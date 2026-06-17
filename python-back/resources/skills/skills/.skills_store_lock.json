@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "skills": {
+    "news-search": {
+      "name": "news-search",
+      "zip_url": "https://lightmake.site/api/v1/download?slug=news-search",
+      "source": "community",
+      "version": "1.0.0",
+      "installedAt": "2026-05-21T08:18:52Z"
+    },
+    "report-search": {
+      "name": "report-search",
+      "zip_url": "https://lightmake.site/api/v1/download?slug=report-search",
+      "source": "community",
+      "version": "1.0.0",
+      "installedAt": "2026-05-21T08:22:58Z"
+    }
+  }
+}

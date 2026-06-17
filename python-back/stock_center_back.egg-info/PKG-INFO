@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: stock-center-back
+Version: 0.1.0
+Summary: New Python backend for stock-center market data migration.
+Requires-Python: >=3.11
+Requires-Dist: akshare>=1.18.0
+Requires-Dist: apscheduler<4.0.0,>=3.10.4
+Requires-Dist: asyncpg>=0.29.0
+Requires-Dist: cryptography>=42.0.0
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: greenlet>=3.0.0
+Requires-Dist: httpx<0.26.0,>=0.25.0
+Requires-Dist: mootdx>=0.11.7
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: pydantic-settings>=2.4.0
+Requires-Dist: sqlalchemy>=2.0.30
+Requires-Dist: uvicorn[standard]>=0.30.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23.0; extra == "dev"
