@@ -1,4 +1,5 @@
 # AI协作规则
+<!-- wiki-migration -->
 
 ## 必读
 

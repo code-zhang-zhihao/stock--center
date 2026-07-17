@@ -7,7 +7,7 @@ description: Maintain the stock-center project wiki and enforce synchronization 
 
 ## Core Rule
 
-Treat `stock-center-wiki/` as the project memory layer. Before changing `stock-center`, read:
+Treat `docs/wiki/` as the project memory layer. Before changing `stock-center`, read:
 
 1. `stock-center-wiki/00-开始这里.md`
 2. `stock-center-wiki/01-阅读路径.md`

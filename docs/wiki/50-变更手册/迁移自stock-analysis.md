@@ -1,4 +1,5 @@
 # 迁移自stock-analysis
+<!-- wiki-migration -->
 
 ## 原则
 
