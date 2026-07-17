@@ -1,4 +1,4 @@
-export type ConfigCategory = 'search' | 'llm' | 'notification';
+export type ConfigCategory = 'search' | 'llm' | 'notification' | 'market_data';
 export type ValueStatus = 'active' | 'cooldown' | 'invalid' | 'disabled';
 
 export interface ApiEnvelope<T> {
@@ -46,6 +46,7 @@ export interface ConfigValue {
   system_config_id: number;
   value_name: string;
   value_kind: string;
+  endpoint_url: string | null;
   fingerprint: string;
   priority: number;
   weight: number;
@@ -66,6 +67,7 @@ export interface ConfigValueTestResult {
   fingerprint: string;
   status: string;
   error: string | null;
+  details: Record<string, unknown>;
 }
 
 export interface ConfigItem {

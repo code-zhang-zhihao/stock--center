@@ -115,6 +115,18 @@ class ConfigCenterRepository:
         )
         return list(result.scalars().all())
 
+    async def release_expired_cooldowns(self) -> None:
+        now = datetime.now(timezone.utc)
+        await self.session.execute(
+            update(ConfigValue)
+            .where(
+                ConfigValue.status == "cooldown",
+                ConfigValue.cooldown_until.is_not(None),
+                ConfigValue.cooldown_until <= now,
+            )
+            .values(status="active", cooldown_until=None, updated_at=now)
+        )
+
     async def update_value(self, value_id: int, values: dict) -> ConfigValue | None:
         if not values:
             return await self.get_value(value_id)
@@ -134,6 +146,25 @@ class ConfigCenterRepository:
             update(ConfigValue)
             .where(ConfigValue.id == value_id)
             .values(failure_count=ConfigValue.failure_count + 1, updated_at=datetime.now(timezone.utc))
+        )
+
+    async def mark_value_invalid(self, value_id: int) -> None:
+        await self.session.execute(
+            update(ConfigValue)
+            .where(ConfigValue.id == value_id)
+            .values(status="invalid", failure_count=ConfigValue.failure_count + 1, updated_at=datetime.now(timezone.utc))
+        )
+
+    async def mark_value_cooldown(self, value_id: int, cooldown_until: datetime) -> None:
+        await self.session.execute(
+            update(ConfigValue)
+            .where(ConfigValue.id == value_id)
+            .values(
+                status="cooldown",
+                cooldown_until=cooldown_until,
+                failure_count=ConfigValue.failure_count + 1,
+                updated_at=datetime.now(timezone.utc),
+            )
         )
 
     async def delete_value(self, value_id: int) -> bool:

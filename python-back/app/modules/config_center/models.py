@@ -58,6 +58,7 @@ class ConfigValue(Base):
     system_config_id: Mapped[int] = mapped_column(ForeignKey("t_system_config.id", ondelete="CASCADE"), nullable=False)
     value_name: Mapped[str] = mapped_column(String(160), nullable=False)
     value_kind: Mapped[str] = mapped_column(String(40), nullable=False, default="api_key")
+    endpoint_url: Mapped[str | None] = mapped_column(Text)
     encrypted_value: Mapped[str] = mapped_column(Text, nullable=False)
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)

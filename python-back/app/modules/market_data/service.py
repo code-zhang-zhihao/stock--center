@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import uuid4
 
 from app.modules.market_data.capabilities import capability_definition
@@ -27,6 +27,9 @@ from app.modules.market_data.models import (
 from app.modules.market_data.providers import AkShareProvider, MootdxProvider, json_safe, normalize_symbol
 from app.modules.market_data.repository import MarketDataRepository
 from app.modules.market_data.schemas import DailyBarRead, MinuteBarRead, QueryMeta, QueryMode, QueryResult, QuoteRead, StockRead
+from app.modules.market_data.tushare_runtime import TushareProviderFactory
+from app.modules.market_data.tushare_mappers import TushareCanonicalMapper
+from app.modules.config_center.repository import ConfigCenterRepository
 
 
 class MarketDataQueryService:
@@ -36,10 +39,47 @@ class MarketDataQueryService:
         *,
         akshare_provider: AkShareProvider | None = None,
         mootdx_provider: MootdxProvider | None = None,
+        tushare_factory: TushareProviderFactory | None = None,
     ) -> None:
         self.repository = repository
         self.akshare = akshare_provider or AkShareProvider()
         self.mootdx = mootdx_provider or MootdxProvider()
+        self.tushare = tushare_factory or TushareProviderFactory(ConfigCenterRepository(repository.session))
+        self.tushare_mapper = TushareCanonicalMapper()
+
+    async def browse_sectors(
+        self,
+        *,
+        sector_type: str,
+        provider: str,
+        keyword: str | None,
+        page: int,
+        page_size: int,
+    ) -> dict:
+        return await self.repository.browse_sectors(
+            sector_type=self._sector_type(sector_type),
+            provider=provider,
+            keyword=(keyword or "").strip() or None,
+            page=page,
+            page_size=page_size,
+        )
+
+    async def browse_sector_stocks(
+        self,
+        *,
+        sector_code: str,
+        keyword: str | None,
+        status: str | None,
+        page: int,
+        page_size: int,
+    ) -> dict | None:
+        return await self.repository.browse_sector_stocks(
+            sector_code=sector_code,
+            keyword=(keyword or "").strip() or None,
+            status=(status or "").strip() or None,
+            page=page,
+            page_size=page_size,
+        )
 
     async def query_stock_basic(
         self,
@@ -49,7 +89,7 @@ class MarketDataQueryService:
         engine_priority: list[str] | None = None,
     ) -> QueryResult:
         code = normalize_symbol(stock_code)
-        engines = self._engines(engine_priority, ["akshare", "mootdx"])
+        engines = self._engines(engine_priority, ["tushare", "akshare", "mootdx"])
         if query_mode in {"db_first", "db_only"}:
             row = await self.repository.get_stock(code)
             if row is not None or query_mode == "db_only":
@@ -83,7 +123,7 @@ class MarketDataQueryService:
         limit: int = 120,
     ) -> QueryResult:
         code = normalize_symbol(stock_code)
-        engines = self._engines(engine_priority, ["akshare", "mootdx"])
+        engines = self._engines(engine_priority, ["tushare", "akshare", "mootdx"])
         db_rows: list[DailyBar] = []
         db_staleness: dict = {}
         if query_mode in {"db_first", "db_only"}:
@@ -104,7 +144,7 @@ class MarketDataQueryService:
             db_staleness = staleness
 
         provider = await self._provider_daily(code, engines, start_date=start_date, end_date=end_date, limit=limit)
-        data = provider["data"]
+        data = provider["data"][:limit]
         if data and query_mode != "provider_only":
             await self.repository.upsert_daily_bars(data)
             await self.repository.commit()
@@ -257,12 +297,13 @@ class MarketDataQueryService:
             sector_type,
             query_mode=query_mode,
             engine_priority=engine_priority,
-            default_engines=["akshare", "mootdx"],
+            default_engines=["tushare", "akshare", "mootdx"],
             model=SectorBasic,
             filters=filters,
             order_by=[SectorBasic.sector_name.asc()],
             limit=limit,
             calls={
+                "tushare": lambda: self.tushare.call("sectors", lambda provider: self.tushare_mapper.ths_sectors(provider, sector_type), request_summary={"sector_type": sector_type}),
                 "akshare": lambda: self.akshare.sectors(sector_type),
                 "mootdx": lambda: self.mootdx.sectors(sector_type),
             },
@@ -288,17 +329,33 @@ class MarketDataQueryService:
                 row["sector_code"] = sector_code
             return rows, raw
 
+        async def tushare_components():
+            if sector_code.startswith(("ths_concept_", "ths_industry_")):
+                return await self.tushare.call(
+                    "sector_components",
+                    lambda provider: self.tushare_mapper.ths_sector_components(provider, sector_code),
+                    request_summary={"sector_code": sector_code, "sector_type": sector_type},
+                )
+            if sector_code.startswith("sw2021_"):
+                return await self.tushare.call(
+                    "sector_components",
+                    lambda provider: self.tushare_mapper.sector_components(provider, sector_code),
+                    request_summary={"sector_code": sector_code, "sector_type": sector_type},
+                )
+            raise ValueError("Tushare sector components require a Tushare sector code")
+
         return await self._query_rows(
             "sector_components",
             sector_code,
             query_mode=query_mode,
             engine_priority=engine_priority,
-            default_engines=["akshare", "mootdx"],
+            default_engines=["tushare", "akshare", "mootdx"],
             model=SectorComponent,
             filters=[SectorComponent.sector_code == sector_code],
             order_by=[SectorComponent.stock_code.asc()],
             limit=limit,
             calls={
+                "tushare": tushare_components,
                 "akshare": akshare_components,
                 "mootdx": lambda: self.mootdx.sector_components(sector_type, sector_code),
             },
@@ -385,7 +442,7 @@ class MarketDataQueryService:
             limit=limit,
             calls={"akshare": akshare_sector_bars},
             request_extra={"sector_type": sector_type, "sector_code": sector_code, "start_date": start_date, "end_date": end_date, "limit": limit},
-            conflict_attrs=["sector_code", "trade_date", "source"],
+            conflict_attrs=["sector_code", "trade_date"],
         )
 
     async def query_indexes(
@@ -405,12 +462,15 @@ class MarketDataQueryService:
             target,
             query_mode=query_mode,
             engine_priority=engine_priority,
-            default_engines=["akshare"],
+            default_engines=["tushare", "akshare"],
             model=IndexBasic,
             filters=filters,
             order_by=[IndexBasic.index_code.asc()],
             limit=limit,
-            calls={"akshare": lambda: self.akshare.indexes(index_code)},
+            calls={
+                "tushare": lambda: self.tushare.call("indexes", lambda provider: self.tushare_mapper.indexes(provider, index_code), request_summary={"index_code": index_code}),
+                "akshare": lambda: self.akshare.indexes(index_code),
+            },
             request_extra={"index_code": index_code, "limit": limit},
             conflict_attrs=["index_code"],
         )
@@ -429,14 +489,17 @@ class MarketDataQueryService:
             code,
             query_mode=query_mode,
             engine_priority=engine_priority,
-            default_engines=["akshare"],
+            default_engines=["tushare", "akshare"],
             model=IndexComponent,
             filters=[IndexComponent.index_code == code],
             order_by=[IndexComponent.stock_code.asc()],
             limit=limit,
-            calls={"akshare": lambda: self.akshare.index_components(code)},
+            calls={
+                "tushare": lambda: self.tushare.call("index_components", lambda provider: self.tushare_mapper.index_components(provider, index_code), request_summary={"index_code": index_code}),
+                "akshare": lambda: self.akshare.index_components(code),
+            },
             request_extra={"index_code": code, "limit": limit},
-            conflict_attrs=["index_code", "stock_code", "effective_date", "source"],
+            conflict_attrs=["index_code", "stock_code"],
         )
 
     async def query_index_bars(
@@ -460,17 +523,18 @@ class MarketDataQueryService:
             code,
             query_mode=query_mode,
             engine_priority=engine_priority,
-            default_engines=["akshare", "mootdx"],
+            default_engines=["tushare", "akshare", "mootdx"],
             model=IndexBar,
             filters=filters,
             order_by=[IndexBar.trade_date.desc()],
             limit=limit,
             calls={
+                "tushare": lambda: self.tushare.call("index_bars", lambda provider: self.tushare_mapper.index_bars(provider, index_code, start_date=start_date, end_date=end_date), request_summary={"index_code": index_code}),
                 "akshare": lambda: self.akshare.index_bars(code, start_date=start_date, end_date=end_date),
                 "mootdx": lambda: self.mootdx.index_bars(code, limit=limit),
             },
             request_extra={"index_code": code, "start_date": start_date, "end_date": end_date, "limit": limit},
-            conflict_attrs=["index_code", "trade_date", "source"],
+            conflict_attrs=["index_code", "trade_date"],
         )
 
     async def query_fund_flow(
@@ -496,14 +560,17 @@ class MarketDataQueryService:
                 code,
                 query_mode=query_mode,
                 engine_priority=engine_priority,
-                default_engines=["akshare"],
+                default_engines=["tushare", "akshare"],
                 model=StockFundFlowDaily,
                 filters=filters,
                 order_by=[StockFundFlowDaily.trade_date.desc()],
                 limit=limit,
-                calls={"akshare": lambda: self.akshare.stock_fund_flow(code, start_date=start_date, end_date=end_date)},
+                calls={
+                    "tushare": lambda: self.tushare.call("fund_flow", lambda provider: self.tushare_mapper.stock_fund_flow(provider, code, start_date=start_date, end_date=end_date), request_summary={"stock_code": code}),
+                    "akshare": lambda: self.akshare.stock_fund_flow(code, start_date=start_date, end_date=end_date),
+                },
                 request_extra={"stock_code": code, "start_date": start_date, "end_date": end_date, "limit": limit},
-                conflict_attrs=["stock_code", "trade_date", "source"],
+                conflict_attrs=["stock_code", "trade_date"],
                 normalized_table="t_stock_fund_flow_daily",
             )
         selected_sector_type = self._sector_type(sector_type or "industry")
@@ -519,7 +586,7 @@ class MarketDataQueryService:
             limit=limit,
             calls={"akshare": lambda: self.akshare.sector_fund_flow(selected_sector_type)},
             request_extra={"sector_type": selected_sector_type, "limit": limit},
-            conflict_attrs=["sector_code", "trade_date", "source"],
+            conflict_attrs=["sector_code", "trade_date"],
             normalized_table="t_sector_fund_flow_daily",
         )
 
@@ -534,7 +601,7 @@ class MarketDataQueryService:
         limit: int = 200,
     ) -> QueryResult:
         code = normalize_symbol(stock_code) if stock_code else "all"
-        engines = self._engines(engine_priority, ["akshare"])
+        engines = self._engines(engine_priority, ["tushare", "akshare"])
         event_filters = []
         seat_filters = []
         if stock_code:
@@ -556,7 +623,10 @@ class MarketDataQueryService:
             code,
             engines,
             "lhb",
-            {"akshare": lambda: self.akshare.lhb(stock_code=stock_code, start_date=start_date, end_date=end_date)},
+            {
+                "tushare": lambda: self.tushare.call("lhb", lambda provider: self.tushare_mapper.lhb(provider, stock_code=stock_code, start_date=start_date, end_date=end_date), request_summary={"stock_code": stock_code}),
+                "akshare": lambda: self.akshare.lhb(stock_code=stock_code, start_date=start_date, end_date=end_date),
+            },
             request_extra={"stock_code": stock_code, "start_date": start_date, "end_date": end_date, "limit": limit},
             normalized_table="t_lhb_event",
             empty_data={"events": [], "seats": []},
@@ -567,7 +637,7 @@ class MarketDataQueryService:
             await self.repository.upsert_rows(
                 LhbEvent,
                 data.get("events", []),
-                conflict_attrs=["stock_code", "trade_date", "reason", "source"],
+                conflict_attrs=["stock_code", "trade_date", "reason"],
             )
             await self.repository.upsert_rows(
                 LhbSeatDetail,
@@ -600,12 +670,15 @@ class MarketDataQueryService:
             code,
             query_mode=query_mode,
             engine_priority=engine_priority,
-            default_engines=["akshare"],
+            default_engines=["tushare", "akshare"],
             model=Announcement,
             filters=filters,
             order_by=[Announcement.published_at.desc()],
             limit=limit,
-            calls={"akshare": lambda: self.akshare.announcements(stock_code=code, start_date=start_date, end_date=end_date, keyword=keyword)},
+            calls={
+                "tushare": lambda: self.tushare.call("announcements", lambda provider: self.tushare_mapper.announcements(provider, code, start_date=start_date, end_date=end_date), request_summary={"stock_code": code}),
+                "akshare": lambda: self.akshare.announcements(stock_code=code, start_date=start_date, end_date=end_date, keyword=keyword),
+            },
             request_extra={"stock_code": code, "start_date": start_date, "end_date": end_date, "keyword": keyword, "limit": limit},
             conflict_attrs=["stock_code", "title", "published_at", "source"],
         )
@@ -694,6 +767,7 @@ class MarketDataQueryService:
             engines,
             "stock_basic",
             {
+                "tushare": lambda: self.tushare.call("stock_basic", lambda provider: self.tushare_mapper.stock_basic(provider, stock_code), request_summary={"stock_code": stock_code}),
                 "akshare": lambda: self.akshare.stock_basic(stock_code),
                 "mootdx": lambda: self.mootdx.stock_basic(stock_code),
             },
@@ -709,15 +783,20 @@ class MarketDataQueryService:
         end_date: date | None,
         limit: int,
     ) -> dict:
+        # Tushare returns the full history when no range is provided. Keep the
+        # query contract bounded by deriving a calendar window from ``limit``.
+        resolved_end_date = end_date or date.today()
+        resolved_start_date = start_date or (resolved_end_date - timedelta(days=max(limit * 2, 10)))
         return await self._try_engines(
             stock_code,
             engines,
             "daily_bars",
             {
-                "akshare": lambda: self.akshare.daily_bars(stock_code, start_date=start_date, end_date=end_date),
+                "tushare": lambda: self.tushare.call("daily_bars", lambda provider: self.tushare_mapper.daily_bars(provider, stock_code, start_date=resolved_start_date, end_date=resolved_end_date), request_summary={"stock_code": stock_code, "start_date": resolved_start_date, "end_date": resolved_end_date}),
+                "akshare": lambda: self.akshare.daily_bars(stock_code, start_date=resolved_start_date, end_date=resolved_end_date),
                 "mootdx": lambda: self.mootdx.daily_bars(stock_code, limit=limit),
             },
-            request_extra={"start_date": start_date, "end_date": end_date, "limit": limit},
+            request_extra={"start_date": resolved_start_date, "end_date": resolved_end_date, "limit": limit},
             normalized_table="t_daily_bar",
             empty_data=[],
         )
@@ -870,7 +949,7 @@ class MarketDataQueryService:
 
     def _engines(self, values: list[str] | None, default: list[str]) -> list[str]:
         engines = [item.strip().lower() for item in (values or default) if item and item.strip()]
-        engines = [item for item in engines if item in {"akshare", "mootdx"}]
+        engines = [item for item in engines if item in {"tushare", "akshare", "mootdx"}]
         return engines or default
 
     def _has_data(self, data) -> bool:

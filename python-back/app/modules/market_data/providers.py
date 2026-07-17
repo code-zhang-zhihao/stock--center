@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+import logging
+import threading
+import time as time_module
 from typing import Any
 from zoneinfo import ZoneInfo
+
+
+logger = logging.getLogger(__name__)
+
+
+class ThsAuthenticationRequiredError(RuntimeError):
+    """Raised when a THS pagination response is replaced by its login page."""
 
 
 def normalize_symbol(stock_code: str) -> str:
@@ -128,8 +140,30 @@ def parse_trade_side(value) -> str | None:
     return text or None
 
 
+@dataclass(frozen=True)
+class SectorComponentSnapshot:
+    rows: list[dict]
+    raw: list[dict]
+    source: str
+    is_complete: bool
+    fetched_page_count: int
+    expected_page_count: int | None
+
+
 class AkShareProvider:
     code = "akshare"
+    _THS_REQUEST_INTERVAL_SECONDS = 0.8
+    _THS_PAGE_RETRY_COUNT = 3
+    _THS_RETRY_BACKOFF_SECONDS = 2.0
+    _THS_MAX_PAGE_COUNT = 100
+
+    def __init__(self) -> None:
+        self._ths_session = None
+        self._ths_session_lock = threading.Lock()
+        self._ths_last_request_at = 0.0
+
+    def set_ths_request_interval(self, seconds: float) -> None:
+        self._THS_REQUEST_INTERVAL_SECONDS = max(0.1, float(seconds))
 
     async def stock_basic_list(self) -> tuple[list[dict], set[str], list[dict]]:
         return await asyncio.to_thread(self._stock_basic_list_sync)
@@ -160,6 +194,9 @@ class AkShareProvider:
 
     async def sector_components(self, sector_type: str, sector_code: str) -> tuple[list[dict], list[dict]]:
         return await asyncio.to_thread(self._sector_components_sync, sector_type, sector_code)
+
+    async def sector_component_snapshot(self, sector_type: str, sector_code: str) -> SectorComponentSnapshot:
+        return await asyncio.to_thread(self._sector_component_snapshot_sync, sector_type, sector_code)
 
     async def sector_bars(
         self,
@@ -448,13 +485,20 @@ class AkShareProvider:
                 normalized_type = "industry"
             return self._sector_rows_from_raw(raw, normalized_type=normalized_type, source=source)
         except Exception as em_exc:
-            if normalized_type == "concept":
-                raw = frame_records(ak.stock_board_concept_name_ths())
-                source = "akshare:stock_board_concept_name_ths"
-            else:
-                raw = frame_records(ak.stock_board_industry_name_ths())
-                source = "akshare:stock_board_industry_name_ths"
-                normalized_type = "industry"
+            try:
+                if normalized_type == "concept":
+                    raw = frame_records(ak.stock_board_concept_name_ths())
+                    source = "akshare:stock_board_concept_name_ths"
+                else:
+                    raw = frame_records(ak.stock_board_industry_name_ths())
+                    source = "akshare:stock_board_industry_name_ths"
+                    normalized_type = "industry"
+            except Exception as ths_exc:
+                raise RuntimeError(
+                    "sector catalog providers failed: "
+                    f"eastmoney={type(em_exc).__name__}: {em_exc}; "
+                    f"ths={type(ths_exc).__name__}: {ths_exc}"
+                ) from ths_exc
             rows, raw_records = self._sector_rows_from_raw(raw, normalized_type=normalized_type, source=source)
             for row in rows:
                 row["metadata_json"]["fallback_from"] = "eastmoney"
@@ -479,12 +523,19 @@ class AkShareProvider:
         return rows, raw
 
     def _sector_components_sync(self, sector_type: str, sector_code: str) -> tuple[list[dict], list[dict]]:
+        snapshot = self._sector_component_snapshot_sync(sector_type, sector_code)
+        return snapshot.rows, snapshot.raw
+
+    def _sector_component_snapshot_sync(self, sector_type: str, sector_code: str) -> SectorComponentSnapshot:
         import akshare as ak
 
         normalized_type = self._sector_type(sector_type)
         symbol = self._raw_sector_code(sector_code)
+        is_complete = True
+        fetched_page_count = 1
+        expected_page_count: int | None = 1
         if self._is_ths_sector_code(sector_code):
-            raw, source = self._sector_components_ths(normalized_type, sector_code)
+            raw, source, is_complete, fetched_page_count, expected_page_count = self._sector_components_ths(normalized_type, sector_code)
         else:
             try:
                 if normalized_type == "concept":
@@ -495,7 +546,7 @@ class AkShareProvider:
                     source = "akshare:stock_board_industry_cons_em"
                     normalized_type = "industry"
             except Exception as em_exc:
-                raw, source = self._sector_components_ths(normalized_type, sector_code)
+                raw, source, is_complete, fetched_page_count, expected_page_count = self._sector_components_ths(normalized_type, sector_code)
                 for item in raw:
                     item["fallback_from"] = "eastmoney"
                     item["fallback_error"] = f"{type(em_exc).__name__}: {em_exc}"
@@ -513,7 +564,14 @@ class AkShareProvider:
                 "source": source,
                 "metadata_json": {"sector_type": normalized_type, "source": source, "raw": item},
             })
-        return rows, raw
+        return SectorComponentSnapshot(
+            rows=rows,
+            raw=raw,
+            source=source,
+            is_complete=is_complete,
+            fetched_page_count=fetched_page_count,
+            expected_page_count=expected_page_count,
+        )
 
     @staticmethod
     def _canonical_sector_code(sector_type: str, raw_code: str, source: str) -> str:
@@ -533,23 +591,138 @@ class AkShareProvider:
             return sector_code.removeprefix("ths_industry_")
         return sector_code
 
-    def _sector_components_ths(self, sector_type: str, sector_code: str) -> tuple[list[dict], str]:
+    def _sector_components_ths(self, sector_type: str, sector_code: str) -> tuple[list[dict], str, bool, int, int | None]:
         import requests
-        from bs4 import BeautifulSoup
 
         raw_code = self._raw_sector_code(sector_code)
         if sector_type == "concept":
-            url = f"https://q.10jqka.com.cn/gn/detail/code/{raw_code}/"
+            base_path = "gn/detail"
             source = "akshare:stock_board_concept_detail_ths_html"
         else:
-            url = f"https://q.10jqka.com.cn/thshy/detail/code/{raw_code}/"
+            base_path = "thshy/detail"
             source = "akshare:stock_board_industry_detail_ths_html"
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        first_url = f"https://q.10jqka.com.cn/{base_path}/code/{raw_code}/"
+        with self._ths_session_lock:
+            session = self._get_ths_session(requests)
+            first_rows, expected_page_count, field, order, actual_page = self._fetch_ths_component_page(
+                session,
+                first_url,
+                source_url=first_url,
+            )
+            if actual_page not in {None, 1}:
+                raise RuntimeError(f"THS first component page mismatch: expected=1 actual={actual_page}")
+            expected_page_count = expected_page_count or 1
+            if expected_page_count < 1 or expected_page_count > self._THS_MAX_PAGE_COUNT:
+                raise RuntimeError(f"THS component page count out of range: {expected_page_count}")
+            pages = [first_rows]
+            for page in range(2, expected_page_count + 1):
+                page_url = (
+                    f"https://q.10jqka.com.cn/{base_path}/field/{field}/order/{order}/"
+                    f"page/{page}/ajax/1/code/{raw_code}/"
+                )
+                rows, page_count, _, _, actual_page = self._fetch_ths_component_page(
+                    session,
+                    page_url,
+                    source_url=page_url,
+                    ajax=True,
+                )
+                if page_count not in {None, expected_page_count} or actual_page not in {None, page}:
+                    raise RuntimeError(
+                        "THS component pagination mismatch: "
+                        f"expected={page}/{expected_page_count} actual={actual_page}/{page_count}"
+                    )
+                if not rows:
+                    raise RuntimeError(f"THS component page returned no rows: page={page}/{expected_page_count}")
+                pages.append(rows)
+            deduped = {str(row["代码"]): row for rows in pages for row in rows}
+        rows = list(deduped.values())
+        if not rows:
+            raise RuntimeError("THS component snapshot returned no valid stock rows")
+        return rows, source, True, expected_page_count, expected_page_count
+
+    def _get_ths_session(self, requests):
+        if self._ths_session is None:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html, */*; q=0.01",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://q.10jqka.com.cn/",
+            })
+            self._ths_session = session
+        return self._ths_session
+
+    def _ths_get(self, session, url: str, *, ajax: bool = False):
+        elapsed = time_module.monotonic() - self._ths_last_request_at
+        if elapsed < self._THS_REQUEST_INTERVAL_SECONDS:
+            time_module.sleep(self._THS_REQUEST_INTERVAL_SECONDS - elapsed)
+        headers = {"X-Requested-With": "XMLHttpRequest"} if ajax else None
+        response = session.get(url, headers=headers, timeout=20)
+        self._ths_last_request_at = time_module.monotonic()
         response.raise_for_status()
         response.encoding = response.apparent_encoding or "gbk"
-        soup = BeautifulSoup(response.text, features="lxml")
+        return response
+
+    def _fetch_ths_component_page(self, session, url: str, *, source_url: str, ajax: bool = False):
+        last_error: Exception | None = None
+        for attempt in range(1, self._THS_PAGE_RETRY_COUNT + 1):
+            try:
+                response = self._ths_get(session, url, ajax=ajax)
+                if self._is_ths_login_page(response.text):
+                    raise ThsAuthenticationRequiredError("THS component pagination requires an authenticated session")
+                parsed = self._parse_ths_component_page(response.text, source_url=source_url)
+                if not parsed[0]:
+                    raise RuntimeError("THS response contained no component rows")
+                return parsed
+            except ThsAuthenticationRequiredError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt == self._THS_PAGE_RETRY_COUNT:
+                    break
+                delay = self._THS_RETRY_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "THS component page retry scheduled: attempt=%s/%s delay=%ss url=%s error=%s: %s",
+                    attempt,
+                    self._THS_PAGE_RETRY_COUNT,
+                    delay,
+                    url,
+                    type(exc).__name__,
+                    exc,
+                )
+                time_module.sleep(delay)
+        raise RuntimeError(
+            f"THS component page failed after {self._THS_PAGE_RETRY_COUNT} attempts: "
+            f"{type(last_error).__name__}: {last_error}"
+        ) from last_error
+
+    @staticmethod
+    def _is_ths_login_page(html: str) -> bool:
+        return "同花顺-用户登录" in html or ("短信登录" in html and "密码登录" in html)
+
+    @staticmethod
+    def _parse_ths_component_page(html: str, *, source_url: str) -> tuple[list[dict], int | None, str, str, int | None]:
+        import re
+
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, features="lxml")
+        page_info = soup.select_one(".page_info")
+        current_page: int | None = None
+        expected_page_count: int | None = None
+        if page_info:
+            matched = re.search(r"(\d+)\s*/\s*(\d+)", page_info.get_text(" ", strip=True))
+            if matched:
+                current_page = int(matched.group(1))
+                expected_page_count = int(matched.group(2))
+        current_sort = soup.select_one(".m-pager-table th.cur a[field]")
+        field = current_sort.get("field") if current_sort else "199112"
+        order = current_sort.get("order") if current_sort else "desc"
         rows: list[dict] = []
-        for tr in soup.select("#maincont table tbody tr"):
+        for tr in soup.select("table tbody tr"):
             cells = [cell.get_text(strip=True) for cell in tr.find_all("td")]
             if len(cells) < 3:
                 continue
@@ -564,9 +737,9 @@ class AkShareProvider:
                 "现价": cells[3] if len(cells) > 3 else None,
                 "涨跌幅": cells[4] if len(cells) > 4 else None,
                 "raw_cells": cells,
-                "source_url": url,
+                "source_url": source_url,
             })
-        return rows, source
+        return rows, expected_page_count, str(field), str(order), current_page
 
     def _sector_bars_sync(self, sector_type: str, sector_code: str, start_date: date | None, end_date: date | None) -> tuple[list[dict], list[dict]]:
         import akshare as ak
@@ -885,6 +1058,7 @@ class MootdxProvider:
     def __init__(self) -> None:
         self._client = None
         self._client_label = None
+        self._client_lock = threading.RLock()
         self._stocks_cache: dict[int, list[dict]] = {}
 
     async def stock_basic(self, stock_code: str) -> tuple[dict | None, list[dict]]:
@@ -901,6 +1075,9 @@ class MootdxProvider:
 
     async def quote(self, stock_code: str) -> tuple[dict | None, list[dict]]:
         return await asyncio.to_thread(self._quote_sync, stock_code)
+
+    async def quote_batch(self, stock_codes: list[str]) -> tuple[list[dict], list[dict]]:
+        return await asyncio.to_thread(self._quote_batch_sync, stock_codes)
 
     async def ticks(self, stock_code: str, *, date_value: date | None = None) -> tuple[list[dict], list[dict]]:
         return await asyncio.to_thread(self._ticks_sync, stock_code, date_value)
@@ -948,31 +1125,43 @@ class MootdxProvider:
         client = getattr(self._client, "client", None)
         disconnect = getattr(client, "disconnect", None)
         if callable(disconnect):
-            try:
+            with suppress(Exception):
                 disconnect()
-            except Exception:
-                pass
+        if self._client is not None:
+            with suppress(Exception):
+                self._client.client = None
         self._client = None
         self._client_label = None
 
-    def _call_quotes(self, operation):
-        errors = []
-        if self._client is not None:
-            try:
-                return operation(self._client)
-            except Exception as exc:
-                errors.append(f"{self._client_label or 'cached'}: {exc}")
-                self._close_client()
+    def close(self) -> None:
+        with self._client_lock:
+            self._close_client()
 
-        for label, server in self._server_candidates():
-            try:
-                self._client = self._quote_client(server=server, bestip=(server is None))
-                self._client_label = label
-                return operation(self._client)
-            except Exception as exc:
-                errors.append(f"{label}: {exc}")
-                self._close_client()
-        raise RuntimeError("; ".join(errors) or "MooTDX connection failed")
+    def _call_quotes(self, operation, *, require_records: bool = False):
+        def invoke(client):
+            result = operation(client)
+            if require_records and not frame_records(result):
+                raise RuntimeError("MooTDX returned an empty quote response")
+            return result
+
+        with self._client_lock:
+            errors = []
+            if self._client is not None:
+                try:
+                    return invoke(self._client)
+                except Exception as exc:
+                    errors.append(f"{self._client_label or 'cached'}: {exc}")
+                    self._close_client()
+
+            for label, server in self._server_candidates():
+                try:
+                    self._client = self._quote_client(server=server, bestip=(server is None))
+                    self._client_label = label
+                    return invoke(self._client)
+                except Exception as exc:
+                    errors.append(f"{label}: {exc}")
+                    self._close_client()
+            raise RuntimeError("; ".join(errors) or "MooTDX connection failed")
 
     def _tdx_markets(self, code: str) -> list[int]:
         if code.startswith("6"):
@@ -1105,10 +1294,26 @@ class MootdxProvider:
 
     def _quote_sync(self, stock_code: str) -> tuple[dict | None, list[dict]]:
         code = normalize_symbol(stock_code)
-        raw = frame_records(self._call_quotes(lambda quotes: quotes.quotes(symbol=[code])))
+        raw = frame_records(self._call_quotes(lambda quotes: quotes.quotes(symbol=[code]), require_records=True))
         if not raw:
             return None, raw
-        item = raw[0]
+        return self._quote_row_from_item(code, raw[0]), raw
+
+    def _quote_batch_sync(self, stock_codes: list[str]) -> tuple[list[dict], list[dict]]:
+        codes = [normalize_symbol(stock_code) for stock_code in stock_codes if normalize_symbol(stock_code)]
+        if not codes:
+            return [], []
+        raw = frame_records(self._call_quotes(lambda quotes: quotes.quotes(symbol=codes), require_records=True))
+        rows: list[dict] = []
+        for index, item in enumerate(raw):
+            fallback_code = codes[index] if index < len(codes) else ""
+            code = normalize_symbol(str(first(item, ["code", "symbol", "stock_code", "ts_code"]) or fallback_code))
+            if not code:
+                continue
+            rows.append(self._quote_row_from_item(code, item))
+        return rows, raw
+
+    def _quote_row_from_item(self, code: str, item: dict) -> dict:
         last_price = safe_float(item.get("price"))
         pre_close = safe_float(item.get("last_close"))
         change = last_price - pre_close if last_price is not None and pre_close not in (None, 0) else None
@@ -1128,7 +1333,7 @@ class MootdxProvider:
             "amount_yuan": safe_float(item.get("amount")),
             "order_book": {"raw_levels": item},
             "raw_payload": {"source": "mootdx:quotes", "raw": item},
-        }, raw
+        }
 
     def _ticks_sync(self, stock_code: str, date_value: date | None) -> tuple[list[dict], list[dict]]:
         code = normalize_symbol(stock_code)

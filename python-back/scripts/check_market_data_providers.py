@@ -13,6 +13,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.modules.market_data.providers import AkShareProvider, MootdxProvider
+from app.db.session import get_sessionmaker
+from app.modules.config_center.repository import ConfigCenterRepository
+from app.modules.market_data.tushare_runtime import TushareProviderFactory
 
 
 def preview(value, *, limit: int = 2):
@@ -63,10 +66,30 @@ async def check_akshare(stock_code: str) -> dict:
     }
 
 
+async def check_tushare() -> dict:
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        factory = TushareProviderFactory(ConfigCenterRepository(session))
+        end_date = date.today()
+        response = await factory.call(
+            "tushare_daily_connectivity_test",
+            lambda provider: provider.daily_connectivity(end_date=end_date),
+            request_summary={"api_name": "daily", "stock_code": "600519.SH", "end_date": end_date.isoformat()},
+        )
+        return {
+            "provider": "tushare",
+            "ok": True,
+            "api_name": "daily",
+            "stock_code": "600519.SH",
+            "daily_count": response.row_count,
+            "daily_raw_api_name": response.raw_payload.get("api_name"),
+        }
+
+
 async def main() -> int:
-    parser = argparse.ArgumentParser(description="Check MooTDX and AkShare provider connectivity.")
+    parser = argparse.ArgumentParser(description="Check MooTDX, AkShare and optional Tushare provider connectivity.")
     parser.add_argument("--stock-code", default="600519", help="A-share stock code, default: 600519")
-    parser.add_argument("--provider", choices=["all", "mootdx", "akshare"], default="all")
+    parser.add_argument("--provider", choices=["all", "mootdx", "akshare", "tushare"], default="all")
     args = parser.parse_args()
 
     checks = []
@@ -74,6 +97,8 @@ async def main() -> int:
         checks.append(("mootdx", check_mootdx(args.stock_code)))
     if args.provider in {"all", "akshare"}:
         checks.append(("akshare", check_akshare(args.stock_code)))
+    if args.provider == "tushare":
+        checks.append(("tushare", check_tushare()))
 
     results = []
     failed = False

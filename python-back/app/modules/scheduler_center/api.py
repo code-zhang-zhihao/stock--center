@@ -1,9 +1,9 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.response import ApiResponse
-from app.db.session import get_pool_status, get_session, get_sessionmaker
+from app.db.session import get_pool_status, get_session
 from app.modules.scheduler_center.repository import SchedulerRepository
 from app.modules.scheduler_center.runtime import scheduler_runtime
 from app.modules.scheduler_center.schemas import (
@@ -55,6 +55,8 @@ async def create_or_update_job(payload: SchedulerJobCreate, session: AsyncSessio
         job = await service(session).create_or_update_job(payload)
         await _reload_scheduler()
         return ApiResponse.ok(await service(session).get_job(job.job_code) or job)
+    except SchedulerError as exc:
+        return ApiResponse.fail(code=exc.code, message=exc.message)
     except Exception as exc:
         return ApiResponse.fail(code="scheduler_job_create_failed", message=str(exc))
 
@@ -67,6 +69,8 @@ async def update_job(job_code: str, payload: SchedulerJobUpdate, session: AsyncS
             return ApiResponse.fail(code="job_not_found", message=f"job not found: {job_code}")
         await _reload_scheduler()
         return ApiResponse.ok(await service(session).get_job(job_code) or job)
+    except SchedulerError as exc:
+        return ApiResponse.fail(code=exc.code, message=exc.message)
     except Exception as exc:
         return ApiResponse.fail(code="scheduler_job_update_failed", message=str(exc))
 
@@ -111,7 +115,6 @@ async def resume_job(job_code: str, session: AsyncSession = Depends(get_session)
 async def run_job(
     job_code: str,
     payload: SchedulerRunRequest,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ):
     try:
@@ -121,7 +124,7 @@ async def run_job(
         if not should_run_async:
             return ApiResponse.ok(await svc.run_job(job_code, payload=payload.payload, trigger_source="manual"))
         run = await svc.start_job(job_code, payload=payload.payload, trigger_source="manual")
-        background_tasks.add_task(_execute_job_background, run.run_id, job_code, run.payload)
+        scheduler_runtime.start_background_execution(run.run_id, job_code, run.payload)
         return ApiResponse.ok(run)
     except SchedulerError as exc:
         return ApiResponse.fail(code=exc.code, message=exc.message)
@@ -160,6 +163,32 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)):
         return ApiResponse.fail(code="scheduler_run_query_failed", message=str(exc))
 
 
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, session: AsyncSession = Depends(get_session)):
+    try:
+        cancel_requested = scheduler_runtime.cancel_run(run_id)
+        svc = service(session)
+        if cancel_requested:
+            row = await SchedulerRepository(session).get_run(run_id)
+            return ApiResponse.ok(
+                {
+                    "cancel_requested": True,
+                    "active": True,
+                    "run": SchedulerService._run_read(row) if row else None,
+                }
+            )
+        run = await svc.cancel_run_record(
+            run_id,
+            error_code="job_cancelled_not_active",
+            error_message="run was marked running but no active task exists in this process",
+        )
+        if run is None:
+            return ApiResponse.fail(code="job_run_not_found", message=f"job run not found: {run_id}")
+        return ApiResponse.ok({"cancel_requested": False, "active": False, "run": run})
+    except Exception as exc:
+        return ApiResponse.fail(code="scheduler_run_cancel_failed", message=str(exc))
+
+
 @router.get("/status")
 async def scheduler_status():
     return ApiResponse.ok(scheduler_runtime.status())
@@ -176,9 +205,3 @@ async def reload_scheduler():
 @router.get("/db-pool/status")
 async def db_pool_status():
     return ApiResponse.ok({"status": get_pool_status()})
-
-
-async def _execute_job_background(run_id: str, job_code: str, payload: dict) -> None:
-    sessionmaker = get_sessionmaker()
-    async with sessionmaker() as session:
-        await service(session).execute_started_job(run_id, job_code, payload)

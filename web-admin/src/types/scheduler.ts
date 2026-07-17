@@ -1,10 +1,23 @@
+export interface SchedulerParameterSpec {
+  label?: string;
+  type?: 'string' | 'number' | 'boolean' | 'array' | 'json' | string;
+  default?: unknown;
+  required?: boolean;
+  description?: string;
+  options?: unknown[];
+  min?: number;
+  max?: number;
+}
+
+export type SchedulerParameterSchema = Record<string, SchedulerParameterSpec>;
+
 export interface SchedulerJob {
   id: number;
   job_code: string;
   job_name: string;
   job_type: string;
   description: string | null;
-  parameter_schema: Record<string, unknown>;
+  parameter_schema: SchedulerParameterSchema;
   trigger_type: string;
   cron_expr: string | null;
   timezone: string;
@@ -70,5 +83,6 @@ export interface SchedulerStatus {
   running: boolean;
   job_count: number;
   jobs: Array<Record<string, unknown>>;
+  active_runs: Array<Record<string, unknown>>;
   error: string | null;
 }

@@ -6,6 +6,7 @@ Requires-Python: >=3.11
 Requires-Dist: akshare>=1.18.0
 Requires-Dist: apscheduler<4.0.0,>=3.10.4
 Requires-Dist: asyncpg>=0.29.0
+Requires-Dist: chinesecalendar>=1.10.0
 Requires-Dist: cryptography>=42.0.0
 Requires-Dist: fastapi>=0.115.0
 Requires-Dist: greenlet>=3.0.0
@@ -14,6 +15,8 @@ Requires-Dist: mootdx>=0.11.7
 Requires-Dist: pandas>=2.2.0
 Requires-Dist: pydantic>=2.8.0
 Requires-Dist: pydantic-settings>=2.4.0
+Requires-Dist: redis>=5.0.0
+Requires-Dist: requests>=2.31.0
 Requires-Dist: sqlalchemy>=2.0.30
 Requires-Dist: uvicorn[standard]>=0.30.0
 Provides-Extra: dev

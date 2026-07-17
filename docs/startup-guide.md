@@ -14,6 +14,16 @@ cd /Volumes/TiPro9000/projects/archived/stock-center
 ```env
 DATABASE_URL=postgresql+asyncpg://<user>:<password>@<host>:5432/<原stock-analysis数据库>
 CONFIG_MASTER_KEY=<复用原项目本机值>
+DATABASE_CONNECT_TIMEOUT_SECONDS=10
+DATABASE_SSL=auto
+```
+
+`DATABASE_SSL` 支持 `auto`、`disable`、`require`。云端 PostgreSQL 出现 asyncpg SSL 握手断开时，可先运行诊断脚本判断哪种模式可用：
+
+```bash
+cd /Volumes/TiPro9000/projects/archived/stock-center/python-back
+source .venv/bin/activate
+python scripts/check_database_connection.py
 ```
 
 日常启动：
@@ -28,9 +38,12 @@ cd /Volumes/TiPro9000/projects/archived/stock-center
 - API：`http://127.0.0.1:8000`
 - Swagger：`http://127.0.0.1:8000/docs`
 - Health：`http://127.0.0.1:8000/api/v1/health`
+- DB Health：`http://127.0.0.1:8000/api/v1/health/db`
 - 前端：`http://127.0.0.1:8080`
 
 脚本默认同时启动后端和 `web-admin` 前端。后端日志写入 `logs/backend-*.log`，前端日志写入 `logs/frontend-*.log`。
+
+`/api/v1/health` 只表示后端进程已启动；数据库连接请查看 `/api/v1/health/db`。当 `SCHEDULER_ENABLED=true` 但数据库暂时不可连时，后端仍会启动，调度器状态会在 `/api/v1/scheduler/status` 中显示错误。
 
 只启动后端：
 
@@ -79,6 +92,23 @@ curl "http://127.0.0.1:8000/api/v1/market-data/query/minute-bars?stock_code=6005
 ```
 
 返回 `meta.resolved_source`、`meta.fallback_used`、`meta.raw_ref` 可用于判断实际使用了哪个 provider，以及 raw landing 是否写入 `t_provider_raw_record`。
+
+## 股票池中心
+
+先在原 PostgreSQL 数据库执行：
+
+```bash
+psql "${DATABASE_URL/postgresql+asyncpg/postgresql}" -f docs/sql/15-stock-pool-center.sql
+```
+
+执行后重启后端，确认四个系统池已初始化：
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/stock-pools"
+curl "http://127.0.0.1:8000/api/v1/stock-pools/candidate/members?page=1&page_size=20"
+```
+
+股票池成员仅接受已同步到 `t_stock` 的无后缀股票代码。未知代码会返回 `unknown_codes`，整批不会写入。前端入口为 `http://127.0.0.1:8080/stock-pools`。
 
 ## 前端
 

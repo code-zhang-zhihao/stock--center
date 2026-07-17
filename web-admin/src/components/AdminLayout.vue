@@ -35,14 +35,19 @@
 </template>
 
 <script setup lang="ts">
-import { CalendarClock, Settings, ShieldCheck } from 'lucide-vue-next';
+import { Activity, CalendarClock, Database, Layers3, LineChart, ListChecks, Settings, ShieldCheck } from 'lucide-vue-next';
 import { useRoute } from 'vue-router';
 
 const route = useRoute();
 
 const navItems = [
   { path: '/settings/search', matchPrefix: '/settings', label: '系统设置中心', icon: Settings },
+  { path: '/data-center', matchPrefix: '/data-center', label: '数据中心', icon: Database },
   { path: '/scheduler', matchPrefix: '/scheduler', label: '调度任务', icon: CalendarClock },
+  { path: '/sector-dashboard', matchPrefix: '/sector-dashboard', label: '板块资金大屏', icon: Activity },
+  { path: '/sectors', matchPrefix: '/sectors', label: '板块中心', icon: Layers3 },
+  { path: '/stock-pools', matchPrefix: '/stock-pools', label: '股票池', icon: ListChecks },
+  { path: '/market', matchPrefix: '/market', label: '个股行情', icon: LineChart },
 ];
 
 function isActive(prefix: string) {
@@ -52,12 +57,16 @@ function isActive(prefix: string) {
 
 <style scoped>
 .admin-shell {
+  width: 100%;
+  min-width: 0;
   min-height: 100vh;
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);
 }
 
 .admin-sidebar {
+  min-width: 0;
+  overflow: hidden;
   background: #17212b;
   color: #f8fafc;
   padding: 18px 14px;
@@ -127,15 +136,46 @@ function isActive(prefix: string) {
 
 .admin-content {
   min-width: 0;
+  overflow-x: hidden;
 }
 
 @media (max-width: 860px) {
   .admin-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .admin-sidebar {
     position: static;
+    gap: 10px;
+    padding: 12px 14px;
+  }
+
+  .brand-block {
+    padding: 2px 0 10px;
+  }
+
+  .main-nav {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    scrollbar-width: none;
+  }
+
+  .main-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .main-nav-item {
+    min-width: max-content;
+    min-height: 36px;
+    grid-template-columns: 18px auto;
+    padding: 0 9px;
+    font-size: 13px;
+  }
+
+  .sidebar-note {
+    display: none;
   }
 }
 </style>

@@ -3,6 +3,8 @@ import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from fastapi.encoders import jsonable_encoder
+
 from app.core.config import get_settings
 from app.modules.scheduler_center.handlers import JobExecutionContext, job_handler_registry
 from app.modules.scheduler_center.models import SchedulerJob, SchedulerJobRun
@@ -14,6 +16,7 @@ from app.modules.scheduler_center.schemas import (
     SchedulerJobUpdate,
     SchedulerRunRead,
 )
+from app.modules.scheduler_center.validation import CronValidationError, PayloadValidationError, validate_cron_expr, validate_payload
 
 _execution_semaphore: asyncio.Semaphore | None = None
 logger = logging.getLogger(__name__)
@@ -47,12 +50,18 @@ class SchedulerService:
         return self._job_read(row) if row else None
 
     async def create_or_update_job(self, payload: SchedulerJobCreate) -> SchedulerJobRead:
-        row = await self.repository.upsert_job(self._job_create_values(payload))
+        values = self._job_create_values(payload)
+        self._validate_job_configuration(values)
+        row = await self.repository.upsert_job(values)
         await self.repository.commit()
         return self._job_read(row)
 
     async def update_job(self, job_code: str, payload: SchedulerJobUpdate) -> SchedulerJobRead | None:
+        existing = await self.repository.get_job(job_code)
+        if existing is None:
+            return None
         values = self._job_update_values(payload)
+        self._validate_job_configuration(values, existing=existing)
         row = await self.repository.update_job(job_code, values)
         await self.repository.commit()
         return self._job_read(row) if row else None
@@ -81,6 +90,7 @@ class SchedulerService:
         if handler is None:
             raise SchedulerError("job_handler_not_found", f"job handler not found: {job_code}")
         run_payload = {**dict(job.default_payload or {}), **dict(payload or {})}
+        self._validate_payload_for_job(job, run_payload)
         now = datetime.now(timezone.utc)
         run = await self.repository.record_run(
             {
@@ -150,24 +160,43 @@ class SchedulerService:
                 trigger_source = run_row.trigger_source if run_row else "manual"
                 result = await self._run_with_retry(run_id, job, payload, trigger_source)
                 logger.info(
-                    "scheduler job succeeded: run_id=%s job_code=%s affected_rows=%s",
+                    "scheduler job finished: run_id=%s job_code=%s status=%s affected_rows=%s",
                     run_id,
                     job_code,
+                    result.status,
                     result.affected_rows,
                 )
                 return await self._finish_run(
                     run_id,
-                    status="success",
+                    status=result.status,
                     affected_rows=result.affected_rows,
                     result_summary=result.summary,
                 )
         except TimeoutError as exc:
             logger.warning("scheduler job timeout: run_id=%s job_code=%s error=%s", run_id, job_code, exc)
             return await self._finish_run(run_id, status="timeout", error_code="job_timeout", error_message=str(exc))
+        except asyncio.CancelledError:
+            logger.info("scheduler job cancelled: run_id=%s job_code=%s", run_id, job_code)
+            try:
+                await self.repository.rollback()
+            except Exception:
+                logger.exception("scheduler rollback failed before marking job cancelled: run_id=%s job_code=%s", run_id, job_code)
+            return await asyncio.shield(
+                self._finish_run(
+                    run_id,
+                    status="cancelled",
+                    error_code="job_cancelled",
+                    error_message="job cancellation requested",
+                )
+            )
         except Exception as exc:
             details = getattr(exc, "details", None)
             error_code = getattr(exc, "code", None) or "job_failed"
             logger.exception("scheduler job failed: run_id=%s job_code=%s error_code=%s", run_id, job_code, error_code)
+            try:
+                await self.repository.rollback()
+            except Exception:
+                logger.exception("scheduler rollback failed before marking job failed: run_id=%s job_code=%s", run_id, job_code)
             return await self._finish_run(
                 run_id,
                 status="failed",
@@ -241,21 +270,56 @@ class SchedulerService:
         error_message: str | None = None,
         result_summary: dict | None = None,
     ) -> SchedulerRunRead:
-        row = await self.repository.update_run(
-            run_id,
-            {
-                "status": status,
-                "affected_rows": affected_rows,
-                "finished_at": datetime.now(timezone.utc),
-                "error_code": error_code,
-                "error_message": error_message,
-                "result_summary": result_summary or {},
-            },
-        )
-        await self.repository.commit()
+        values = {
+            "status": status,
+            "affected_rows": affected_rows,
+            "finished_at": datetime.now(timezone.utc),
+            "error_code": error_code,
+            "error_message": error_message,
+            "result_summary": jsonable_encoder(result_summary or {}),
+        }
+        try:
+            row = await self._finish_run_with_repository(self.repository, run_id, values)
+        except Exception:
+            logger.exception(
+                "scheduler finish run failed on current session, retrying with a fresh session: run_id=%s status=%s",
+                run_id,
+                status,
+            )
+            try:
+                await self.repository.rollback()
+            except Exception:
+                logger.exception("scheduler rollback failed after finish-run connection error: run_id=%s", run_id)
+
+            from app.db.session import get_sessionmaker
+
+            async with get_sessionmaker() as session:
+                row = await self._finish_run_with_repository(SchedulerRepository(session), run_id, values)
         if row is None:
             raise SchedulerError("job_run_not_found", f"job run not found: {run_id}")
         return self._run_read(row)
+
+    @staticmethod
+    async def _finish_run_with_repository(
+        repository: SchedulerRepository,
+        run_id: str,
+        values: dict,
+    ) -> SchedulerJobRun | None:
+        row = await repository.update_run(run_id, values)
+        await repository.commit()
+        return row
+
+    async def cancel_run_record(self, run_id: str, *, error_code: str, error_message: str) -> SchedulerRunRead | None:
+        row = await self.repository.cancel_running_run(
+            run_id,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        await self.repository.commit()
+        if row is not None:
+            return self._run_read(row)
+        existing = await self.repository.get_run(run_id)
+        return self._run_read(existing) if existing else None
 
     @staticmethod
     def _job_create_values(payload: SchedulerJobCreate) -> dict:
@@ -270,6 +334,30 @@ class SchedulerService:
         if "metadata" in data:
             data["metadata_json"] = data.pop("metadata")
         return data
+
+    @staticmethod
+    def _validate_job_configuration(values: dict, *, existing: SchedulerJob | None = None) -> None:
+        timezone = values.get("timezone") if "timezone" in values else getattr(existing, "timezone", "Asia/Shanghai")
+        cron_expr = values.get("cron_expr") if "cron_expr" in values else getattr(existing, "cron_expr", None)
+        schema = values.get("parameter_schema") if "parameter_schema" in values else getattr(existing, "parameter_schema", {})
+        default_payload = values.get("default_payload") if "default_payload" in values else getattr(existing, "default_payload", {})
+        legacy_unknown = set(getattr(existing, "default_payload", {}) or {}) - set(schema or {})
+        try:
+            validate_cron_expr(cron_expr, timezone=timezone or "Asia/Shanghai")
+        except CronValidationError as exc:
+            raise SchedulerError("invalid_cron_expr", str(exc)) from exc
+        try:
+            validate_payload(default_payload or {}, schema or {}, allowed_unknown_keys=legacy_unknown)
+        except PayloadValidationError as exc:
+            raise SchedulerError("invalid_job_payload", str(exc)) from exc
+
+    @staticmethod
+    def _validate_payload_for_job(job: SchedulerJob, payload: dict) -> None:
+        legacy_unknown = set(job.default_payload or {}) - set(job.parameter_schema or {})
+        try:
+            validate_payload(payload, job.parameter_schema or {}, allowed_unknown_keys=legacy_unknown)
+        except PayloadValidationError as exc:
+            raise SchedulerError("invalid_job_payload", str(exc)) from exc
 
     @staticmethod
     def _job_read(row: SchedulerJob) -> SchedulerJobRead:

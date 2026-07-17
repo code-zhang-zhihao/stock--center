@@ -42,7 +42,7 @@ class ConfigCenterService:
         return items
 
     async def summary(self) -> ConfigSummaryRead:
-        categories = ["search", "llm", "notification"]
+        categories = ["search", "llm", "notification", "market_data"]
         configs_by_category = {category: await self.repository.list_configs(category_code=category) for category in categories}
         active_values = {}
         for category, configs in configs_by_category.items():
@@ -96,7 +96,8 @@ class ConfigCenterService:
         return [self._value_read(value) for value in values]
 
     async def create_value(self, config_id: int, payload: ConfigValueCreate) -> ConfigValueRead:
-        await self._require_config(config_id)
+        config = await self._require_config(config_id)
+        self._validate_endpoint_url(config, payload.value_kind, payload.endpoint_url)
         secret = payload.secret
         values = payload.model_dump(exclude={"secret"})
         values["system_config_id"] = config_id
@@ -108,7 +109,16 @@ class ConfigCenterService:
         return self._value_read(value)
 
     async def update_value(self, value_id: int, payload: ConfigValueUpdate) -> ConfigValueRead | None:
+        existing = await self.repository.get_value(value_id)
+        if existing is None:
+            return None
+        config = await self._require_config(existing.system_config_id)
         values = payload.model_dump(exclude_unset=True)
+        self._validate_endpoint_url(
+            config,
+            values.get("value_kind", existing.value_kind),
+            values.get("endpoint_url", existing.endpoint_url),
+        )
         secret = values.pop("secret", None)
         if secret is not None:
             values["encrypted_value"] = self.cipher.encrypt(secret)
@@ -135,9 +145,25 @@ class ConfigCenterService:
             return None
         error = None
         available = False
+        details: dict = {}
         try:
             secret = self.cipher.decrypt(value.encrypted_value)
             available = bool(secret) and build_secret_fingerprint(secret) == value.fingerprint
+            config = await self.repository.get_config(value.system_config_id)
+            if available and config and config.category_code == "market_data" and config.config_code == "tushare_pro":
+                from app.modules.market_data.tushare_runtime import TushareProviderFactory
+
+                probe = await TushareProviderFactory(self.repository).probe_value(value_id)
+                available = probe.available
+                error = probe.error
+                details = probe.details
+            elif available and config and config.category_code == "market_data" and config.config_code == "redis_cache":
+                from app.core.redis_client import redis_client
+
+                probe = await redis_client.test_url(secret)
+                available = bool(probe.get("available"))
+                error = probe.get("error")
+                details = {key: value for key, value in probe.items() if key not in {"available", "error"}}
         except Exception as exc:
             error = str(exc)
         await self.repository.record_call(
@@ -150,7 +176,7 @@ class ConfigCenterService:
                 "call_type": "test_value",
                 "status": "success" if available else "failed",
                 "request_summary": {"value_id": value.id},
-                "response_summary": {"available": available, "fingerprint": value.fingerprint},
+                "response_summary": {"available": available, "fingerprint": value.fingerprint, "details": details},
                 "error_code": None if available else "config_value_test_failed",
                 "error_message": error,
                 "finished_at": datetime.now(timezone.utc),
@@ -164,6 +190,7 @@ class ConfigCenterService:
             fingerprint=value.fingerprint,
             status=value.status,
             error=error,
+            details=details,
         )
 
     async def migration_dry_run(self) -> MigrationDryRunRead:
@@ -238,6 +265,7 @@ class ConfigCenterService:
             system_config_id=value.system_config_id,
             value_name=value.value_name,
             value_kind=value.value_kind,
+            endpoint_url=value.endpoint_url,
             fingerprint=value.fingerprint,
             priority=value.priority,
             weight=value.weight,
@@ -251,3 +279,10 @@ class ConfigCenterService:
             created_at=value.created_at,
             updated_at=value.updated_at,
         )
+
+    @staticmethod
+    def _validate_endpoint_url(config: SystemConfig, value_kind: str, endpoint_url: str | None) -> None:
+        if endpoint_url is None:
+            return
+        if config.category_code != "market_data" or config.config_code != "tushare_pro" or value_kind != "token":
+            raise ValueError("endpoint_url is only supported by market_data/tushare_pro token values")

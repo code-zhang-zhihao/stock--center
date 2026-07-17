@@ -124,9 +124,11 @@ class SchedulerStatusRead(BaseModel):
     running: bool
     job_count: int = 0
     jobs: list[dict] = Field(default_factory=list)
+    active_runs: list[dict] = Field(default_factory=list)
     error: str | None = None
 
 
 class JobResult(BaseModel):
+    status: Literal["success", "skipped"] = "success"
     affected_rows: int = 0
     summary: dict = Field(default_factory=dict)

@@ -13,6 +13,7 @@
 
 - 旧行情模块：`stock-analysis/python-api/app/modules/market_data/`
 - 旧股票基础资料同步：`stock-analysis/python-api/app/modules/market_universe/`
+- 旧股票池模块：`stock-analysis/python-api/app/modules/market_universe/`
 - 旧配置模块：`stock-analysis/python-api/app/modules/system_config/`
 - 旧 Provider/Key 模块：`stock-analysis/python-api/app/modules/provider_runtime/`
 - 旧 LLM 模块：`stock-analysis/python-api/app/modules/llm_runtime/`
@@ -113,6 +114,7 @@ Key 规则：
 - `sync_sector_catalog`：每日同步概念/行业板块目录，并维护板块与股票关联。
 - 两个任务写入 `t_scheduler_job`，默认 disabled，先手动验证。
 - 任务运行日志写入 `t_scheduler_job_run`。
+- 调度页面使用 `parameter_schema` 生成默认参数与手动运行表单；可编辑 cron、启停、单次尝试超时、重试次数和重试间隔。Cron 与 payload 均在后端写入或运行前校验。
 - Provider 原始响应通过 `t_provider_raw_record` 留痕。
 
 不迁移：
@@ -126,3 +128,13 @@ Key 规则：
 - 调度中心只负责触发、并发、日志和状态。
 - 行情同步业务由 `MarketDataSyncService` 编排。
 - 同步任务默认 `retry_count=0`，避免手动验证时外部源失败后长时间等待重试。
+
+## 股票池迁移边界
+
+新项目股票池使用 `t_stock_pool/t_stock_pool_member` 和独立 `stock_pool` 模块，不复用旧 `stock_pool_member` 中的来源、评分、原因、持仓成本或策略扩展字段。
+
+- 只 seed `candidate`、`focus`、`holding`、`breakout_retake` 四个系统池，不迁移旧 `daily_core`。
+- 成员只保存 Canonical `stock_code`，一个股票可属于多个池；名称与基础资料通过 `t_stock` 读取。
+- 股票详情只读取 `t_stock` 及 Tushare 当前概念/行业快照，不触发行情 Provider。
+- 添加成员前可通过 `GET /api/v1/stock-pools/{pool_code}/candidate-stocks` 搜索本地正常交易股票；返回当前池是否已有该成员，前端多选后仍调用现有批量新增接口。
+- 自定义池由用户填写稳定的 `pool_code`，系统池身份字段不可改删。

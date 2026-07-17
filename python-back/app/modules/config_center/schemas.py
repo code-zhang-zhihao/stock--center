@@ -1,10 +1,11 @@
 from datetime import datetime
 from typing import Literal
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
-ConfigCategory = Literal["search", "llm", "notification"]
+ConfigCategory = Literal["search", "llm", "notification", "market_data"]
 ValueStatus = Literal["active", "cooldown", "invalid", "disabled"]
 
 
@@ -66,6 +67,7 @@ class ConfigOptionRead(BaseModel):
 class ConfigValueCreate(BaseModel):
     value_name: str = Field(min_length=1, max_length=160)
     value_kind: str = "api_key"
+    endpoint_url: str | None = Field(default=None, max_length=1000)
     secret: str = Field(min_length=1)
     priority: int = 100
     weight: int = 100
@@ -74,10 +76,16 @@ class ConfigValueCreate(BaseModel):
     description: str | None = None
     metadata: dict = Field(default_factory=dict)
 
+    @field_validator("endpoint_url")
+    @classmethod
+    def normalize_endpoint_url(cls, value: str | None) -> str | None:
+        return _normalize_endpoint_url(value)
+
 
 class ConfigValueUpdate(BaseModel):
     value_name: str | None = Field(default=None, min_length=1, max_length=160)
     value_kind: str | None = None
+    endpoint_url: str | None = Field(default=None, max_length=1000)
     secret: str | None = Field(default=None, min_length=1)
     priority: int | None = None
     weight: int | None = None
@@ -88,12 +96,18 @@ class ConfigValueUpdate(BaseModel):
     description: str | None = None
     metadata: dict | None = None
 
+    @field_validator("endpoint_url")
+    @classmethod
+    def normalize_endpoint_url(cls, value: str | None) -> str | None:
+        return _normalize_endpoint_url(value)
+
 
 class ConfigValueRead(BaseModel):
     id: int
     system_config_id: int
     value_name: str
     value_kind: str
+    endpoint_url: str | None = None
     fingerprint: str
     priority: int
     weight: int
@@ -114,6 +128,7 @@ class ConfigValueTestRead(BaseModel):
     fingerprint: str
     status: str
     error: str | None = None
+    details: dict = Field(default_factory=dict)
 
 
 class ConfigItemRead(BaseModel):
@@ -132,3 +147,15 @@ class MigrationDryRunRead(BaseModel):
     source_project: str
     legacy_counts: dict[str, int | None] = Field(default_factory=dict)
     planned_steps: list[str]
+
+
+def _normalize_endpoint_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    endpoint = value.strip()
+    if not endpoint:
+        return None
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("endpoint_url must be an absolute http:// or https:// URL")
+    return endpoint.rstrip("/")

@@ -25,6 +25,7 @@ export interface OptionPayload {
 export interface ValueCreatePayload {
   value_name: string;
   value_kind: string;
+  endpoint_url?: string | null;
   secret: string;
   priority: number;
   weight: number;
@@ -37,6 +38,7 @@ export interface ValueCreatePayload {
 export interface ValueUpdatePayload {
   value_name?: string;
   value_kind?: string;
+  endpoint_url?: string | null;
   secret?: string;
   priority?: number;
   weight?: number;

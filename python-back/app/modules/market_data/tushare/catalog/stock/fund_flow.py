@@ -1,0 +1,12 @@
+from app.modules.market_data.tushare.catalog.common import api, fields, p
+
+
+_RANGE = (p("trade_date", value_type="date"), p("start_date", value_type="date"), p("end_date", value_type="date"))
+SPECS = (
+    api("moneyflow", "stock.fund_flow", 170, min_points=2000, params=(p("ts_code"),) + _RANGE, output_fields=fields("ts_code", "trade_date", "buy_sm_vol", "buy_sm_amount", "sell_sm_vol", "sell_sm_amount", "buy_md_vol", "buy_md_amount", "sell_md_vol", "sell_md_amount", "buy_lg_vol", "buy_lg_amount", "sell_lg_vol", "sell_lg_amount", "buy_elg_vol", "buy_elg_amount", "sell_elg_vol", "sell_elg_amount", "net_mf_vol", "net_mf_amount"), audit_params={"ts_code": "600519.SH", "start_date": "20260613", "end_date": "20260622"}),
+    api("moneyflow_hsgt", "stock.fund_flow", 47, min_points=2000, params=_RANGE, output_fields=fields("trade_date", "ggt_ss", "ggt_sz", "hgt", "sgt", "north_money", "south_money"), audit_params={"start_date": "20260613", "end_date": "20260622"}),
+    api("hsgt_top10", "stock.fund_flow", 47, min_points=2000, params=(p("trade_date", True, "date"), p("market_type", enum=("1", "3"))), output_fields=fields("trade_date", "ts_code", "name", "close", "change", "rank", "market_type", "amount", "net_amount", "buy", "sell"), audit_params={"trade_date": "20260620"}),
+    api("hk_hold", "stock.fund_flow", 188, min_points=2000, params=(p("ts_code"), p("trade_date", value_type="date"), p("start_date", value_type="date"), p("end_date", value_type="date"), p("exchange", enum=("SH", "SZ"))), output_fields=fields("ts_code", "trade_date", "name", "vol", "ratio", "exchange"), audit_params={"trade_date": "20260620"}, allow_extra_params=True),
+    api("moneyflow_cnt_ths", "stock.fund_flow", 371, min_points=6000, params=(p("ts_code"),) + _RANGE, output_fields=fields("trade_date", "ts_code", "name", "lead_stock", "close_price", "pct_change", "industry_index", "company_num", "pct_change_stock", "net_buy_amount", "net_sell_amount", "net_amount"), audit_params={"ts_code": "885748.TI", "start_date": "20260613", "end_date": "20260622"}),
+    api("moneyflow_ind_ths", "stock.fund_flow", 343, min_points=6000, params=(p("ts_code"),) + _RANGE, output_fields=fields("trade_date", "ts_code", "industry", "lead_stock", "close", "pct_change", "company_num", "pct_change_stock", "close_price", "net_buy_amount", "net_sell_amount", "net_amount"), audit_params={"start_date": "20260613", "end_date": "20260622"}),
+)

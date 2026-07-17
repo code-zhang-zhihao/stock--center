@@ -110,7 +110,7 @@
                 </div>
               </n-tab-pane>
 
-              <n-tab-pane v-if="showOptionsTab" name="options" :tab="activeCategory === 'llm' ? '模型参数' : '渠道参数'">
+              <n-tab-pane v-if="showOptionsTab" name="options" :tab="optionsTabLabel">
                 <div class="helper-line">{{ optionHelperText }}</div>
                 <n-empty v-if="optionRows.length === 0" description="暂无可编辑参数" />
                 <div v-else class="table-wrap">
@@ -165,8 +165,11 @@
         <n-form-item label="类型">
           <n-select v-model:value="valueForm.value_kind" :options="valueKindOptions" />
         </n-form-item>
-        <n-form-item label="Secret">
+        <n-form-item :label="secretInputLabel">
           <n-input v-model:value="valueForm.secret" type="password" show-password-on="click" />
+        </n-form-item>
+        <n-form-item v-if="isTushareTokenConfig" label="专属 API URL" class="span-2">
+          <n-input v-model:value="valueForm.endpoint_url" placeholder="留空则使用默认 API URL" />
         </n-form-item>
         <n-form-item label="运行时用途">
           <n-input :value="runtimePurposeLabel" disabled />
@@ -183,7 +186,7 @@
         <n-form-item label="描述" class="span-2">
           <n-input v-model:value="valueForm.description" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }" />
         </n-form-item>
-        <n-alert class="span-2" type="warning" :bordered="false">Secret 只提交一次，保存后页面不会显示明文。</n-alert>
+        <n-alert class="span-2" type="warning" :bordered="false">敏感值只提交一次，保存后页面不会显示明文。</n-alert>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -201,8 +204,11 @@
         <n-form-item label="状态">
           <n-select v-model:value="valueEditForm.status" :options="valueStatusOptions" />
         </n-form-item>
-        <n-form-item label="替换 Secret">
+        <n-form-item :label="`替换 ${secretInputLabel}`">
           <n-input v-model:value="valueEditForm.secret" type="password" show-password-on="click" placeholder="留空则不修改" />
+        </n-form-item>
+        <n-form-item v-if="isTushareTokenConfig" label="专属 API URL" class="span-2">
+          <n-input v-model:value="valueEditForm.endpoint_url" placeholder="留空则使用默认 API URL" />
         </n-form-item>
         <n-form-item label="优先级">
           <n-input-number v-model:value="valueEditForm.priority" :min="1" :max="9999" />
@@ -230,7 +236,7 @@
 <script setup lang="ts">
 import { computed, h, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { Bell, Bot, Edit3, KeyRound, RefreshCw, Search } from 'lucide-vue-next';
+import { Bell, Bot, Database, Edit3, KeyRound, RefreshCw, Search } from 'lucide-vue-next';
 import {
   NAlert,
   NBadge,
@@ -266,15 +272,16 @@ const categories = [
   { value: 'search' as const, label: 'Search', icon: Search, description: '问财、妙想、Kimi Search 的共享 Key 池。' },
   { value: 'llm' as const, label: 'LLM', icon: Bot, description: '固定 LLM 模型配置、默认模型和 Key 池。' },
   { value: 'notification' as const, label: 'Notification', icon: Bell, description: '飞书、邮件、自定义 Webhook 的渠道配置。' },
+  { value: 'market_data' as const, label: '数据源', icon: Database, description: 'Tushare Pro、Redis Cache 等数据源与运行参数。' },
 ];
 
 const activeCategory = ref<ConfigCategory>(normalizeCategory(route.params.domain));
 const activeTab = ref('basic');
 const keyword = ref('');
 const loading = ref(false);
-const itemsByCategory = reactive<Record<ConfigCategory, ConfigItem[]>>({ search: [], llm: [], notification: [] });
+const itemsByCategory = reactive<Record<ConfigCategory, ConfigItem[]>>({ search: [], llm: [], notification: [], market_data: [] });
 const selectedItem = ref<ConfigItem | null>(null);
-const summaryCounts = reactive({ search: 0, llm: 0, notification: 0 });
+const summaryCounts = reactive({ search: 0, llm: 0, notification: 0, market_data: 0 });
 
 const configForm = reactive({
   config_name: '',
@@ -297,6 +304,7 @@ const valueForm = reactive({
   value_name: 'primary',
   value_kind: 'api_key',
   secret: '',
+  endpoint_url: '',
   priority: 100,
   weight: 100,
   is_enabled: true,
@@ -307,6 +315,7 @@ const valueEditForm = reactive({
   value_name: '',
   status: 'active',
   secret: '',
+  endpoint_url: '',
   priority: 100,
   weight: 100,
   is_enabled: true,
@@ -315,6 +324,8 @@ const valueEditForm = reactive({
 
 const valueStatusOptions = ['active', 'cooldown', 'invalid', 'disabled'].map((value) => ({ label: value, value }));
 const valueKindOptions = computed(() => {
+  if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return [{ label: 'redis_url', value: 'redis_url' }];
+  if (activeCategory.value === 'market_data') return [{ label: 'token', value: 'token' }];
   if (activeCategory.value !== 'notification') return [{ label: 'api_key', value: 'api_key' }];
   if (selectedItem.value?.config.config_code === 'email') return [{ label: 'smtp_password', value: 'smtp_password' }];
   return [
@@ -326,10 +337,14 @@ const valueKindOptions = computed(() => {
 
 const activeCategoryMeta = computed(() => categories.find((item) => item.value === activeCategory.value) || categories[0]);
 const activeItems = computed(() => itemsByCategory[activeCategory.value]);
+const isTushareTokenConfig = computed(() => activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tushare_pro');
+const isRedisCacheConfig = computed(() => activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache');
+const optionsTabLabel = computed(() => activeCategory.value === 'llm' ? '模型参数' : activeCategory.value === 'market_data' ? '数据源参数' : '渠道参数');
 const categoryCounts = computed(() => ({
   search: summaryCounts.search || itemsByCategory.search.length,
   llm: summaryCounts.llm || itemsByCategory.llm.length,
   notification: summaryCounts.notification || itemsByCategory.notification.length,
+  market_data: summaryCounts.market_data || itemsByCategory.market_data.length,
 }));
 const filteredItems = computed(() => {
   const needle = keyword.value.trim().toLowerCase();
@@ -342,8 +357,15 @@ const showOptionsTab = computed(() => activeCategory.value !== 'search');
 const showValuesTab = computed(() => activeCategory.value !== 'notification');
 const optionRows = computed(() => (selectedItem.value?.options || []).map((option, index) => ({ ...option, rowIndex: index })));
 const optionHelperText = computed(() => {
+  if (isRedisCacheConfig.value) return 'Redis URL 放在敏感值池；这里只维护缓存后端、Key 前缀、超时和数据中心缓存 TTL。';
+  if (activeCategory.value === 'market_data') return '默认 API URL 仅供未设置专属 URL 的 Token 使用。';
   if (activeCategory.value === 'notification') return '通知渠道参数直接在这里维护，包括 Webhook URL、SMTP Password 和 Token。';
   return '这里只编辑非敏感模型参数；API Key 放在敏感值池。';
+});
+const secretInputLabel = computed(() => {
+  if (isRedisCacheConfig.value) return 'Redis URL';
+  if (isTushareTokenConfig.value) return 'Token';
+  return 'API Key / Secret';
 });
 const runtimePurposeLabel = computed(() => {
   const code = selectedItem.value?.config.config_code;
@@ -351,6 +373,8 @@ const runtimePurposeLabel = computed(() => {
   if (code === 'miaoxiang_search') return '妙想 Skill 入口';
   if (code === 'kimi_search') return 'Kimi Web Search';
   if (activeCategory.value === 'llm') return 'LLM 调用入口';
+  if (code === 'tushare_pro') return 'Tushare Pro 行情与专题数据入口';
+  if (code === 'redis_cache') return '数据中心缓存与通用运行时缓存';
   if (code === 'feishu') return '飞书 Webhook';
   if (code === 'email') return 'SMTP Password';
   if (code === 'webhook') return 'Webhook URL / Token';
@@ -373,7 +397,8 @@ const optionColumns: DataTableColumns<ConfigOption & { rowIndex: number }> = [
   },
 ];
 
-const valueColumns: DataTableColumns<ConfigValue> = [
+const valueColumns = computed<DataTableColumns<ConfigValue>>(() => {
+  const columns: DataTableColumns<ConfigValue> = [
   { title: 'ID', key: 'id', width: 70 },
   { title: '名称', key: 'value_name', width: 140, ellipsis: { tooltip: true } },
   { title: '类型', key: 'value_kind', width: 130, ellipsis: { tooltip: true } },
@@ -395,7 +420,18 @@ const valueColumns: DataTableColumns<ConfigValue> = [
       ]);
     },
   },
-];
+  ];
+  if (isTushareTokenConfig.value) {
+    columns.splice(4, 0, {
+      title: '生效入口',
+      key: 'endpoint_url',
+      width: 220,
+      ellipsis: { tooltip: true },
+      render: (row) => row.endpoint_url || '使用默认 URL',
+    });
+  }
+  return columns;
+});
 
 watch(
   () => route.params.domain,
@@ -418,7 +454,7 @@ onMounted(async () => {
 });
 
 function normalizeCategory(value: unknown): ConfigCategory {
-  return value === 'llm' || value === 'notification' || value === 'search' ? value : 'search';
+  return value === 'llm' || value === 'notification' || value === 'search' || value === 'market_data' ? value : 'search';
 }
 
 function switchCategory(category: ConfigCategory) {
@@ -431,6 +467,7 @@ async function loadSummary() {
     summaryCounts.search = summary.categories.search || 0;
     summaryCounts.llm = summary.categories.llm || 0;
     summaryCounts.notification = summary.categories.notification || 0;
+    summaryCounts.market_data = summary.categories.market_data || 0;
   } catch {
     // Domain item endpoints are the source of truth.
   }
@@ -542,6 +579,7 @@ function openValueModal() {
   valueForm.value_name = defaultValueName();
   valueForm.value_kind = defaultValueKind();
   valueForm.secret = '';
+  valueForm.endpoint_url = '';
   valueForm.priority = 100;
   valueForm.weight = 100;
   valueForm.is_enabled = true;
@@ -552,7 +590,7 @@ function openValueModal() {
 async function saveValue() {
   if (!selectedItem.value) return;
   if (!valueForm.secret.trim()) {
-    message.warning('请输入 Secret');
+    message.warning(`请输入${secretInputLabel.value}`);
     return;
   }
   savingValue.value = true;
@@ -561,6 +599,7 @@ async function saveValue() {
       value_name: valueForm.value_name,
       value_kind: valueForm.value_kind,
       secret: valueForm.secret,
+      endpoint_url: isTushareTokenConfig.value ? (valueForm.endpoint_url.trim() || null) : undefined,
       priority: valueForm.priority,
       weight: valueForm.weight,
       status: 'active',
@@ -585,6 +624,7 @@ function openValueEdit(row: ConfigValue) {
   valueEditForm.value_name = row.value_name;
   valueEditForm.status = row.status;
   valueEditForm.secret = '';
+  valueEditForm.endpoint_url = row.endpoint_url || '';
   valueEditForm.priority = row.priority;
   valueEditForm.weight = row.weight;
   valueEditForm.is_enabled = row.is_enabled;
@@ -600,12 +640,14 @@ async function saveValueEdit() {
       value_name: valueEditForm.value_name,
       status: valueEditForm.status,
       ...(valueEditForm.secret.trim() ? { secret: valueEditForm.secret.trim() } : {}),
+      ...(isTushareTokenConfig.value ? { endpoint_url: valueEditForm.endpoint_url.trim() || null } : {}),
       priority: valueEditForm.priority,
       weight: valueEditForm.weight,
       is_enabled: valueEditForm.is_enabled,
       description: valueEditForm.description || null,
     });
     valueEditForm.secret = '';
+    valueEditForm.endpoint_url = '';
     valueEditOpen.value = false;
     await reloadActive();
     message.success('敏感值已更新');
@@ -647,7 +689,11 @@ function deleteValue(row: ConfigValue) {
 async function testValue(row: ConfigValue) {
   try {
     const result = await configApi.testValue(row.id);
-    if (result.available) message.success(`敏感值可用：${result.fingerprint}`);
+    if (result.available) {
+      const isTushareToken = activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tushare_pro';
+      const isRedisUrl = activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache';
+      message.success(isTushareToken ? 'Tushare 日线连通性正常' : isRedisUrl ? 'Redis 连接正常' : `敏感值可用：${result.fingerprint}`);
+    }
     else message.warning(`敏感值不可用：${result.error || result.status}`);
   } catch (error) {
     message.error(errorMessage(error, '测试敏感值失败'));
@@ -655,12 +701,16 @@ async function testValue(row: ConfigValue) {
 }
 
 function defaultValueKind(): string {
+  if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return 'redis_url';
+  if (activeCategory.value === 'market_data') return 'token';
   if (activeCategory.value !== 'notification') return 'api_key';
   if (selectedItem.value?.config.config_code === 'email') return 'smtp_password';
   return 'webhook_url';
 }
 
 function defaultValueName(): string {
+  if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return 'redis_connection';
+  if (activeCategory.value === 'market_data') return 'tushare_token';
   if (activeCategory.value === 'notification') return defaultValueKind();
   return 'primary';
 }

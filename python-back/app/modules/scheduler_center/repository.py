@@ -130,6 +130,33 @@ class SchedulerRepository:
         )
         return result.scalar_one_or_none()
 
+    async def cancel_running_run(self, run_id: str, *, error_code: str, error_message: str) -> SchedulerJobRun | None:
+        result = await self.session.execute(
+            update(SchedulerJobRun)
+            .where(SchedulerJobRun.run_id == run_id, SchedulerJobRun.status == "running")
+            .values(
+                status="cancelled",
+                finished_at=datetime.now(timezone.utc),
+                error_code=error_code,
+                error_message=error_message,
+            )
+            .returning(SchedulerJobRun)
+        )
+        return result.scalar_one_or_none()
+
+    async def mark_orphaned_running_runs(self, *, error_code: str, error_message: str) -> int:
+        result = await self.session.execute(
+            update(SchedulerJobRun)
+            .where(SchedulerJobRun.status == "running")
+            .values(
+                status="failed",
+                finished_at=datetime.now(timezone.utc),
+                error_code=error_code,
+                error_message=error_message,
+            )
+        )
+        return int(result.rowcount or 0)
+
     async def list_runs_for_api(
         self,
         *,

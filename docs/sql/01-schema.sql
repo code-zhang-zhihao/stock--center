@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS t_index_component (
     source VARCHAR(80),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (index_code, stock_code, effective_date, source)
+    UNIQUE (index_code, stock_code)
 );
 
 CREATE TABLE IF NOT EXISTS t_index_bar (
@@ -434,7 +434,7 @@ COMMENT ON COLUMN t_sector_component.sector_code IS '板块代码。';
 COMMENT ON COLUMN t_sector_component.stock_code IS '股票代码。';
 COMMENT ON COLUMN t_sector_component.weight IS '成分权重。';
 COMMENT ON COLUMN t_sector_component.start_date IS '纳入日期。';
-COMMENT ON COLUMN t_sector_component.end_date IS '移出日期。';
+COMMENT ON COLUMN t_sector_component.end_date IS '历史兼容字段；当前快照同步不再写入。';
 COMMENT ON COLUMN t_sector_component.source IS '数据来源。';
 COMMENT ON COLUMN t_sector_component.metadata IS '扩展信息。';
 COMMENT ON COLUMN t_sector_component.created_at IS '创建时间。';
@@ -463,12 +463,12 @@ COMMENT ON COLUMN t_index_basic.metadata IS '扩展信息。';
 COMMENT ON COLUMN t_index_basic.created_at IS '创建时间。';
 COMMENT ON COLUMN t_index_basic.updated_at IS '更新时间。';
 
-COMMENT ON TABLE t_index_component IS 'Canonical 预留：指数成分股。';
+COMMENT ON TABLE t_index_component IS 'Canonical：指数当前成分股主数据，只保留当前有效关联。';
 COMMENT ON COLUMN t_index_component.id IS '主键 ID。';
 COMMENT ON COLUMN t_index_component.index_code IS '指数代码。';
 COMMENT ON COLUMN t_index_component.stock_code IS '股票代码。';
 COMMENT ON COLUMN t_index_component.weight IS '成分权重。';
-COMMENT ON COLUMN t_index_component.effective_date IS '成分生效日期。';
+COMMENT ON COLUMN t_index_component.effective_date IS '成分纳入或权重生效日期；不作为快照维度。';
 COMMENT ON COLUMN t_index_component.source IS '数据来源。';
 COMMENT ON COLUMN t_index_component.metadata IS '扩展信息。';
 COMMENT ON COLUMN t_index_component.created_at IS '创建时间。';
