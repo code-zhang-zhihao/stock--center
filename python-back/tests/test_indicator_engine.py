@@ -46,6 +46,23 @@ def test_daily_factor_is_derived_from_canonical_bar_history() -> None:
     assert row["ma5"] == 117
     assert row["ma20"] == 109.5
     assert row["features"]["history_days"] == 20
+    assert row["ma30"] == 109.5
+    assert row["ma60"] == 109.5
+    assert "ma30" in row["features"]["missing_windows"]
+    assert "ma60" in row["features"]["missing_windows"]
+
+
+def test_daily_factor_calculates_ma30_and_ma60_when_history_is_available() -> None:
+    service = IndicatorEngineService(repository=None)
+    trade_date = date(2026, 6, 22)
+    bars = [_daily_bar(trade_date - timedelta(days=59 - index), 100 + index) for index in range(60)]
+
+    row, insufficient = service._daily_factor("600519", trade_date, bars)
+
+    assert insufficient is False
+    assert row is not None
+    assert row["ma30"] == 144.5
+    assert row["ma60"] == 129.5
 
 
 def test_minute_factor_uses_canonical_minutes_and_keeps_trade_date() -> None:

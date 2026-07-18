@@ -58,10 +58,12 @@
 52. `52-daily-factor-backfill-set-based.sql`：历史日频因子回填改为 PostgreSQL 集合计算，移除 Python 计算和时间窗口并发参数，保留交易日窗口与受控数据库股票分片大小。
 53. `53-realtime-market-runtime.sql`：新增 `market_data/realtime_market` 固定配置，seed MooTDX 全市场 Quote 与优先股票分钟线实时缓存参数；数据只写 Redis/内存，不写 PostgreSQL 日频事实。
 54. `54-backfill-minute-factor-and-technical-snapshot.sql`：将 `backfill_technical_snapshots` 收口为历史分钟因子与技术快照回填；`rebuild` 会同时重算 `t_stock_factor_minute` 和 `t_technical_indicator_snapshot`，用于公式升级后的可控修复。
+55. `55-data-asset-history-pipelines.sql`：建立历史初始化入口基线。新增 `t_stock_factor_daily.ma30/ma60` 和 `t_index_factor_daily`，seed 个股/板块/指数各“日频事实 + 日频因子”两段任务，并删除被替换的 7 条旧任务定义；历史运行日志保留。
+56. `56-sector-history-range-backfill.sql`：修正历史板块日频事实任务参数。`ths_daily` 改为逐板块一次完整日期区间请求，默认 12 个板块 worker；板块资金流默认使用已实测验证的 20 交易日窗口和 2 个窗口 worker。
 
 ## 产品化初始化规划
 
-当前 01-50 是开发期演进 SQL，适合追踪架构变更，但不适合作为最终产品部署入口。下一轮数据库收敛需要生成：
+当前 01-56 是开发期演进 SQL，适合追踪架构变更，但不适合作为最终产品部署入口。下一轮数据库收敛需要生成：
 
 ```text
 docs/sql/init.sql
@@ -162,3 +164,7 @@ cd python-back
 `51-daily-factor-backfill-window-batching.sql` 是已执行的历史元数据调整，不改事实表结构。它曾使用 Python 股票批次和时间窗口并发；当前运行方式以 52 为准。
 
 `52-daily-factor-backfill-set-based.sql` 取代 51 的运行方式：`backfill_daily_factors` 每个连续交易日窗口在 PostgreSQL 内用窗口函数和 `INSERT ... SELECT` 计算，避免把重叠日线、资金流和完整专业技术 JSONB 反复传到 Python。为避免单条全市场 CTE 占满云端数据库内存，窗口会按 `sql_stock_chunk_size`（默认 200）分成独立提交的集合计算分片。`append_safe` 仍只插入缺失因子，`rebuild` 仍先删除指定股票池和日期窗口后重算。执行本 SQL 后 reload Scheduler。
+
+`55-data-asset-history-pipelines.sql` 建立历史初始化任务基线，必须在 `54` 之后执行。它用 `backfill_stock_daily_facts/backfill_stock_daily_factors/backfill_sector_daily_facts/backfill_sector_daily_factors/backfill_index_daily_facts/backfill_index_daily_factors` 替换旧历史任务定义；旧 `29/34/35/46/49/50/51/52/54` 仍保留为升级历史，不代表当前可执行任务名。随后执行 `56`、reload Scheduler，并按 `docs/wiki/20-核心流程/历史数据资产初始化.md` 先做最小范围 smoke。
+
+`56-sector-history-range-backfill.sql` 只更新 `backfill_sector_daily_facts` 的调度参数和说明，不改事实表。旧实现按交易日请求 `ths_daily`，当全量日期查询返回空时会退化成每日逐板块串行请求。新实现按板块代码请求一次完整 `start_date/end_date` 区间，每个板块完成后立即提交；执行 `56` 后 reload Scheduler。

@@ -384,6 +384,8 @@ class StockFactorDaily(Base):
     ma5: Mapped[float | None]
     ma10: Mapped[float | None]
     ma20: Mapped[float | None]
+    ma30: Mapped[float | None]
+    ma60: Mapped[float | None]
     return_1d: Mapped[float | None]
     amplitude: Mapped[float | None]
     volume_ratio: Mapped[float | None]
@@ -695,6 +697,32 @@ class SectorFactorDaily(Base):
     average_change_pct: Mapped[float | None]
     volatility_20d: Mapped[float | None]
     tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at = created_at_column()
+    updated_at = updated_at_column()
+
+
+class IndexFactorDaily(Base):
+    __tablename__ = "t_index_factor_daily"
+    __table_args__ = (UniqueConstraint("index_code", "trade_date", name="uq_t_index_factor_daily_business"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    index_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False, default="system:history_backfill")
+    ma5: Mapped[float | None]
+    ma10: Mapped[float | None]
+    ma20: Mapped[float | None]
+    ma30: Mapped[float | None]
+    ma60: Mapped[float | None]
+    return_1d: Mapped[float | None]
+    amplitude: Mapped[float | None]
+    volume_ratio: Mapped[float | None]
+    amount_ratio: Mapped[float | None]
+    volatility_20d: Mapped[float | None]
+    turnover_rate: Mapped[float | None]
+    pe_ttm: Mapped[float | None]
+    pb: Mapped[float | None]
     features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at = created_at_column()
     updated_at = updated_at_column()

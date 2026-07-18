@@ -38,6 +38,7 @@ app/modules/market_data/__init__.py
 app/modules/market_data/api.py
 app/modules/market_data/capabilities.py
 app/modules/market_data/close_ingest.py
+app/modules/market_data/entity_history_backfill.py
 app/modules/market_data/history_backfill.py
 app/modules/market_data/models.py
 app/modules/market_data/partitioning.py

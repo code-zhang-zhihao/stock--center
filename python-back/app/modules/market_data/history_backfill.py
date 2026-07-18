@@ -34,7 +34,7 @@ class StockDailyBackfillRequest(BaseModel):
     ingest_mode: Literal["append_safe", "rebuild"] = "append_safe"
     only_missing: bool = True
     max_stocks: int | None = Field(default=None, ge=1)
-    workers: int = Field(default=4, ge=1, le=10)
+    workers: int = Field(default=12, ge=1, le=20)
     commit_stock_batch_size: int = Field(default=20, ge=1, le=200)
     max_upsert_rows_per_commit: int = Field(default=5000, ge=100, le=50000)
     fail_fast: bool = False
@@ -65,6 +65,22 @@ class StockDailyBackfillResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class StockDailyFactsBackfillResult(BaseModel):
+    pool_code: str
+    start_date: date
+    end_date: date
+    stock_count: int = 0
+    fact_results: dict[str, StockDailyBackfillResult] = Field(default_factory=dict)
+    completed_fact_count: int = 0
+    failed_stock_fact_count: int = 0
+    fetched_rows: int = 0
+    upserted_rows: int = 0
+    rebuild_deleted_rows: int = 0
+    workers: int
+    ingest_mode: Literal["append_safe", "rebuild"]
+    warnings: list[str] = Field(default_factory=list)
+
+
 def _ts_code(stock_code: str) -> str:
     code = normalize_symbol(stock_code)
     if code.startswith("6"):
@@ -89,6 +105,45 @@ class StockDailyBackfillService:
 
     async def run_stock_technical_factor_pro(self, payload: StockDailyBackfillRequest) -> StockDailyBackfillResult:
         return await self._run_fact(payload, "stock_technical_factor_pro")
+
+    async def run_all(self, payload: StockDailyBackfillRequest) -> StockDailyFactsBackfillResult:
+        """Backfill the four stock daily fact families as one resumable pipeline."""
+        end_date = payload.end_date or await self._resolve_latest_trade_date()
+        resolved_payload = payload.model_copy(update={"end_date": end_date})
+        fact_results: dict[str, StockDailyBackfillResult] = {}
+        for fact_kind in ("daily", "daily_basic", "moneyflow", "stock_technical_factor_pro"):
+            fact_results[fact_kind] = await self._run_fact(resolved_payload, fact_kind)
+
+        first = fact_results["daily"]
+        result = StockDailyFactsBackfillResult(
+            pool_code=first.pool_code,
+            start_date=first.start_date,
+            end_date=first.end_date,
+            stock_count=first.stock_count,
+            fact_results=fact_results,
+            completed_fact_count=len(fact_results),
+            failed_stock_fact_count=sum(item.failed_stock_count for item in fact_results.values()),
+            fetched_rows=sum(item.fetched_rows for item in fact_results.values()),
+            upserted_rows=sum(item.upserted_rows for item in fact_results.values()),
+            rebuild_deleted_rows=sum(item.rebuild_deleted_rows for item in fact_results.values()),
+            workers=resolved_payload.workers,
+            ingest_mode=resolved_payload.ingest_mode,
+        )
+        for fact_kind, item in fact_results.items():
+            result.warnings.extend(f"{fact_kind}: {warning}" for warning in item.warnings)
+            if item.failed_stock_count:
+                result.warnings.append(f"{fact_kind} 失败股票数: {item.failed_stock_count}")
+        logger.info(
+            "stock daily facts pipeline finished: pool=%s stocks=%s facts=%s failed_stock_facts=%s fetched_rows=%s upserted_rows=%s rebuild_deleted=%s",
+            result.pool_code,
+            result.stock_count,
+            result.completed_fact_count,
+            result.failed_stock_fact_count,
+            result.fetched_rows,
+            result.upserted_rows,
+            result.rebuild_deleted_rows,
+        )
+        return result
 
     async def _run_fact(self, payload: StockDailyBackfillRequest, fact_kind: StockFactKind) -> StockDailyBackfillResult:
         end_date = payload.end_date or await self._resolve_latest_trade_date()

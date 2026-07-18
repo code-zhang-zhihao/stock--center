@@ -2,6 +2,12 @@ from app.db.session import get_sessionmaker
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.indicator_engine.backfill import FactorBackfillRequest, FactorBackfillService
 from app.modules.market_data.close_ingest import DailyMarketCloseIngestRequest, DailyMarketCloseIngestService
+from app.modules.market_data.entity_history_backfill import (
+    IndexDailyFactsBackfillRequest,
+    IndexDailyFactsBackfillService,
+    SectorDailyFactsBackfillRequest,
+    SectorDailyFactsBackfillService,
+)
 from app.modules.market_data.history_backfill import StockDailyBackfillRequest, StockDailyBackfillService
 from app.modules.market_data.repository import MarketDataRepository
 from app.modules.market_data.sync_service import (
@@ -347,8 +353,8 @@ class SyncIndexCatalogHandler:
         )
 
 
-class BackfillStockDailyBarsHandler:
-    job_code = "backfill_stock_daily_bars"
+class BackfillStockDailyFactsHandler:
+    job_code = "backfill_stock_daily_facts"
     job_type = "market_data"
     parameter_schema = {
         "pool_code": {
@@ -356,14 +362,14 @@ class BackfillStockDailyBarsHandler:
             "type": "string",
             "default": "all_a_share",
             "required": True,
-            "description": "指定需要回填历史日 K 的股票池；all_a_share 表示沪深 active 动态全市场。",
+            "description": "指定需要回填四类个股日频事实的股票池；all_a_share 表示沪深 active 动态全市场。",
         },
         "start_date": {
             "label": "开始日期",
             "type": "string",
             "default": "2024-01-01",
             "required": True,
-            "description": "历史日 K 回填开始日期，格式 YYYY-MM-DD。",
+            "description": "日线、daily_basic、资金流和专业技术因子回填开始日期，格式 YYYY-MM-DD。",
         },
         "end_date": {
             "label": "结束日期",
@@ -396,11 +402,11 @@ class BackfillStockDailyBarsHandler:
         "workers": {
             "label": "并发 worker 数",
             "type": "number",
-            "default": 4,
+            "default": 12,
             "required": False,
             "min": 1,
-            "max": 10,
-            "description": "并发拉取 Tushare daily 的 worker 数；仍受 Tushare Token 池限频控制。",
+            "max": 20,
+            "description": "每个事实阶段并发逐股调用 Tushare 的 worker 数；默认 12，仍受 Token 池实际限频控制。",
         },
         "commit_stock_batch_size": {
             "label": "提交批次股票数",
@@ -409,7 +415,16 @@ class BackfillStockDailyBarsHandler:
             "required": False,
             "min": 1,
             "max": 200,
-            "description": "每个 worker 累积多少只股票的日 K 后提交一次；底层 upsert 仍会按 PostgreSQL 参数上限拆分。",
+            "description": "每个 worker 累积多少只股票的数据后提交一次；底层 upsert 仍会按 PostgreSQL 参数上限拆分。",
+        },
+        "max_upsert_rows_per_commit": {
+            "label": "单次提交最大行数",
+            "type": "number",
+            "default": 5000,
+            "required": False,
+            "min": 100,
+            "max": 50000,
+            "description": "每个 worker 单次事务最多提交的行数；四个接口仍按单股完整日期区间各请求一次。",
         },
         "fail_fast": {
             "label": "遇错立即失败",
@@ -426,8 +441,9 @@ class BackfillStockDailyBarsHandler:
         "ingest_mode": "append_safe",
         "only_missing": True,
         "max_stocks": None,
-        "workers": 4,
+        "workers": 12,
         "commit_stock_batch_size": 20,
+        "max_upsert_rows_per_commit": 5000,
         "fail_fast": False,
     }
     force_async = True
@@ -435,38 +451,7 @@ class BackfillStockDailyBarsHandler:
     async def run(self, context: JobExecutionContext) -> JobResult:
         payload = StockDailyBackfillRequest(**{**self.default_payload, **context.payload})
         service = StockDailyBackfillService(get_sessionmaker())
-        result = await service.run(payload)
-        status = "success" if result.failed_stock_count == 0 else "success"
-        return JobResult(
-            status=status,
-            affected_rows=result.upserted_rows,
-            summary=result.model_dump(mode="json"),
-        )
-
-
-class BackfillStockDailyBasicHandler(BackfillStockDailyBarsHandler):
-    job_code = "backfill_stock_daily_basic"
-    parameter_schema = {
-        **BackfillStockDailyBarsHandler.parameter_schema,
-        "pool_code": {
-            **BackfillStockDailyBarsHandler.parameter_schema["pool_code"],
-            "description": "指定需要回填 daily_basic 的股票池；all_a_share 表示沪深 active 动态全市场。",
-        },
-        "start_date": {
-            **BackfillStockDailyBarsHandler.parameter_schema["start_date"],
-            "description": "daily_basic 回填开始日期，格式 YYYY-MM-DD。",
-        },
-        "only_missing": {
-            **BackfillStockDailyBarsHandler.parameter_schema["only_missing"],
-            "description": "兼容参数：append_safe 模式下为 true 表示只补缺失；rebuild 模式会忽略它。",
-        },
-    }
-    default_payload = {**BackfillStockDailyBarsHandler.default_payload}
-
-    async def run(self, context: JobExecutionContext) -> JobResult:
-        payload = StockDailyBackfillRequest(**{**self.default_payload, **context.payload})
-        service = StockDailyBackfillService(get_sessionmaker())
-        result = await service.run_daily_basic(payload)
+        result = await service.run_all(payload)
         return JobResult(
             status="success",
             affected_rows=result.upserted_rows,
@@ -474,80 +459,120 @@ class BackfillStockDailyBasicHandler(BackfillStockDailyBarsHandler):
         )
 
 
-class BackfillStockMoneyflowHandler(BackfillStockDailyBarsHandler):
-    job_code = "backfill_stock_moneyflow"
+class BackfillSectorDailyFactsHandler:
+    job_code = "backfill_sector_daily_facts"
+    job_type = "market_data"
     parameter_schema = {
-        **BackfillStockDailyBarsHandler.parameter_schema,
-        "pool_code": {
-            **BackfillStockDailyBarsHandler.parameter_schema["pool_code"],
-            "description": "指定需要回填个股资金流的股票池；all_a_share 表示沪深 active 动态全市场。",
-        },
-        "start_date": {
-            **BackfillStockDailyBarsHandler.parameter_schema["start_date"],
-            "description": "个股资金流回填开始日期，格式 YYYY-MM-DD。",
-        },
-        "only_missing": {
-            **BackfillStockDailyBarsHandler.parameter_schema["only_missing"],
-            "description": "兼容参数：append_safe 模式下为 true 表示只补缺失；rebuild 模式会忽略它。",
-        },
-        "max_upsert_rows_per_commit": {
-            "label": "单次提交最大行数",
-            "type": "number",
-            "default": 5000,
+        "start_date": {"label": "开始日期", "type": "string", "default": "2024-01-01", "required": True},
+        "end_date": {"label": "结束日期", "type": "string", "required": False, "description": "为空时使用最近开市日。"},
+        "ingest_mode": {
+            "label": "入库模式",
+            "type": "string",
+            "default": "append_safe",
             "required": False,
-            "min": 100,
-            "max": 50000,
-            "description": "只限制每次数据库事务最多提交多少行；Tushare 仍按单股完整 start_date/end_date 区间请求。",
+            "options": ["append_safe", "rebuild"],
         },
+        "max_sectors": {
+            "label": "板块数量上限",
+            "type": "number",
+            "required": False,
+            "min": 1,
+            "description": "Smoke 时限制板块数量；为空表示全部 Tushare THS 板块。",
+        },
+        "workers": {
+            "label": "板块日 K worker 数",
+            "type": "number",
+            "default": 12,
+            "required": False,
+            "min": 1,
+            "max": 20,
+            "description": "按板块代码并发调用一次完整 start_date/end_date 区间的 ths_daily；仍受 Tushare Token 池限频。",
+        },
+        "moneyflow_workers": {
+            "label": "资金流窗口 worker 数",
+            "type": "number",
+            "default": 2,
+            "required": False,
+            "min": 1,
+            "max": 4,
+            "description": "并发处理概念/行业资金流日期窗口；单窗口返回行数较多，独立限制数据库压力。",
+        },
+        "moneyflow_window_trade_days": {
+            "label": "资金流区间交易日数",
+            "type": "number",
+            "default": 20,
+            "required": False,
+            "min": 1,
+            "max": 20,
+            "description": "moneyflow_cnt_ths/moneyflow_ind_ths 每次按多少个交易日成组查询；20 日区间已通过与逐日返回集合对照验证。",
+        },
+        "fail_fast": {"label": "遇错立即失败", "type": "boolean", "default": False, "required": False},
     }
-    default_payload = {**BackfillStockDailyBarsHandler.default_payload, "max_upsert_rows_per_commit": 5000}
+    default_payload = {
+        "start_date": "2024-01-01",
+        "end_date": None,
+        "ingest_mode": "append_safe",
+        "max_sectors": None,
+        "workers": 12,
+        "moneyflow_workers": 2,
+        "moneyflow_window_trade_days": 20,
+        "fail_fast": False,
+    }
+    force_async = True
 
     async def run(self, context: JobExecutionContext) -> JobResult:
-        payload = StockDailyBackfillRequest(**{**self.default_payload, **context.payload})
-        service = StockDailyBackfillService(get_sessionmaker())
-        result = await service.run_moneyflow(payload)
+        payload = SectorDailyFactsBackfillRequest(**{**self.default_payload, **context.payload})
+        result = await SectorDailyFactsBackfillService(get_sessionmaker()).run(payload)
         return JobResult(
             status="success",
-            affected_rows=result.upserted_rows,
+            affected_rows=result.sector_bar_rows + result.sector_moneyflow_rows,
             summary=result.model_dump(mode="json"),
         )
 
 
-class BackfillStockTechnicalFactorProHandler(BackfillStockDailyBarsHandler):
-    job_code = "backfill_stock_technical_factor_pro"
+class BackfillIndexDailyFactsHandler:
+    job_code = "backfill_index_daily_facts"
+    job_type = "market_data"
     parameter_schema = {
-        **BackfillStockDailyBarsHandler.parameter_schema,
-        "pool_code": {
-            **BackfillStockDailyBarsHandler.parameter_schema["pool_code"],
-            "description": "指定需要回填 Tushare 专业技术因子的股票池；all_a_share 表示沪深 active 动态全市场。",
-        },
-        "start_date": {
-            **BackfillStockDailyBarsHandler.parameter_schema["start_date"],
-            "description": "专业技术因子回填开始日期，格式 YYYY-MM-DD。任务按单股完整 start_date/end_date 调用 stk_factor_pro。",
-        },
-        "only_missing": {
-            **BackfillStockDailyBarsHandler.parameter_schema["only_missing"],
-            "description": "兼容参数：append_safe 模式下为 true 表示只补缺失；rebuild 模式会忽略它。",
-        },
-        "max_upsert_rows_per_commit": {
-            "label": "单次提交最大行数",
-            "type": "number",
-            "default": 5000,
+        "start_date": {"label": "开始日期", "type": "string", "default": "2024-01-01", "required": True},
+        "end_date": {"label": "结束日期", "type": "string", "required": False, "description": "为空时使用最近开市日。"},
+        "ingest_mode": {
+            "label": "入库模式",
+            "type": "string",
+            "default": "append_safe",
             "required": False,
-            "min": 100,
-            "max": 50000,
-            "description": "只限制每次数据库事务最多提交多少行；Tushare stk_factor_pro 仍按单股完整 start_date/end_date 区间请求。",
+            "options": ["append_safe", "rebuild"],
         },
+        "only_missing": {"label": "只补缺失", "type": "boolean", "default": True, "required": False},
+        "max_indexes": {"label": "指数数量上限", "type": "number", "required": False, "min": 1},
+        "workers": {
+            "label": "外部请求 worker 数",
+            "type": "number",
+            "default": 4,
+            "required": False,
+            "min": 1,
+            "max": 8,
+            "description": "并发处理指数；每个指数的 index_daily 和 index_dailybasic 各按完整区间查询一次。",
+        },
+        "fail_fast": {"label": "遇错立即失败", "type": "boolean", "default": False, "required": False},
     }
-    default_payload = {**BackfillStockDailyBarsHandler.default_payload, "max_upsert_rows_per_commit": 5000}
+    default_payload = {
+        "start_date": "2024-01-01",
+        "end_date": None,
+        "ingest_mode": "append_safe",
+        "only_missing": True,
+        "max_indexes": None,
+        "workers": 4,
+        "fail_fast": False,
+    }
+    force_async = True
 
     async def run(self, context: JobExecutionContext) -> JobResult:
-        payload = StockDailyBackfillRequest(**{**self.default_payload, **context.payload})
-        service = StockDailyBackfillService(get_sessionmaker())
-        result = await service.run_stock_technical_factor_pro(payload)
+        payload = IndexDailyFactsBackfillRequest(**{**self.default_payload, **context.payload})
+        result = await IndexDailyFactsBackfillService(get_sessionmaker()).run(payload)
         return JobResult(
             status="success",
-            affected_rows=result.upserted_rows,
+            affected_rows=result.index_bar_rows + result.index_daily_basic_rows,
             summary=result.model_dump(mode="json"),
         )
 
@@ -600,14 +625,14 @@ _FACTOR_BACKFILL_COMMON_SCHEMA = {
 }
 
 
-class BackfillDailyFactorsHandler:
-    job_code = "backfill_daily_factors"
+class BackfillStockDailyFactorsHandler:
+    job_code = "backfill_stock_daily_factors"
     job_type = "market_data"
     parameter_schema = {
         "pool_code": {
             "label": "股票池编码",
             "type": "string",
-            "default": "focus",
+            "default": "all_a_share",
             "required": True,
             "description": "指定需要回填日频因子的股票池；all_a_share 表示沪深 active 动态全市场。",
         },
@@ -653,7 +678,7 @@ class BackfillDailyFactorsHandler:
         },
     }
     default_payload = {
-        "pool_code": "focus",
+        "pool_code": "all_a_share",
         "start_date": "2024-01-01",
         "end_date": None,
         "ingest_mode": "append_safe",
@@ -670,69 +695,36 @@ class BackfillDailyFactorsHandler:
     async def run(self, context: JobExecutionContext) -> JobResult:
         payload = FactorBackfillRequest(**{**self.default_payload, **context.payload})
         service = FactorBackfillService(get_sessionmaker())
-        result = await service.backfill_daily(payload)
+        result = await service.backfill_stock_daily_pipeline(payload)
         return JobResult(
-            status="success" if result.failed_trade_dates == 0 else "success",
-            affected_rows=result.daily_factor_rows,
+            status="success",
+            affected_rows=result.daily_factor_rows + result.technical_snapshot_rows,
             summary=result.model_dump(mode="json"),
         )
 
 
-class BackfillTechnicalSnapshotsHandler:
-    job_code = "backfill_technical_snapshots"
+class BackfillSectorDailyFactorsHandler:
+    job_code = "backfill_sector_daily_factors"
     job_type = "market_data"
     parameter_schema = {
-        "pool_code": {
-            "label": "股票池编码",
-            "type": "string",
-            "default": "all_a_share",
-            "required": True,
-            "description": "指定需要重算分钟因子与技术快照的股票池；all_a_share 表示沪深 active 动态全市场。",
-        },
         **_FACTOR_BACKFILL_COMMON_SCHEMA,
-        "max_stocks": {
-            "label": "股票数量上限",
+        "calculation_workers": {
+            "label": "计算 worker 数",
             "type": "number",
+            "default": 2,
             "required": False,
             "min": 1,
-            "description": "调试时限制回填股票数量；为空表示整个股票池。",
+            "max": 4,
+            "description": "按交易日并行计算板块因子；默认 2，避免同时放大成分股聚合查询。",
         },
     }
     default_payload = {
-        "pool_code": "all_a_share",
-        "start_date": "2024-01-01",
-        "end_date": None,
-        "ingest_mode": "append_safe",
-        "only_missing": True,
-        "max_stocks": None,
-        "batch_size": 200,
-        "fail_fast": False,
-    }
-    force_async = True
-
-    async def run(self, context: JobExecutionContext) -> JobResult:
-        payload = FactorBackfillRequest(**{**self.default_payload, **context.payload})
-        service = FactorBackfillService(get_sessionmaker())
-        result = await service.backfill_technical_snapshots(payload)
-        return JobResult(
-            status="success" if result.failed_trade_dates == 0 else "success",
-            affected_rows=result.minute_factor_rows + result.technical_snapshot_rows,
-            summary=result.model_dump(mode="json"),
-        )
-
-
-class BackfillSectorFactorsHandler:
-    job_code = "backfill_sector_factors"
-    job_type = "market_data"
-    parameter_schema = {
-        **_FACTOR_BACKFILL_COMMON_SCHEMA,
-    }
-    default_payload = {
         "start_date": "2024-01-01",
         "end_date": None,
         "ingest_mode": "append_safe",
         "only_missing": True,
         "batch_size": 200,
+        "calculation_workers": 2,
         "fail_fast": False,
     }
     force_async = True
@@ -744,6 +736,57 @@ class BackfillSectorFactorsHandler:
         return JobResult(
             status="success" if result.failed_trade_dates == 0 else "success",
             affected_rows=result.sector_factor_rows,
+            summary=result.model_dump(mode="json"),
+        )
+
+
+class BackfillIndexDailyFactorsHandler:
+    job_code = "backfill_index_daily_factors"
+    job_type = "market_data"
+    parameter_schema = {
+        **{key: value for key, value in _FACTOR_BACKFILL_COMMON_SCHEMA.items() if key != "batch_size"},
+        "max_indexes": {
+            "label": "指数数量上限",
+            "type": "number",
+            "required": False,
+            "min": 1,
+            "description": "调试时限制指数数量；为空表示 t_index_basic 中的全部指数。",
+        },
+        "factor_window_trade_days": {
+            "label": "回填时间窗口（交易日）",
+            "type": "number",
+            "default": 20,
+            "required": False,
+            "min": 5,
+            "max": 60,
+        },
+        "sql_stock_chunk_size": {
+            "label": "数据库分片指数数",
+            "type": "number",
+            "default": 200,
+            "required": False,
+            "min": 50,
+            "max": 500,
+        },
+    }
+    default_payload = {
+        "start_date": "2024-01-01",
+        "end_date": None,
+        "ingest_mode": "append_safe",
+        "only_missing": True,
+        "max_indexes": None,
+        "factor_window_trade_days": 20,
+        "sql_stock_chunk_size": 200,
+        "fail_fast": False,
+    }
+    force_async = True
+
+    async def run(self, context: JobExecutionContext) -> JobResult:
+        payload = FactorBackfillRequest(**{**self.default_payload, **context.payload})
+        result = await FactorBackfillService(get_sessionmaker()).backfill_index(payload)
+        return JobResult(
+            status="success",
+            affected_rows=result.index_factor_rows,
             summary=result.model_dump(mode="json"),
         )
 
@@ -1016,13 +1059,12 @@ def register_market_data_jobs() -> None:
     job_handler_registry.register(SyncTradeCalendarHandler())
     job_handler_registry.register(SyncStockBasicHandler())
     job_handler_registry.register(SyncIndexCatalogHandler())
-    job_handler_registry.register(BackfillStockDailyBarsHandler())
-    job_handler_registry.register(BackfillStockDailyBasicHandler())
-    job_handler_registry.register(BackfillStockMoneyflowHandler())
-    job_handler_registry.register(BackfillStockTechnicalFactorProHandler())
-    job_handler_registry.register(BackfillDailyFactorsHandler())
-    job_handler_registry.register(BackfillTechnicalSnapshotsHandler())
-    job_handler_registry.register(BackfillSectorFactorsHandler())
+    job_handler_registry.register(BackfillStockDailyFactsHandler())
+    job_handler_registry.register(BackfillStockDailyFactorsHandler())
+    job_handler_registry.register(BackfillSectorDailyFactsHandler())
+    job_handler_registry.register(BackfillSectorDailyFactorsHandler())
+    job_handler_registry.register(BackfillIndexDailyFactsHandler())
+    job_handler_registry.register(BackfillIndexDailyFactorsHandler())
     job_handler_registry.register(DailyCloseCoreIngestHandler())
     job_handler_registry.register(DailyCloseEnrichmentIngestHandler())
     job_handler_registry.register(DailyCloseRepairIngestHandler())

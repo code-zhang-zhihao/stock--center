@@ -245,6 +245,8 @@ CREATE TABLE IF NOT EXISTS t_stock_factor_daily (
     ma5 NUMERIC(18, 6),
     ma10 NUMERIC(18, 6),
     ma20 NUMERIC(18, 6),
+    ma30 NUMERIC(18, 6),
+    ma60 NUMERIC(18, 6),
     return_1d NUMERIC(18, 6),
     amplitude NUMERIC(18, 6),
     volume_ratio NUMERIC(18, 6),
@@ -257,6 +259,33 @@ CREATE TABLE IF NOT EXISTS t_stock_factor_daily (
 );
 
 CREATE INDEX IF NOT EXISTS idx_t_stock_factor_daily_stock_date ON t_stock_factor_daily(stock_code, trade_date DESC);
+
+CREATE TABLE IF NOT EXISTS t_index_factor_daily (
+    id BIGSERIAL PRIMARY KEY,
+    index_code VARCHAR(20) NOT NULL,
+    trade_date DATE NOT NULL,
+    source VARCHAR(80) NOT NULL DEFAULT 'system:history_backfill',
+    ma5 NUMERIC(18, 6),
+    ma10 NUMERIC(18, 6),
+    ma20 NUMERIC(18, 6),
+    ma30 NUMERIC(18, 6),
+    ma60 NUMERIC(18, 6),
+    return_1d NUMERIC(18, 6),
+    amplitude NUMERIC(18, 6),
+    volume_ratio NUMERIC(18, 6),
+    amount_ratio NUMERIC(18, 6),
+    volatility_20d NUMERIC(18, 6),
+    turnover_rate NUMERIC(18, 6),
+    pe_ttm NUMERIC(18, 6),
+    pb NUMERIC(18, 6),
+    features JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_t_index_factor_daily_business UNIQUE (index_code, trade_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_t_index_factor_daily_code_date
+    ON t_index_factor_daily(index_code, trade_date DESC);
 
 CREATE TABLE IF NOT EXISTS t_stock_factor_minute (
     id BIGSERIAL PRIMARY KEY,
@@ -495,6 +524,8 @@ COMMENT ON COLUMN t_stock_factor_daily.source IS '因子来源。';
 COMMENT ON COLUMN t_stock_factor_daily.ma5 IS '5 日均线。';
 COMMENT ON COLUMN t_stock_factor_daily.ma10 IS '10 日均线。';
 COMMENT ON COLUMN t_stock_factor_daily.ma20 IS '20 日均线。';
+COMMENT ON COLUMN t_stock_factor_daily.ma30 IS '30 日均线。';
+COMMENT ON COLUMN t_stock_factor_daily.ma60 IS '60 日均线。';
 COMMENT ON COLUMN t_stock_factor_daily.return_1d IS '单日收益率百分比。';
 COMMENT ON COLUMN t_stock_factor_daily.amplitude IS '振幅百分比。';
 COMMENT ON COLUMN t_stock_factor_daily.volume_ratio IS '成交量相对 5 日均量比值。';
@@ -503,6 +534,11 @@ COMMENT ON COLUMN t_stock_factor_daily.volatility_20d IS '20 日收益波动率�
 COMMENT ON COLUMN t_stock_factor_daily.close_position IS '收盘价在当日高低区间的位置。';
 COMMENT ON COLUMN t_stock_factor_daily.features IS '扩展因子字段。';
 COMMENT ON COLUMN t_stock_factor_daily.created_at IS '创建时间。';
+
+COMMENT ON TABLE t_index_factor_daily IS 'Derived 层：由指数日线和指数每日指标计算的指数日频因子。';
+COMMENT ON COLUMN t_index_factor_daily.index_code IS '无后缀 Canonical 指数代码。';
+COMMENT ON COLUMN t_index_factor_daily.trade_date IS '交易日期。';
+COMMENT ON COLUMN t_index_factor_daily.features IS '历史窗口完整性和来源表等扩展信息。';
 
 COMMENT ON TABLE t_stock_factor_minute IS 'Derived 层：股票分钟量化因子，迁移阶段保留旧结果，后续可重算。';
 COMMENT ON COLUMN t_stock_factor_minute.id IS '主键 ID。';

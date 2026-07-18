@@ -277,6 +277,8 @@ export interface StockDailyFactor {
   ma5: number | null;
   ma10: number | null;
   ma20: number | null;
+  ma30: number | null;
+  ma60: number | null;
   return_1d: number | null;
   amplitude: number | null;
   volume_ratio: number | null;

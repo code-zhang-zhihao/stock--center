@@ -76,6 +76,53 @@ class TushareMarketAdapter(ProviderAdapter):
             warnings.append(f"index_daily skipped records: {len(records) - len(rows)}")
         return self._result("index_daily", "index_daily", target_date, target_date, records, rows, warnings, self.index_daily_unit_conversions)
 
+    def map_index_daily_range(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        start_date: date | str,
+        end_date: date | str,
+        index_codes: set[str] | None = None,
+    ) -> CanonicalMappingResult:
+        start = self._as_date(start_date)
+        end = self._as_date(end_date)
+        rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for record in records:
+            row_date = parse_date(record.get("trade_date"))
+            index_code = normalize_symbol(str(record.get("ts_code") or ""))
+            if not index_code or row_date is None or not (start <= row_date <= end):
+                continue
+            if index_codes is not None and index_code not in index_codes:
+                continue
+            source = str(record.get("source") or "tushare:index_daily")
+            amount = safe_float(record.get("amount"))
+            rows.append(
+                {
+                    "index_code": index_code,
+                    "trade_date": row_date,
+                    "source": source,
+                    "open_price": safe_float(record.get("open")),
+                    "high_price": safe_float(record.get("high")),
+                    "low_price": safe_float(record.get("low")),
+                    "close_price": safe_float(record.get("close")),
+                    "change_pct": safe_float(record.get("pct_chg")),
+                    "volume": safe_float(record.get("vol")),
+                    "amount_yuan": amount * 1000 if amount is not None else None,
+                    "metadata_json": self._metadata(
+                        "index_daily",
+                        record.get("raw", record),
+                        self.index_daily_unit_conversions,
+                        provider=source.split(":", 1)[0],
+                        source=source,
+                        unit_normalized="yuan",
+                    ),
+                }
+            )
+        if len(records) != len(rows):
+            warnings.append(f"index_daily skipped records: {len(records) - len(rows)}")
+        return self._result("index_daily", "index_daily", start, end, records, rows, warnings, self.index_daily_unit_conversions)
+
     def map_index_daily_basic(
         self,
         records: list[dict[str, Any]],
@@ -164,13 +211,30 @@ class TushareMarketAdapter(ProviderAdapter):
         sector_map: dict[str, dict[str, Any]],
     ) -> CanonicalMappingResult:
         target_date = self._as_date(trade_date)
+        return self.map_ths_daily_range(
+            records,
+            start_date=target_date,
+            end_date=target_date,
+            sector_map=sector_map,
+        )
+
+    def map_ths_daily_range(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        start_date: date | str,
+        end_date: date | str,
+        sector_map: dict[str, dict[str, Any]],
+    ) -> CanonicalMappingResult:
+        start = self._as_date(start_date)
+        end = self._as_date(end_date)
         rows: list[dict[str, Any]] = []
         warnings: list[str] = []
         for record in records:
             raw_code = str(record.get("ts_code") or "")
             sector = sector_map.get(raw_code)
             row_date = parse_date(record.get("trade_date"))
-            if not sector or row_date != target_date:
+            if not sector or row_date is None or not (start <= row_date <= end):
                 continue
             amount = safe_float(record.get("amount"))
             rows.append(
@@ -198,7 +262,16 @@ class TushareMarketAdapter(ProviderAdapter):
             )
         if len(records) != len(rows):
             warnings.append(f"ths_daily skipped records: {len(records) - len(rows)}")
-        return self._result("ths_daily", "sector_daily_bar", target_date, target_date, records, rows, warnings, self.ths_daily_unit_conversions)
+        return self._result(
+            "ths_daily",
+            "sector_daily_bar",
+            start,
+            end,
+            records,
+            rows,
+            warnings,
+            self.ths_daily_unit_conversions,
+        )
 
     def map_sector_moneyflow(
         self,

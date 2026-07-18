@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import (
     DailyBar,
+    IndexBasic,
     IndexComponent,
     IndexDailyBasic,
     IndexBar,
@@ -169,6 +170,47 @@ class MarketDataRepository:
         )
         return set(result.scalars().all())
 
+    async def existing_index_bar_dates(self, *, index_code: str, start_date: date, end_date: date) -> set[date]:
+        result = await self.session.execute(
+            select(IndexBar.trade_date).where(
+                IndexBar.index_code == index_code,
+                IndexBar.trade_date >= start_date,
+                IndexBar.trade_date <= end_date,
+            )
+        )
+        return set(result.scalars().all())
+
+    async def existing_sector_bar_dates(self, *, sector_code: str, start_date: date, end_date: date) -> set[date]:
+        result = await self.session.execute(
+            select(SectorBar.trade_date).where(
+                SectorBar.sector_code == sector_code,
+                SectorBar.trade_date >= start_date,
+                SectorBar.trade_date <= end_date,
+            )
+        )
+        return set(result.scalars().all())
+
+    async def existing_index_daily_basic_dates(self, *, index_code: str, start_date: date, end_date: date) -> set[date]:
+        result = await self.session.execute(
+            select(IndexDailyBasic.trade_date).where(
+                IndexDailyBasic.index_code == index_code,
+                IndexDailyBasic.trade_date >= start_date,
+                IndexDailyBasic.trade_date <= end_date,
+            )
+        )
+        return set(result.scalars().all())
+
+    async def list_index_history_targets(self) -> list[dict[str, str]]:
+        rows = (await self.session.execute(select(IndexBasic).order_by(IndexBasic.index_code))).scalars().all()
+        targets: list[dict[str, str]] = []
+        for row in rows:
+            metadata = dict(row.metadata_json or {})
+            official_code = str(metadata.get("official_index_code") or "").strip()
+            if not official_code:
+                official_code = f"{row.index_code}.SZ" if row.index_code.startswith("399") else f"{row.index_code}.SH"
+            targets.append({"index_code": row.index_code, "official_index_code": official_code})
+        return targets
+
     async def clear_stock_fact_range(
         self,
         *,
@@ -197,6 +239,37 @@ class MarketDataRepository:
                 )
             )
             deleted += int(result.rowcount or 0)
+        return deleted
+
+    async def clear_sector_daily_fact_range(self, *, start_date: date, end_date: date) -> int:
+        deleted = 0
+        for model in (SectorBar, SectorFundFlowDaily):
+            result = await self.session.execute(
+                delete(model).where(model.trade_date >= start_date, model.trade_date <= end_date)
+            )
+            deleted += int(result.rowcount or 0)
+        return deleted
+
+    async def clear_index_daily_fact_range(
+        self,
+        *,
+        index_codes: list[str],
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        if not index_codes:
+            return 0
+        deleted = 0
+        for codes in _chunked(index_codes, 1000):
+            for model in (IndexBar, IndexDailyBasic):
+                result = await self.session.execute(
+                    delete(model).where(
+                        model.index_code.in_(codes),
+                        model.trade_date >= start_date,
+                        model.trade_date <= end_date,
+                    )
+                )
+                deleted += int(result.rowcount or 0)
         return deleted
 
     async def open_trade_dates_between(self, *, start_date: date, end_date: date, market: str = "CN") -> list[date]:

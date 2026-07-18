@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import (
     DailyBar,
+    IndexFactorDaily,
     LimitEventDaily,
     MinuteBar,
     SectorBar,
@@ -300,6 +301,8 @@ class IndicatorRepository:
                 "ma5": row.ma5,
                 "ma10": row.ma10,
                 "ma20": row.ma20,
+                "ma30": row.ma30,
+                "ma60": row.ma60,
                 "return_1d": row.return_1d,
                 "features": row.features,
             }
@@ -429,6 +432,8 @@ class IndicatorRepository:
                 ma5 = EXCLUDED.ma5,
                 ma10 = EXCLUDED.ma10,
                 ma20 = EXCLUDED.ma20,
+                ma30 = EXCLUDED.ma30,
+                ma60 = EXCLUDED.ma60,
                 return_1d = EXCLUDED.return_1d,
                 amplitude = EXCLUDED.amplitude,
                 volume_ratio = EXCLUDED.volume_ratio,
@@ -494,6 +499,12 @@ class IndicatorRepository:
                     avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
                         PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
                     ) AS ma20,
+                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
+                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                    ) AS ma30,
+                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
+                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    ) AS ma60,
                     avg(volume_hand) FILTER (WHERE volume_hand IS NOT NULL) OVER (
                         PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
                     ) AS previous_volume_mean_5,
@@ -616,6 +627,8 @@ class IndicatorRepository:
                     daily.ma5,
                     daily.ma10,
                     daily.ma20,
+                    daily.ma30,
+                    daily.ma60,
                     CASE
                         WHEN coalesce(daily.pre_close_price, daily.previous_close_price) IS NOT NULL
                          AND coalesce(daily.pre_close_price, daily.previous_close_price) <> 0
@@ -638,6 +651,8 @@ class IndicatorRepository:
                             CASE WHEN daily.history_days < 5 THEN 'ma5' END,
                             CASE WHEN daily.history_days < 10 THEN 'ma10' END,
                             CASE WHEN daily.history_days < 20 THEN 'ma20' END,
+                            CASE WHEN daily.history_days < 30 THEN 'ma30' END,
+                            CASE WHEN daily.history_days < 60 THEN 'ma60' END,
                             CASE WHEN daily.history_days < 21 THEN 'volatility_20d' END
                         ]::text[], NULL))
                     )
@@ -693,12 +708,12 @@ class IndicatorRepository:
             )
             INSERT INTO t_stock_factor_daily (
                 stock_code, trade_date, source,
-                ma5, ma10, ma20, return_1d, amplitude,
+                ma5, ma10, ma20, ma30, ma60, return_1d, amplitude,
                 volume_ratio, amount_ratio, volatility_20d, close_position, features, created_at
             )
             SELECT
                 stock_code, trade_date, 'system:daily_close',
-                ma5, ma10, ma20, return_1d, amplitude,
+                ma5, ma10, ma20, ma30, ma60, return_1d, amplitude,
                 volume_ratio, amount_ratio, volatility_20d, close_position, features, now()
             FROM candidates
             ON CONFLICT (stock_code, trade_date, source) {conflict_clause}
@@ -747,6 +762,137 @@ class IndicatorRepository:
             deleted += int(result.rowcount or 0)
         return deleted
 
+    async def clear_technical_snapshot_rows_between(
+        self,
+        stock_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        if not stock_codes:
+            return 0
+        start = datetime.combine(start_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
+        end = datetime.combine(
+            end_date.fromordinal(end_date.toordinal() + 1),
+            datetime.min.time(),
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        )
+        deleted = 0
+        for offset in range(0, len(stock_codes), 1000):
+            result = await self.session.execute(
+                delete(TechnicalIndicatorSnapshot).where(
+                    TechnicalIndicatorSnapshot.stock_code.in_(stock_codes[offset : offset + 1000]),
+                    TechnicalIndicatorSnapshot.snapshot_time >= start,
+                    TechnicalIndicatorSnapshot.snapshot_time < end,
+                    TechnicalIndicatorSnapshot.source == "system:daily_close",
+                )
+            )
+            deleted += int(result.rowcount or 0)
+        return deleted
+
+    async def backfill_technical_snapshots_set_based(
+        self,
+        stock_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+        only_missing: bool,
+    ) -> dict[date, int]:
+        """Build historical EOD snapshots from daily bars and daily factors only."""
+        if not stock_codes:
+            return {}
+        conflict_clause = (
+            "DO NOTHING"
+            if only_missing
+            else """DO UPDATE SET
+                last_price = EXCLUDED.last_price,
+                change_pct = EXCLUDED.change_pct,
+                intraday_strength = EXCLUDED.intraday_strength,
+                volume_score = EXCLUDED.volume_score,
+                trend_score = EXCLUDED.trend_score,
+                factor_payload = EXCLUDED.factor_payload"""
+        )
+        statement = text(
+            f"""
+            WITH ranked_bars AS (
+                SELECT
+                    bar.*,
+                    row_number() OVER (
+                        PARTITION BY bar.stock_code, bar.trade_date
+                        ORDER BY CASE bar.source
+                            WHEN 'tushare:daily' THEN 0
+                            WHEN 'akshare_qfq' THEN 1
+                            WHEN 'mootdx' THEN 2
+                            ELSE 9
+                        END, bar.updated_at DESC, bar.id DESC
+                    ) AS source_rank
+                FROM t_daily_bar AS bar
+                WHERE bar.stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                  AND bar.trade_date BETWEEN :start_date AND :end_date
+            ),
+            factors AS (
+                SELECT DISTINCT ON (stock_code, trade_date)
+                    stock_code, trade_date, ma5, ma10, ma20, return_1d
+                FROM t_stock_factor_daily
+                WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                  AND trade_date BETWEEN :start_date AND :end_date
+                ORDER BY stock_code, trade_date,
+                    CASE WHEN source = 'system:daily_close' THEN 0 ELSE 9 END,
+                    created_at DESC, id DESC
+            )
+            INSERT INTO t_technical_indicator_snapshot (
+                stock_code, snapshot_time, source, last_price, change_pct,
+                intraday_strength, volume_score, trend_score, factor_payload, created_at
+            )
+            SELECT
+                bar.stock_code,
+                (bar.trade_date::timestamp + time '15:00') AT TIME ZONE 'Asia/Shanghai',
+                'system:daily_close',
+                bar.close_price,
+                bar.change_pct,
+                bar.change_pct,
+                NULL,
+                CASE
+                    WHEN factor.ma5 IS NULL OR factor.ma10 IS NULL THEN NULL
+                    ELSE LEAST(
+                        50
+                        + CASE WHEN factor.ma5 > factor.ma10 THEN 20 ELSE 0 END
+                        + CASE WHEN factor.ma20 IS NOT NULL AND factor.ma10 > factor.ma20 THEN 20 ELSE 0 END
+                        + CASE WHEN factor.return_1d > 0 THEN 10 ELSE 0 END,
+                        100
+                    )
+                END,
+                jsonb_build_object(
+                    'daily_factor_trade_date', CASE WHEN factor.trade_date IS NULL THEN NULL ELSE factor.trade_date::text END,
+                    'minute_factor_bar_time', NULL,
+                    'daily_bar_id', bar.id,
+                    'price_source', 't_daily_bar'
+                ),
+                now()
+            FROM ranked_bars AS bar
+            LEFT JOIN factors AS factor
+              ON factor.stock_code = bar.stock_code
+             AND factor.trade_date = bar.trade_date
+            WHERE bar.source_rank = 1
+            ON CONFLICT (stock_code, snapshot_time, source) {conflict_clause}
+            RETURNING (snapshot_time AT TIME ZONE 'Asia/Shanghai')::date
+            """
+        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
+        rows = (
+            await self.session.execute(
+                statement,
+                {
+                    "stock_codes": stock_codes,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+            )
+        ).all()
+        written: dict[date, int] = {}
+        for (trade_date,) in rows:
+            written[trade_date] = written.get(trade_date, 0) + 1
+        return written
+
     async def clear_minute_factor_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
         if not stock_codes:
             return 0
@@ -765,6 +911,156 @@ class IndicatorRepository:
     async def clear_sector_factor_rows(self, *, trade_date: date) -> int:
         result = await self.session.execute(delete(SectorFactorDaily).where(SectorFactorDaily.trade_date == trade_date))
         return int(result.rowcount or 0)
+
+    async def clear_index_factor_rows_between(
+        self,
+        index_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        if not index_codes:
+            return 0
+        deleted = 0
+        for codes in _chunked(index_codes, 1000):
+            result = await self.session.execute(
+                delete(IndexFactorDaily).where(
+                    IndexFactorDaily.index_code.in_(codes),
+                    IndexFactorDaily.trade_date >= start_date,
+                    IndexFactorDaily.trade_date <= end_date,
+                )
+            )
+            deleted += int(result.rowcount or 0)
+        return deleted
+
+    async def backfill_index_factors_set_based(
+        self,
+        index_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+        history_start: date,
+        only_missing: bool,
+    ) -> dict[date, int]:
+        if not index_codes:
+            return {}
+        conflict_clause = (
+            "DO NOTHING"
+            if only_missing
+            else """DO UPDATE SET
+                source = EXCLUDED.source,
+                ma5 = EXCLUDED.ma5,
+                ma10 = EXCLUDED.ma10,
+                ma20 = EXCLUDED.ma20,
+                ma30 = EXCLUDED.ma30,
+                ma60 = EXCLUDED.ma60,
+                return_1d = EXCLUDED.return_1d,
+                amplitude = EXCLUDED.amplitude,
+                volume_ratio = EXCLUDED.volume_ratio,
+                amount_ratio = EXCLUDED.amount_ratio,
+                volatility_20d = EXCLUDED.volatility_20d,
+                turnover_rate = EXCLUDED.turnover_rate,
+                pe_ttm = EXCLUDED.pe_ttm,
+                pb = EXCLUDED.pb,
+                features = EXCLUDED.features,
+                updated_at = now()"""
+        )
+        statement = text(
+            f"""
+            WITH bars AS (
+                SELECT
+                    bar.*,
+                    lag(close_price) OVER (PARTITION BY index_code ORDER BY trade_date) AS previous_close,
+                    row_number() OVER (PARTITION BY index_code ORDER BY trade_date) AS history_days,
+                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
+                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
+                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS ma30,
+                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS ma60,
+                    avg(volume) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_volume_mean_5,
+                    avg(amount_yuan) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_amount_mean_5
+                FROM t_index_bar AS bar
+                WHERE bar.index_code = ANY(CAST(:index_codes AS varchar[]))
+                  AND bar.trade_date BETWEEN :history_start AND :end_date
+            ),
+            returns AS (
+                SELECT
+                    bars.*,
+                    CASE WHEN previous_close IS NOT NULL AND previous_close <> 0
+                        THEN (close_price - previous_close) / previous_close * 100 END AS close_return
+                FROM bars
+            ),
+            metrics AS (
+                SELECT
+                    returns.*,
+                    stddev_pop(close_return) FILTER (WHERE close_return IS NOT NULL) OVER (
+                        PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS volatility_20d
+                FROM returns
+            )
+            INSERT INTO t_index_factor_daily (
+                index_code, trade_date, source,
+                ma5, ma10, ma20, ma30, ma60,
+                return_1d, amplitude, volume_ratio, amount_ratio, volatility_20d,
+                turnover_rate, pe_ttm, pb, features, created_at, updated_at
+            )
+            SELECT
+                metrics.index_code,
+                metrics.trade_date,
+                'system:history_backfill',
+                metrics.ma5,
+                metrics.ma10,
+                metrics.ma20,
+                metrics.ma30,
+                metrics.ma60,
+                metrics.close_return,
+                CASE WHEN coalesce(metrics.previous_close, metrics.close_price) <> 0
+                    THEN (metrics.high_price - metrics.low_price) / coalesce(metrics.previous_close, metrics.close_price) * 100 END,
+                metrics.volume / NULLIF(metrics.previous_volume_mean_5, 0),
+                metrics.amount_yuan / NULLIF(metrics.previous_amount_mean_5, 0),
+                metrics.volatility_20d,
+                basic.turnover_rate,
+                basic.pe_ttm,
+                basic.pb,
+                jsonb_build_object(
+                    'history_days', metrics.history_days,
+                    'missing_windows', to_jsonb(array_remove(ARRAY[
+                        CASE WHEN metrics.history_days < 5 THEN 'ma5' END,
+                        CASE WHEN metrics.history_days < 10 THEN 'ma10' END,
+                        CASE WHEN metrics.history_days < 20 THEN 'ma20' END,
+                        CASE WHEN metrics.history_days < 30 THEN 'ma30' END,
+                        CASE WHEN metrics.history_days < 60 THEN 'ma60' END,
+                        CASE WHEN metrics.history_days < 21 THEN 'volatility_20d' END,
+                        CASE WHEN basic.index_code IS NULL THEN 'index_daily_basic' END
+                    ]::text[], NULL)),
+                    'source_tables', jsonb_build_array('t_index_bar', 't_index_daily_basic')
+                ),
+                now(),
+                now()
+            FROM metrics
+            LEFT JOIN t_index_daily_basic AS basic
+              ON basic.index_code = metrics.index_code
+             AND basic.trade_date = metrics.trade_date
+            WHERE metrics.trade_date BETWEEN :start_date AND :end_date
+            ON CONFLICT (index_code, trade_date) {conflict_clause}
+            RETURNING trade_date
+            """
+        ).bindparams(bindparam("index_codes", type_=ARRAY(String())))
+        rows = (
+            await self.session.execute(
+                statement,
+                {
+                    "index_codes": index_codes,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "history_start": history_start,
+                },
+            )
+        ).all()
+        written: dict[date, int] = {}
+        for (trade_date,) in rows:
+            written[trade_date] = written.get(trade_date, 0) + 1
+        return written
 
     async def load_sector_factor_inputs(self, *, trade_date: date, lookback_days: int = 30) -> dict:
         start_date = trade_date.fromordinal(trade_date.toordinal() - lookback_days)
@@ -867,6 +1163,8 @@ class IndicatorRepository:
                         "ma5": stmt.excluded.ma5,
                         "ma10": stmt.excluded.ma10,
                         "ma20": stmt.excluded.ma20,
+                        "ma30": stmt.excluded.ma30,
+                        "ma60": stmt.excluded.ma60,
                         "return_1d": stmt.excluded.return_1d,
                         "amplitude": stmt.excluded.amplitude,
                         "volume_ratio": stmt.excluded.volume_ratio,

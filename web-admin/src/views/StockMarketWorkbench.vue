@@ -174,6 +174,8 @@
             <Metric label="5日均线" hint="近5日收盘均价" :value="formatNumber(latestDailyFactor?.ma5 ?? null)" />
             <Metric label="10日均线" hint="近10日收盘均价" :value="formatNumber(latestDailyFactor?.ma10 ?? null)" />
             <Metric label="20日均线" hint="近20日收盘均价" :value="formatNumber(latestDailyFactor?.ma20 ?? null)" />
+            <Metric label="30日均线" hint="近30日收盘均价" :value="formatNumber(latestDailyFactor?.ma30 ?? null)" />
+            <Metric label="60日均线" hint="近60日收盘均价" :value="formatNumber(latestDailyFactor?.ma60 ?? null)" />
             <Metric label="当日涨跌" hint="相对昨收" :value="formatPercent(latestDailyFactor?.return_1d ?? null)" :tone="numberTone(latestDailyFactor?.return_1d ?? null)" />
             <Metric label="日内振幅" hint="最高与最低价差" :value="formatPercent(latestDailyFactor?.amplitude ?? null)" />
             <Metric label="20日波动率" hint="近20日收益波动" :value="formatPercent(latestDailyFactor?.volatility_20d ?? null)" />
@@ -383,6 +385,8 @@ const dailyChartOption = computed<EChartsOption>(() => {
       { name: 'MA5', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma5 ?? null), lineStyle: { color: '#f59e0b' } },
       { name: 'MA10', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma10 ?? null), lineStyle: { color: '#2563eb' } },
       { name: 'MA20', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma20 ?? null), lineStyle: { color: '#7c3aed' } },
+      { name: 'MA30', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma30 ?? null), lineStyle: { color: '#0f766e' } },
+      { name: 'MA60', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma60 ?? null), lineStyle: { color: '#be123c' } },
       { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volume, itemStyle: { color: '#8da2b5' } },
     ],
   };

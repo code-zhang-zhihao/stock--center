@@ -419,13 +419,15 @@ class IndicatorEngineService:
             "ma5": self._window_mean(closes, index, 5),
             "ma10": self._window_mean(closes, index, 10),
             "ma20": self._window_mean(closes, index, 20),
+            "ma30": self._window_mean(closes, index, 30),
+            "ma60": self._window_mean(closes, index, 60),
             "return_1d": self._ratio(close - previous_close, previous_close, percent=True),
             "amplitude": self._ratio(high - low, previous_close or close, percent=True),
             "volume_ratio": self._ratio(volumes[index], self._window_mean(volumes, index - 1, 5)),
             "amount_ratio": self._ratio(amounts[index], self._window_mean(amounts, index - 1, 5)),
             "volatility_20d": pstdev(returns) if len(returns) >= 2 else None,
             "close_position": self._ratio(close - low, high - low),
-            "features": {"history_days": history_days, "missing_windows": [name for name, minimum in (("ma5", 5), ("ma10", 10), ("ma20", 20), ("volatility_20d", 21)) if history_days < minimum]},
+            "features": {"history_days": history_days, "missing_windows": [name for name, minimum in (("ma5", 5), ("ma10", 10), ("ma20", 20), ("ma30", 30), ("ma60", 60), ("volatility_20d", 21)) if history_days < minimum]},
         }, history_days < 20
 
     def _minute_factors(self, stock_code: str, trade_date: date, bars: list[MinuteBar]) -> list[dict]:
