@@ -109,3 +109,81 @@ def test_moneyflow_adapter_converts_ten_thousand_yuan_to_yuan():
     assert row["big_order_net_inflow"] == 20000
     assert row["super_large_net_inflow"] == 25000
     assert row["metadata_json"]["unit_conversions"]["moneyflow.*_amount"] == "ten_thousand_yuan -> yuan"
+
+
+def test_limit_event_adapter_maps_market_events_and_filters_universe():
+    adapter = TushareStockDailyAdapter()
+
+    result = adapter.map_limit_events(
+        [
+            {
+                "ts_code": "600519.SH",
+                "trade_date": "20260701",
+                "limit": "U",
+                "close": 110,
+                "limit_price": 110,
+                "amount": 123456,
+                "first_time": "93209",
+                "last_time": "100009",
+                "open_times": 0,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": "20260701",
+                "limit": "D",
+            },
+        ],
+        trade_date=date(2026, 7, 1),
+        universe={"600519"},
+    )
+
+    assert result.raw_count == 2
+    assert result.mapped_count == 1
+    assert result.rows[0]["stock_code"] == "600519"
+    assert result.rows[0]["event_type"] == "limit_up"
+    assert result.rows[0]["first_time"].isoformat() == "09:32:09"
+    assert result.rows[0]["last_time"].isoformat() == "10:00:09"
+    assert result.rows[0]["open_count"] == 0
+    assert result.rows[0]["source"] == "tushare:limit_list_d"
+
+
+def test_limit_event_adapter_maps_broken_limit_pool():
+    result = TushareStockDailyAdapter().map_limit_events(
+        [{"ts_code": "000001.SZ", "trade_date": "20260701", "limit": "Z"}],
+        trade_date=date(2026, 7, 1),
+    )
+
+    assert result.rows[0]["event_type"] == "limit_break"
+
+
+def test_limit_event_adapter_treats_missing_flag_with_up_stat_as_limit_up():
+    result = TushareStockDailyAdapter().map_limit_events(
+        [
+            {
+                "ts_code": "000716.SZ",
+                "trade_date": "20251216",
+                "limit": None,
+                "pct_chg": 10.05,
+                "fd_amount": 73292292,
+                "up_stat": "1/1",
+                "first_time": "93142",
+            }
+        ],
+        trade_date=date(2025, 12, 16),
+    )
+
+    assert result.rows[0]["event_type"] == "limit_up"
+
+
+def test_suspend_event_adapter_accepts_suspend_date():
+    adapter = TushareStockDailyAdapter()
+
+    result = adapter.map_suspend_events(
+        [{"ts_code": "000001.SZ", "suspend_date": "20260701", "suspend_type": "S"}],
+        trade_date=date(2026, 7, 1),
+        universe={"000001"},
+    )
+
+    assert result.mapped_count == 1
+    assert result.rows[0]["event_type"] == "suspend"
+    assert result.rows[0]["source"] == "tushare:suspend_d"

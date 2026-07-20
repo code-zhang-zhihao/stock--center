@@ -4,13 +4,14 @@ import asyncio
 import logging
 from datetime import date, datetime
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.market_data.providers import normalize_symbol, parse_date
-from app.modules.market_data.repository import MarketDataRepository
+from app.modules.market_data.repository import MarketDataRepository, STOCK_LIMIT_EVENT_HISTORY_CAPABILITY
 from app.modules.market_data.tushare.adapters import TushareStockDailyAdapter
 from app.modules.market_data.tushare.contracts import TushareApiRequest
 from app.modules.market_data.tushare_runtime import TushareProviderFactory
@@ -37,6 +38,8 @@ class StockDailyBackfillRequest(BaseModel):
     workers: int = Field(default=12, ge=1, le=20)
     commit_stock_batch_size: int = Field(default=20, ge=1, le=200)
     max_upsert_rows_per_commit: int = Field(default=5000, ge=100, le=50000)
+    include_limit_events: bool = True
+    event_workers: int = Field(default=4, ge=1, le=8)
     fail_fast: bool = False
 
     @field_validator("pool_code")
@@ -65,14 +68,35 @@ class StockDailyBackfillResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class StockLimitEventBackfillResult(BaseModel):
+    pool_code: str
+    start_date: date
+    end_date: date
+    trade_date_count: int = 0
+    completed_trade_date_count: int = 0
+    skipped_trade_date_count: int = 0
+    failed_trade_date_count: int = 0
+    fetched_rows: int = 0
+    upserted_rows: int = 0
+    rebuild_deleted_rows: int = 0
+    event_workers: int
+    ingest_mode: Literal["append_safe", "rebuild"]
+    only_missing: bool
+    completion_scope: str
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class StockDailyFactsBackfillResult(BaseModel):
     pool_code: str
     start_date: date
     end_date: date
     stock_count: int = 0
     fact_results: dict[str, StockDailyBackfillResult] = Field(default_factory=dict)
+    limit_event_result: StockLimitEventBackfillResult | None = None
     completed_fact_count: int = 0
     failed_stock_fact_count: int = 0
+    failed_event_trade_date_count: int = 0
     fetched_rows: int = 0
     upserted_rows: int = 0
     rebuild_deleted_rows: int = 0
@@ -106,13 +130,17 @@ class StockDailyBackfillService:
     async def run_stock_technical_factor_pro(self, payload: StockDailyBackfillRequest) -> StockDailyBackfillResult:
         return await self._run_fact(payload, "stock_technical_factor_pro")
 
+    async def run_limit_events(self, payload: StockDailyBackfillRequest) -> StockLimitEventBackfillResult:
+        return await self._run_limit_events(payload)
+
     async def run_all(self, payload: StockDailyBackfillRequest) -> StockDailyFactsBackfillResult:
-        """Backfill the four stock daily fact families as one resumable pipeline."""
+        """Backfill stock daily facts and market-wide stock events as one resumable pipeline."""
         end_date = payload.end_date or await self._resolve_latest_trade_date()
         resolved_payload = payload.model_copy(update={"end_date": end_date})
         fact_results: dict[str, StockDailyBackfillResult] = {}
         for fact_kind in ("daily", "daily_basic", "moneyflow", "stock_technical_factor_pro"):
             fact_results[fact_kind] = await self._run_fact(resolved_payload, fact_kind)
+        limit_event_result = await self._run_limit_events(resolved_payload) if resolved_payload.include_limit_events else None
 
         first = fact_results["daily"]
         result = StockDailyFactsBackfillResult(
@@ -121,11 +149,13 @@ class StockDailyBackfillService:
             end_date=first.end_date,
             stock_count=first.stock_count,
             fact_results=fact_results,
-            completed_fact_count=len(fact_results),
+            limit_event_result=limit_event_result,
+            completed_fact_count=len(fact_results) + (1 if limit_event_result is not None else 0),
             failed_stock_fact_count=sum(item.failed_stock_count for item in fact_results.values()),
-            fetched_rows=sum(item.fetched_rows for item in fact_results.values()),
-            upserted_rows=sum(item.upserted_rows for item in fact_results.values()),
-            rebuild_deleted_rows=sum(item.rebuild_deleted_rows for item in fact_results.values()),
+            failed_event_trade_date_count=limit_event_result.failed_trade_date_count if limit_event_result else 0,
+            fetched_rows=sum(item.fetched_rows for item in fact_results.values()) + (limit_event_result.fetched_rows if limit_event_result else 0),
+            upserted_rows=sum(item.upserted_rows for item in fact_results.values()) + (limit_event_result.upserted_rows if limit_event_result else 0),
+            rebuild_deleted_rows=sum(item.rebuild_deleted_rows for item in fact_results.values()) + (limit_event_result.rebuild_deleted_rows if limit_event_result else 0),
             workers=resolved_payload.workers,
             ingest_mode=resolved_payload.ingest_mode,
         )
@@ -133,12 +163,241 @@ class StockDailyBackfillService:
             result.warnings.extend(f"{fact_kind}: {warning}" for warning in item.warnings)
             if item.failed_stock_count:
                 result.warnings.append(f"{fact_kind} 失败股票数: {item.failed_stock_count}")
+        if limit_event_result is not None:
+            result.warnings.extend(f"limit_events: {warning}" for warning in limit_event_result.warnings)
+            if limit_event_result.failed_trade_date_count:
+                result.warnings.append(f"limit_events 失败交易日数: {limit_event_result.failed_trade_date_count}")
         logger.info(
-            "stock daily facts pipeline finished: pool=%s stocks=%s facts=%s failed_stock_facts=%s fetched_rows=%s upserted_rows=%s rebuild_deleted=%s",
+            "stock daily facts pipeline finished: pool=%s stocks=%s facts=%s failed_stock_facts=%s failed_event_dates=%s fetched_rows=%s upserted_rows=%s rebuild_deleted=%s",
             result.pool_code,
             result.stock_count,
             result.completed_fact_count,
             result.failed_stock_fact_count,
+            result.failed_event_trade_date_count,
+            result.fetched_rows,
+            result.upserted_rows,
+            result.rebuild_deleted_rows,
+        )
+        return result
+
+    async def _run_limit_events(self, payload: StockDailyBackfillRequest) -> StockLimitEventBackfillResult:
+        end_date = payload.end_date or await self._resolve_latest_trade_date()
+        if payload.start_date > end_date:
+            raise StockDailyBackfillError("invalid_date_range", "开始日期不能晚于结束日期")
+        stock_codes = await self._resolve_stock_codes(payload.pool_code)
+        if payload.max_stocks:
+            stock_codes = stock_codes[: payload.max_stocks]
+        if not stock_codes:
+            raise StockDailyBackfillError("empty_stock_pool", f"股票池没有可回填的沪深 active 股票: {payload.pool_code}")
+
+        completion_scope = f"{payload.pool_code}:max_stocks={payload.max_stocks or 'all'}"
+        async with self.sessionmaker() as session:
+            repository = MarketDataRepository(session)
+            trade_dates = await repository.open_trade_dates_between(
+                start_date=payload.start_date,
+                end_date=end_date,
+            )
+            if not trade_dates:
+                raise StockDailyBackfillError("trade_calendar_missing", "指定日期范围内没有交易日，请先同步交易日历")
+            completed_dates = (
+                await repository.completed_stock_limit_event_backfill_dates(
+                    completion_scope=completion_scope,
+                    start_date=payload.start_date,
+                    end_date=end_date,
+                )
+                if payload.ingest_mode == "append_safe" and payload.only_missing
+                else set()
+            )
+            rebuild_deleted = 0
+            if payload.ingest_mode == "rebuild":
+                rebuild_deleted = await repository.clear_stock_limit_event_range(
+                    stock_codes=stock_codes,
+                    start_date=payload.start_date,
+                    end_date=end_date,
+                )
+                await session.commit()
+
+        target_dates = [trade_date for trade_date in trade_dates if trade_date not in completed_dates]
+        result = StockLimitEventBackfillResult(
+            pool_code=payload.pool_code,
+            start_date=payload.start_date,
+            end_date=end_date,
+            trade_date_count=len(trade_dates),
+            skipped_trade_date_count=len(trade_dates) - len(target_dates),
+            rebuild_deleted_rows=rebuild_deleted,
+            event_workers=payload.event_workers,
+            ingest_mode=payload.ingest_mode,
+            only_missing=payload.only_missing,
+            completion_scope=completion_scope,
+        )
+        if not target_dates:
+            logger.info(
+                "stock limit event backfill skipped: pool=%s start_date=%s end_date=%s trade_dates=%s reason=already_complete",
+                payload.pool_code,
+                payload.start_date,
+                end_date,
+                len(trade_dates),
+            )
+            return result
+
+        logger.info(
+            "stock limit event backfill started: pool=%s stocks=%s start_date=%s end_date=%s trade_dates=%s target_dates=%s workers=%s ingest_mode=%s only_missing=%s",
+            payload.pool_code,
+            len(stock_codes),
+            payload.start_date,
+            end_date,
+            len(trade_dates),
+            len(target_dates),
+            payload.event_workers,
+            payload.ingest_mode,
+            payload.only_missing,
+        )
+        universe = set(stock_codes)
+        queue: asyncio.Queue[date] = asyncio.Queue()
+        for trade_date in target_dates:
+            queue.put_nowait(trade_date)
+        lock = asyncio.Lock()
+
+        async def update_result(**values: int) -> None:
+            async with lock:
+                for key, value in values.items():
+                    setattr(result, key, getattr(result, key) + value)
+
+        async def add_error(trade_date: date, exc: Exception) -> None:
+            async with lock:
+                if len(result.errors) < 30:
+                    result.errors.append({"trade_date": trade_date.isoformat(), "error": f"{type(exc).__name__}: {exc}"})
+
+        async def worker(worker_id: int) -> None:
+            adapter = TushareStockDailyAdapter()
+            async with self.sessionmaker() as session:
+                repository = MarketDataRepository(session)
+                tushare = TushareProviderFactory(ConfigCenterRepository(session))
+                while True:
+                    try:
+                        trade_date = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    try:
+                        limit_response = await tushare.call(
+                            "stock_limit_event_history_backfill",
+                            lambda provider, current_date=trade_date: provider.request(
+                                TushareApiRequest(
+                                    api_name="limit_list_d",
+                                    params={"trade_date": current_date},
+                                )
+                            ),
+                            request_summary={
+                                "api_name": "limit_list_d",
+                                "trade_date": trade_date.isoformat(),
+                                "pool_code": payload.pool_code,
+                            },
+                            execution_mode="scheduler",
+                        )
+                        suspend_response = await tushare.call(
+                            "stock_suspend_event_history_backfill",
+                            lambda provider, current_date=trade_date: provider.request(
+                                TushareApiRequest(
+                                    api_name="suspend_d",
+                                    params={"trade_date": current_date},
+                                )
+                            ),
+                            request_summary={
+                                "api_name": "suspend_d",
+                                "trade_date": trade_date.isoformat(),
+                                "pool_code": payload.pool_code,
+                            },
+                            execution_mode="scheduler",
+                        )
+                        limit_mapping = adapter.map_limit_events(
+                            limit_response.records,
+                            trade_date=trade_date,
+                            universe=universe,
+                        )
+                        suspend_mapping = adapter.map_suspend_events(
+                            suspend_response.records,
+                            trade_date=trade_date,
+                            universe=universe,
+                        )
+                        rows = [*limit_mapping.rows, *suspend_mapping.rows]
+                        upserted = await repository.upsert_limit_event_rows(rows)
+                        raw_count = len(limit_response.records) + len(suspend_response.records)
+                        await repository.insert_raw(
+                            {
+                                "trace_id": uuid4().hex,
+                                "provider_code": "tushare",
+                                "capability": STOCK_LIMIT_EVENT_HISTORY_CAPABILITY,
+                                "request_params": {
+                                    "completion_scope": completion_scope,
+                                    "pool_code": payload.pool_code,
+                                    "max_stocks": payload.max_stocks,
+                                    "trade_date": trade_date.isoformat(),
+                                },
+                                "record_key": f"{completion_scope}:{trade_date.isoformat()}",
+                                "payload": {
+                                    "api_names": ["limit_list_d", "suspend_d"],
+                                    "raw_rows": raw_count,
+                                    "mapped_rows": len(rows),
+                                },
+                                "payload_summary": {
+                                    "limit_list_d_raw_rows": len(limit_response.records),
+                                    "suspend_d_raw_rows": len(suspend_response.records),
+                                    "mapped_rows": len(rows),
+                                },
+                                "normalized_table": "t_limit_event_daily",
+                                "normalized_pk": trade_date.isoformat(),
+                                "status": "captured",
+                            }
+                        )
+                        await session.commit()
+                        await update_result(
+                            completed_trade_date_count=1,
+                            fetched_rows=len(rows),
+                            upserted_rows=upserted,
+                        )
+                        logger.info(
+                            "stock limit event date completed: worker=%s trade_date=%s raw_rows=%s mapped_rows=%s upserted_rows=%s",
+                            worker_id,
+                            trade_date,
+                            raw_count,
+                            len(rows),
+                            upserted,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        await session.rollback()
+                        await update_result(failed_trade_date_count=1)
+                        await add_error(trade_date, exc)
+                        logger.warning(
+                            "stock limit event date failed: worker=%s trade_date=%s error=%s",
+                            worker_id,
+                            trade_date,
+                            exc,
+                        )
+                        if payload.fail_fast:
+                            raise
+                    finally:
+                        queue.task_done()
+
+        workers = [
+            asyncio.create_task(worker(index + 1))
+            for index in range(min(payload.event_workers, len(target_dates)))
+        ]
+        try:
+            await asyncio.gather(*workers)
+        except Exception:
+            for task in workers:
+                task.cancel()
+            raise
+
+        logger.info(
+            "stock limit event backfill finished: pool=%s trade_dates=%s completed=%s skipped=%s failed=%s fetched_rows=%s upserted_rows=%s rebuild_deleted=%s",
+            result.pool_code,
+            result.trade_date_count,
+            result.completed_trade_date_count,
+            result.skipped_trade_date_count,
+            result.failed_trade_date_count,
             result.fetched_rows,
             result.upserted_rows,
             result.rebuild_deleted_rows,

@@ -362,14 +362,14 @@ class BackfillStockDailyFactsHandler:
             "type": "string",
             "default": "all_a_share",
             "required": True,
-            "description": "指定需要回填四类个股日频事实的股票池；all_a_share 表示沪深 active 动态全市场。",
+            "description": "指定需要回填个股日频事实和事件的股票池；all_a_share 表示沪深 active 动态全市场。",
         },
         "start_date": {
             "label": "开始日期",
             "type": "string",
             "default": "2024-01-01",
             "required": True,
-            "description": "日线、daily_basic、资金流和专业技术因子回填开始日期，格式 YYYY-MM-DD。",
+            "description": "日线、daily_basic、资金流、专业技术因子和事件回填开始日期，格式 YYYY-MM-DD。",
         },
         "end_date": {
             "label": "结束日期",
@@ -426,12 +426,28 @@ class BackfillStockDailyFactsHandler:
             "max": 50000,
             "description": "每个 worker 单次事务最多提交的行数；四个接口仍按单股完整日期区间各请求一次。",
         },
+        "include_limit_events": {
+            "label": "回填涨跌停与停牌事件",
+            "type": "boolean",
+            "default": True,
+            "required": False,
+            "description": "开启后按交易日调用 limit_list_d 和 suspend_d，写入 t_limit_event_daily。",
+        },
+        "event_workers": {
+            "label": "事件交易日 worker 数",
+            "type": "number",
+            "default": 4,
+            "required": False,
+            "min": 1,
+            "max": 8,
+            "description": "涨跌停/停牌事件按交易日查询的并发数；每个交易日各请求两个全市场接口。",
+        },
         "fail_fast": {
             "label": "遇错立即失败",
             "type": "boolean",
             "default": False,
             "required": False,
-            "description": "关闭时单只股票失败只记录错误并继续其他股票。",
+            "description": "关闭时单只股票或单个事件交易日失败只记录错误并继续。",
         },
     }
     default_payload = {
@@ -444,6 +460,8 @@ class BackfillStockDailyFactsHandler:
         "workers": 12,
         "commit_stock_batch_size": 20,
         "max_upsert_rows_per_commit": 5000,
+        "include_limit_events": True,
+        "event_workers": 4,
         "fail_fast": False,
     }
     force_async = True

@@ -680,50 +680,21 @@ class DailyMarketCloseIngestService:
         return upserted
 
     async def _sync_stock_limit_status(self, trade_date: date, universe: set[str]) -> int:
-        rows = []
         limit_response = await self._tushare_response("limit_list_d", {"trade_date": trade_date}, capability="daily_market_close_stock_limit")
-        for record in limit_response.records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
-            row_date = parse_date(record.get("trade_date"))
-            if not stock_code or row_date is None or stock_code not in universe:
-                continue
-            limit_flag = str(record.get("limit") or record.get("limit_type") or "").upper()
-            event_type = "limit_up" if limit_flag == "U" else "limit_down" if limit_flag == "D" else "limit_event"
-            rows.append(
-                {
-                    "stock_code": stock_code,
-                    "trade_date": row_date,
-                    "event_type": event_type,
-                    "source": "tushare:limit_list_d",
-                    "close_price": safe_float(record.get("close")),
-                    "limit_price": safe_float(record.get("limit_price")),
-                    "first_time": None,
-                    "last_time": None,
-                    "open_count": None,
-                    "turnover_amount": safe_float(record.get("amount")),
-                    "metadata_json": {"provider": "tushare", "api_name": "limit_list_d", "raw": record},
-                }
-            )
         suspend_response = await self._tushare_response("suspend_d", {"trade_date": trade_date}, capability="daily_market_close_stock_suspend")
-        for record in suspend_response.records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
-            row_date = parse_date(record.get("trade_date") or record.get("suspend_date"))
-            if stock_code and row_date and stock_code in universe:
-                rows.append(
-                    {
-                        "stock_code": stock_code,
-                        "trade_date": row_date,
-                        "event_type": "suspend",
-                        "source": "tushare:suspend_d",
-                        "close_price": None,
-                        "limit_price": None,
-                        "first_time": None,
-                        "last_time": None,
-                        "open_count": None,
-                        "turnover_amount": None,
-                        "metadata_json": {"provider": "tushare", "api_name": "suspend_d", "raw": record},
-                    }
-                )
+        limit_mapping = self.tushare_daily_adapter.map_limit_events(
+            limit_response.records,
+            trade_date=trade_date,
+            universe=universe,
+        )
+        suspend_mapping = self.tushare_daily_adapter.map_suspend_events(
+            suspend_response.records,
+            trade_date=trade_date,
+            universe=universe,
+        )
+        self._log_mapping_summary(limit_mapping)
+        self._log_mapping_summary(suspend_mapping)
+        rows = [*limit_mapping.rows, *suspend_mapping.rows]
         await self._capture_raw_summary("daily_market_close_stock_limit", trade_date, limit_response.raw_payload, len(limit_response.records), normalized_table="t_limit_event_daily")
         await self._capture_raw_summary("daily_market_close_stock_suspend", trade_date, suspend_response.raw_payload, len(suspend_response.records), normalized_table="t_limit_event_daily")
         return await self.repository.upsert_limit_event_rows(rows)

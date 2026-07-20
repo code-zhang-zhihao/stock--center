@@ -245,7 +245,14 @@ def _limit_rows(records: list[dict]) -> list[dict]:
     for record in records:
         code, trade_date = _code(record), _date(record, "trade_date")
         if code and trade_date:
-            limit_type = str(record.get("limit") or record.get("limit_type") or "unknown").lower()
+            limit_flag = str(record.get("limit") or record.get("limit_type") or "").upper()
+            if not limit_flag and record.get("up_stat") not in (None, ""):
+                limit_flag = "U"
+            limit_type = {
+                "U": "limit_up",
+                "D": "limit_down",
+                "Z": "limit_break",
+            }.get(limit_flag, "limit_event")
             rows.append({"stock_code": code, "trade_date": trade_date, "event_type": limit_type, "source": "tushare:limit_list_d", "close_price": safe_float(record.get("close")), "limit_price": safe_float(record.get("limit_price")), "first_time": None, "last_time": None, "open_count": None, "turnover_amount": safe_float(record.get("amount")), "metadata_json": _metadata("limit_list_d", record)})
     return rows
 
@@ -1320,7 +1327,7 @@ class MarketDataSyncService:
                 row["status"] = self._normalize_tushare_status(row.get("status"))
             if self._is_delisted_stock_row(row):
                 metadata = dict(row.get("metadata_json") or {})
-                metadata.setdefault("status_normalized_reason", "name_prefix_delisted")
+                metadata.setdefault("status_normalized_reason", "name_marker_delisted")
                 metadata.setdefault("provider_status_before_name_check", row.get("status"))
                 row["metadata_json"] = metadata
                 row["status"] = "delisted"
@@ -1387,7 +1394,18 @@ class MarketDataSyncService:
             raw_source_fields.get("证券全称"),
             raw_source_fields.get("公司简称"),
         ]
-        return any(str(value or "").strip().startswith("退市") for value in candidates)
+        return any(MarketDataSyncService._is_delisted_stock_name(value) for value in candidates)
+
+    @staticmethod
+    def _is_delisted_stock_name(value: object) -> bool:
+        """Recognize the strict exchange display-name markers used during delisting."""
+        name = str(value or "").strip()
+        return bool(name) and (
+            name.startswith("退市")
+            or name.endswith("退")
+            or name.endswith("(退)")
+            or name.endswith("（退）")
+        )
 
     async def _capture_sync_raw(
         self,

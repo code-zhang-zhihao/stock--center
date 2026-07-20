@@ -63,9 +63,9 @@ WITH job_defs AS (
         (
             'backfill_stock_daily_facts',
             '历史个股日频事实回填',
-            '依次按股票池逐股区间调用 Tushare daily、daily_basic、moneyflow、stk_factor_pro，写入四张日频事实表；不拉历史分钟线。',
-            '{"pool_code":{"label":"股票池编码","type":"string","default":"all_a_share","required":true},"start_date":{"label":"开始日期","type":"string","default":"2024-01-01","required":true},"end_date":{"label":"结束日期","type":"string","required":false},"ingest_mode":{"label":"入库模式","type":"string","default":"append_safe","required":false,"options":["append_safe","rebuild"]},"only_missing":{"label":"只补缺失","type":"boolean","default":true,"required":false},"max_stocks":{"label":"股票数量上限","type":"number","required":false,"min":1},"workers":{"label":"并发 worker 数","type":"number","default":12,"required":false,"min":1,"max":20},"commit_stock_batch_size":{"label":"提交批次股票数","type":"number","default":20,"required":false,"min":1,"max":200},"max_upsert_rows_per_commit":{"label":"单次提交最大行数","type":"number","default":5000,"required":false,"min":100,"max":50000},"fail_fast":{"label":"遇错立即失败","type":"boolean","default":false,"required":false}}'::jsonb,
-            '{"pool_code":"all_a_share","start_date":"2024-01-01","end_date":null,"ingest_mode":"append_safe","only_missing":true,"max_stocks":null,"workers":12,"commit_stock_batch_size":20,"max_upsert_rows_per_commit":5000,"fail_fast":false}'::jsonb
+            '依次按股票池逐股区间调用 Tushare daily、daily_basic、moneyflow、stk_factor_pro，并按交易日调用 limit_list_d、suspend_d；不拉历史分钟线。',
+            '{"pool_code":{"label":"股票池编码","type":"string","default":"all_a_share","required":true},"start_date":{"label":"开始日期","type":"string","default":"2024-01-01","required":true},"end_date":{"label":"结束日期","type":"string","required":false},"ingest_mode":{"label":"入库模式","type":"string","default":"append_safe","required":false,"options":["append_safe","rebuild"]},"only_missing":{"label":"只补缺失","type":"boolean","default":true,"required":false},"max_stocks":{"label":"股票数量上限","type":"number","required":false,"min":1},"workers":{"label":"并发 worker 数","type":"number","default":12,"required":false,"min":1,"max":20},"commit_stock_batch_size":{"label":"提交批次股票数","type":"number","default":20,"required":false,"min":1,"max":200},"max_upsert_rows_per_commit":{"label":"单次提交最大行数","type":"number","default":5000,"required":false,"min":100,"max":50000},"include_limit_events":{"label":"回填涨跌停与停牌事件","type":"boolean","default":true,"required":false},"event_workers":{"label":"事件交易日 worker 数","type":"number","default":4,"required":false,"min":1,"max":8},"fail_fast":{"label":"遇错立即失败","type":"boolean","default":false,"required":false}}'::jsonb,
+            '{"pool_code":"all_a_share","start_date":"2024-01-01","end_date":null,"ingest_mode":"append_safe","only_missing":true,"max_stocks":null,"workers":12,"commit_stock_batch_size":20,"max_upsert_rows_per_commit":5000,"include_limit_events":true,"event_workers":4,"fail_fast":false}'::jsonb
         ),
         (
             'backfill_stock_daily_factors',
@@ -115,7 +115,7 @@ SELECT
     'cron', NULL, 'Asia/Shanghai', default_payload, 1,
     300, 86400, 0, 300,
     FALSE, TRUE, FALSE,
-    jsonb_build_object('source', '55-data-asset-history-pipelines.sql', 'manual_first', TRUE, 'pipeline_version', 2)
+    jsonb_build_object('source', '55-data-asset-history-pipelines.sql', 'manual_first', TRUE, 'pipeline_version', 3)
 FROM job_defs
 ON CONFLICT (job_code) DO UPDATE SET
     job_name = EXCLUDED.job_name,

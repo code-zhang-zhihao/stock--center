@@ -38,6 +38,7 @@ from app.modules.market_data.partitioning import ensure_market_partition, partit
 MAX_POSTGRES_QUERY_PARAMS = 30000
 DEFAULT_BULK_UPSERT_BATCH_SIZE = 1000
 MAINLAND_EXCHANGES = ("SH", "SZ", "SSE", "SZSE")
+STOCK_LIMIT_EVENT_HISTORY_CAPABILITY = "stock_limit_event_history_backfill"
 
 
 def _chunked(rows: list[dict], batch_size: int) -> Iterable[list[dict]]:
@@ -170,6 +171,30 @@ class MarketDataRepository:
         )
         return set(result.scalars().all())
 
+    async def completed_stock_limit_event_backfill_dates(
+        self,
+        *,
+        completion_scope: str,
+        start_date: date,
+        end_date: date,
+    ) -> set[date]:
+        result = await self.session.execute(
+            select(ProviderRawRecord.record_key).where(
+                ProviderRawRecord.capability == STOCK_LIMIT_EVENT_HISTORY_CAPABILITY,
+                ProviderRawRecord.status == "captured",
+                ProviderRawRecord.request_params["completion_scope"].astext == completion_scope,
+            )
+        )
+        completed: set[date] = set()
+        for record_key in result.scalars().all():
+            try:
+                trade_date = date.fromisoformat(str(record_key or "")[-10:])
+            except ValueError:
+                continue
+            if start_date <= trade_date <= end_date:
+                completed.add(trade_date)
+        return completed
+
     async def existing_index_bar_dates(self, *, index_code: str, start_date: date, end_date: date) -> set[date]:
         result = await self.session.execute(
             select(IndexBar.trade_date).where(
@@ -236,6 +261,25 @@ class MarketDataRepository:
                     model.stock_code.in_(codes),
                     model.trade_date >= start_date,
                     model.trade_date <= end_date,
+                )
+            )
+            deleted += int(result.rowcount or 0)
+        return deleted
+
+    async def clear_stock_limit_event_range(
+        self,
+        *,
+        stock_codes: list[str],
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        deleted = 0
+        for codes in _chunked(stock_codes, 1000):
+            result = await self.session.execute(
+                delete(LimitEventDaily).where(
+                    LimitEventDaily.stock_code.in_(codes),
+                    LimitEventDaily.trade_date >= start_date,
+                    LimitEventDaily.trade_date <= end_date,
                 )
             )
             deleted += int(result.rowcount or 0)

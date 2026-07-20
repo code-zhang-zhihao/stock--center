@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time
 from typing import Any
 
 from app.modules.market_data.contracts import CanonicalMappingResult, ProviderAdapter
@@ -23,6 +23,107 @@ class TushareStockDailyAdapter(ProviderAdapter):
         "moneyflow.*_amount": "ten_thousand_yuan -> yuan",
         "moneyflow.net_mf_amount": "ten_thousand_yuan -> yuan",
     }
+
+    def map_limit_events(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        trade_date: date | str,
+        universe: set[str] | None = None,
+    ) -> CanonicalMappingResult:
+        target_date = self._as_date(trade_date)
+        rows: list[dict[str, Any]] = []
+        for record in records:
+            row_date = parse_date(record.get("trade_date"))
+            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
+            if (
+                not stock_code
+                or row_date != target_date
+                or (universe is not None and stock_code not in universe)
+            ):
+                continue
+            limit_flag = str(record.get("limit") or record.get("limit_type") or "").upper()
+            if not limit_flag and record.get("up_stat") not in (None, ""):
+                limit_flag = "U"
+            event_type = {
+                "U": "limit_up",
+                "D": "limit_down",
+                "Z": "limit_break",
+            }.get(limit_flag, "limit_event")
+            open_count_value = record.get("open_times")
+            if open_count_value in (None, ""):
+                open_count_value = record.get("open_count")
+            rows.append(
+                {
+                    "stock_code": stock_code,
+                    "trade_date": row_date,
+                    "event_type": event_type,
+                    "source": "tushare:limit_list_d",
+                    "close_price": safe_float(record.get("close")),
+                    "limit_price": safe_float(record.get("limit_price")),
+                    "first_time": self._intraday_time(record.get("first_time")),
+                    "last_time": self._intraday_time(record.get("last_time")),
+                    "open_count": safe_int(open_count_value),
+                    "turnover_amount": safe_float(record.get("amount")),
+                    "metadata_json": self._metadata("limit_list_d", record, {}),
+                }
+            )
+        warnings = [f"limit_list_d skipped records: {len(records) - len(rows)}"] if len(records) != len(rows) else []
+        return self._result(
+            api_name="limit_list_d",
+            capability_code="stock_limit_event",
+            start_date=target_date,
+            end_date=target_date,
+            records=records,
+            rows=rows,
+            warnings=warnings,
+            unit_conversions={},
+        )
+
+    def map_suspend_events(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        trade_date: date | str,
+        universe: set[str] | None = None,
+    ) -> CanonicalMappingResult:
+        target_date = self._as_date(trade_date)
+        rows: list[dict[str, Any]] = []
+        for record in records:
+            row_date = parse_date(record.get("trade_date") or record.get("suspend_date"))
+            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
+            if (
+                not stock_code
+                or row_date != target_date
+                or (universe is not None and stock_code not in universe)
+            ):
+                continue
+            rows.append(
+                {
+                    "stock_code": stock_code,
+                    "trade_date": row_date,
+                    "event_type": "suspend",
+                    "source": "tushare:suspend_d",
+                    "close_price": None,
+                    "limit_price": None,
+                    "first_time": None,
+                    "last_time": None,
+                    "open_count": None,
+                    "turnover_amount": None,
+                    "metadata_json": self._metadata("suspend_d", record, {}),
+                }
+            )
+        warnings = [f"suspend_d skipped records: {len(records) - len(rows)}"] if len(records) != len(rows) else []
+        return self._result(
+            api_name="suspend_d",
+            capability_code="stock_suspend_event",
+            start_date=target_date,
+            end_date=target_date,
+            records=records,
+            rows=rows,
+            warnings=warnings,
+            unit_conversions={},
+        )
 
     def map_daily(
         self,
@@ -299,3 +400,20 @@ class TushareStockDailyAdapter(ProviderAdapter):
     def _ten_thousand(value: Any, *, multiplier: float = 10000) -> float | None:
         parsed = safe_float(value)
         return parsed * multiplier if parsed is not None else None
+
+    @staticmethod
+    def _intraday_time(value: Any) -> time | None:
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        if text.replace(".", "", 1).isdigit():
+            text = str(int(float(text))).zfill(6)
+            if len(text) == 6:
+                try:
+                    return time(int(text[:2]), int(text[2:4]), int(text[4:6]))
+                except ValueError:
+                    return None
+        try:
+            return time.fromisoformat(text)
+        except ValueError:
+            return None

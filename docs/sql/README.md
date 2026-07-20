@@ -60,6 +60,7 @@
 54. `54-backfill-minute-factor-and-technical-snapshot.sql`：将 `backfill_technical_snapshots` 收口为历史分钟因子与技术快照回填；`rebuild` 会同时重算 `t_stock_factor_minute` 和 `t_technical_indicator_snapshot`，用于公式升级后的可控修复。
 55. `55-data-asset-history-pipelines.sql`：建立历史初始化入口基线。新增 `t_stock_factor_daily.ma30/ma60` 和 `t_index_factor_daily`，seed 个股/板块/指数各“日频事实 + 日频因子”两段任务，并删除被替换的 7 条旧任务定义；历史运行日志保留。
 56. `56-sector-history-range-backfill.sql`：修正历史板块日频事实任务参数。`ths_daily` 改为逐板块一次完整日期区间请求，默认 12 个板块 worker；板块资金流默认使用已实测验证的 20 交易日窗口和 2 个窗口 worker。
+57. `57-stock-history-limit-events.sql`：将 `limit_list_d/suspend_d` 按交易日全市场查询阶段加入 `backfill_stock_daily_facts`，补齐 `t_limit_event_daily` 的历史涨跌停与停牌事件；把旧 `Z` 池归一为 `limit_break`，并兼容特定历史区间 U 池标志为空但带 `up_stat` 的响应。
 
 ## 产品化初始化规划
 
@@ -165,6 +166,8 @@ cd python-back
 
 `52-daily-factor-backfill-set-based.sql` 取代 51 的运行方式：`backfill_daily_factors` 每个连续交易日窗口在 PostgreSQL 内用窗口函数和 `INSERT ... SELECT` 计算，避免把重叠日线、资金流和完整专业技术 JSONB 反复传到 Python。为避免单条全市场 CTE 占满云端数据库内存，窗口会按 `sql_stock_chunk_size`（默认 200）分成独立提交的集合计算分片。`append_safe` 仍只插入缺失因子，`rebuild` 仍先删除指定股票池和日期窗口后重算。执行本 SQL 后 reload Scheduler。
 
-`55-data-asset-history-pipelines.sql` 建立历史初始化任务基线，必须在 `54` 之后执行。它用 `backfill_stock_daily_facts/backfill_stock_daily_factors/backfill_sector_daily_facts/backfill_sector_daily_factors/backfill_index_daily_facts/backfill_index_daily_factors` 替换旧历史任务定义；旧 `29/34/35/46/49/50/51/52/54` 仍保留为升级历史，不代表当前可执行任务名。随后执行 `56`、reload Scheduler，并按 `docs/wiki/20-核心流程/历史数据资产初始化.md` 先做最小范围 smoke。
+`55-data-asset-history-pipelines.sql` 建立历史初始化任务基线，必须在 `54` 之后执行。它用 `backfill_stock_daily_facts/backfill_stock_daily_factors/backfill_sector_daily_facts/backfill_sector_daily_factors/backfill_index_daily_facts/backfill_index_daily_factors` 替换旧历史任务定义；旧 `29/34/35/46/49/50/51/52/54` 仍保留为升级历史，不代表当前可执行任务名。随后执行 `56`、`57`、reload Scheduler，并按 `docs/wiki/20-核心流程/历史数据资产初始化.md` 先做最小范围 smoke。
 
 `56-sector-history-range-backfill.sql` 只更新 `backfill_sector_daily_facts` 的调度参数和说明，不改事实表。旧实现按交易日请求 `ths_daily`，当全量日期查询返回空时会退化成每日逐板块串行请求。新实现按板块代码请求一次完整 `start_date/end_date` 区间，每个板块完成后立即提交；执行 `56` 后 reload Scheduler。
+
+`57-stock-history-limit-events.sql` 不改表结构；它更新 `backfill_stock_daily_facts` 的调度参数，并幂等归一 `t_limit_event_daily` 的旧通用事件：metadata 明确标识为 Tushare `Z` 池的行转为 `limit_break`；类别为空但带 `up_stat` 的历史 U 池行转为 `limit_up`。事件阶段对每个交易日各调用一次 `limit_list_d` 和 `suspend_d`，按目标股票池过滤后 Upsert；成功日期在 `t_provider_raw_record` 留完成标记，`append_safe + only_missing=true` 重跑时会跳过。执行 `57` 后 reload Scheduler。
