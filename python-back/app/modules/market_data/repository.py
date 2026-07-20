@@ -27,6 +27,7 @@ from app.modules.market_data.models import (
     Stock,
     StockChipPerfDaily,
     StockDailyBasic,
+    StockFactorDaily,
     StockFundFlowDaily,
     StockNorthHoldDaily,
     StockTechnicalFactorDaily,
@@ -747,6 +748,40 @@ class MarketDataRepository:
         stmt = stmt.order_by(DailyBar.trade_date.desc(), source_priority, DailyBar.id.desc()).limit(limit)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def list_stock_daily_factor_mas(
+        self,
+        *,
+        stock_code: str,
+        trade_dates: list[date],
+    ) -> dict[date, dict[str, float | None]]:
+        """Return the lightweight MA projection used by the stock daily chart."""
+        if not trade_dates:
+            return {}
+        result = await self.session.execute(
+            select(
+                StockFactorDaily.trade_date,
+                StockFactorDaily.ma5,
+                StockFactorDaily.ma10,
+                StockFactorDaily.ma20,
+                StockFactorDaily.ma30,
+                StockFactorDaily.ma60,
+            ).where(
+                StockFactorDaily.stock_code == stock_code,
+                StockFactorDaily.source == "system:daily_close",
+                StockFactorDaily.trade_date.in_(trade_dates),
+            )
+        )
+        return {
+            row.trade_date: {
+                "ma5": float(row.ma5) if row.ma5 is not None else None,
+                "ma10": float(row.ma10) if row.ma10 is not None else None,
+                "ma20": float(row.ma20) if row.ma20 is not None else None,
+                "ma30": float(row.ma30) if row.ma30 is not None else None,
+                "ma60": float(row.ma60) if row.ma60 is not None else None,
+            }
+            for row in result
+        }
 
     async def upsert_daily_bars(self, rows: list[dict]) -> int:
         if not rows:

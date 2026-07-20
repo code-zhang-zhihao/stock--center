@@ -133,7 +133,20 @@ class StockAnalysisService:
     async def daily_bars(self, stock_code: str, *, limit: int = 250) -> dict:
         code = normalize_symbol(stock_code)
         rows = await self.repository.list_daily_bars(stock_code=code, limit=limit)
-        items = [self._row(row) for row in reversed(rows)]
+        factor_mas = await self.repository.list_stock_daily_factor_mas(
+            stock_code=code,
+            trade_dates=[row.trade_date for row in rows],
+        )
+        items = []
+        for row in reversed(rows):
+            item = self._row(row)
+            item.update(
+                factor_mas.get(
+                    row.trade_date,
+                    {"ma5": None, "ma10": None, "ma20": None, "ma30": None, "ma60": None},
+                )
+            )
+            items.append(item)
         return {"stock_code": code, "items": items, "total": len(items), "source": "database"}
 
     async def minute_bars(self, stock_code: str, *, trade_date: date | None, limit: int = 2000) -> dict:
@@ -199,9 +212,12 @@ class StockAnalysisService:
             order_by=[StockFactorMinute.bar_time.desc()],
             limit=400,
         )
-        snapshots = await self.repository.list_rows(TechnicalIndicatorSnapshot, filters=snapshot_filters, order_by=[TechnicalIndicatorSnapshot.snapshot_time.desc()], limit=lookback)
-        technical = await self.repository.list_rows(StockTechnicalFactorDaily, filters=technical_filters, order_by=[StockTechnicalFactorDaily.trade_date.desc()], limit=lookback)
-        chip = await self.repository.list_rows(StockChipPerfDaily, filters=chip_filters, order_by=[StockChipPerfDaily.trade_date.desc()], limit=lookback)
+        # The workbench only consumes the latest snapshot and enhanced-factor
+        # documents. Keeping their full JSON history in this response made a
+        # single-stock page request unnecessarily large and slow.
+        snapshots = await self.repository.list_rows(TechnicalIndicatorSnapshot, filters=snapshot_filters, order_by=[TechnicalIndicatorSnapshot.snapshot_time.desc()], limit=1)
+        technical = await self.repository.list_rows(StockTechnicalFactorDaily, filters=technical_filters, order_by=[StockTechnicalFactorDaily.trade_date.desc()], limit=1)
+        chip = await self.repository.list_rows(StockChipPerfDaily, filters=chip_filters, order_by=[StockChipPerfDaily.trade_date.desc()], limit=1)
 
         latest_daily = self._row(daily[0]) if daily else None
         latest_technical = self._row(technical[0]) if technical else None

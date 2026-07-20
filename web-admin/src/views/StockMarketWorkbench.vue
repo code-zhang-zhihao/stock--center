@@ -262,7 +262,7 @@ import type {
   StockAnalysisOverview,
   StockAnalysisRealtime,
   StockAnalysisSeries,
-  StockDailyBar,
+  StockDailyChartBar,
   StockDailyFactor,
   StockFundFlowSeries,
   StockLhbEvent,
@@ -310,7 +310,7 @@ const fundWindowOptions = [3, 5, 10, 20, 30] as const;
 
 const overview = ref<StockAnalysisOverview | null>(null);
 const realtime = ref<StockAnalysisRealtime | null>(null);
-const dailyBars = ref<StockAnalysisSeries<StockDailyBar> | null>(null);
+const dailyBars = ref<StockAnalysisSeries<StockDailyChartBar> | null>(null);
 const minuteBars = ref<StockAnalysisMinuteSeries | null>(null);
 const factors = ref<StockAnalysisFactors | null>(null);
 const fundFlow = ref<StockFundFlowSeries | null>(null);
@@ -372,7 +372,6 @@ const dailyChartOption = computed<EChartsOption>(() => {
   const dates = items.map((item) => item.trade_date);
   const candles = items.map((item) => [item.open_price, item.close_price, item.low_price, item.high_price]);
   const volume = coloredVolume(items.map((item) => ({ price: item.close_price, volume: item.volume_hand })), items[0]?.pre_close_price || null);
-  const factorByDate = new Map((factors.value?.daily_factors || []).map((item) => [item.trade_date, item]));
   return {
     animation: false,
     tooltip: { trigger: 'axis' },
@@ -382,11 +381,11 @@ const dailyChartOption = computed<EChartsOption>(() => {
     dataZoom: [{ type: 'inside', xAxisIndex: [0, 1] }],
     series: [
       { name: '日K', type: 'candlestick', data: candles, itemStyle: { color: '#d92d20', color0: '#07845f', borderColor: '#d92d20', borderColor0: '#07845f' } },
-      { name: 'MA5', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma5 ?? null), lineStyle: { color: '#f59e0b' } },
-      { name: 'MA10', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma10 ?? null), lineStyle: { color: '#2563eb' } },
-      { name: 'MA20', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma20 ?? null), lineStyle: { color: '#7c3aed' } },
-      { name: 'MA30', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma30 ?? null), lineStyle: { color: '#0f766e' } },
-      { name: 'MA60', type: 'line', smooth: true, showSymbol: false, data: dates.map((date) => factorByDate.get(date)?.ma60 ?? null), lineStyle: { color: '#be123c' } },
+      { name: 'MA5', type: 'line', smooth: true, showSymbol: false, data: items.map((item) => item.ma5), lineStyle: { color: '#f59e0b' } },
+      { name: 'MA10', type: 'line', smooth: true, showSymbol: false, data: items.map((item) => item.ma10), lineStyle: { color: '#2563eb' } },
+      { name: 'MA20', type: 'line', smooth: true, showSymbol: false, data: items.map((item) => item.ma20), lineStyle: { color: '#7c3aed' } },
+      { name: 'MA30', type: 'line', smooth: true, showSymbol: false, data: items.map((item) => item.ma30), lineStyle: { color: '#0f766e' } },
+      { name: 'MA60', type: 'line', smooth: true, showSymbol: false, data: items.map((item) => item.ma60), lineStyle: { color: '#be123c' } },
       { name: '成交量', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volume, itemStyle: { color: '#8da2b5' } },
     ],
   };

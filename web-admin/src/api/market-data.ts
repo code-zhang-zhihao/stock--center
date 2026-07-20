@@ -17,7 +17,7 @@ import type {
   StockAnalysisRealtime,
   StockAnalysisSearchResult,
   StockAnalysisSeries,
-  StockDailyBar,
+  StockDailyChartBar,
   StockFundFlowSeries,
 } from '@/types/market-data';
 
@@ -130,7 +130,7 @@ export const marketDataApi = {
     method: 'GET',
     url: `/market-data/stock-analysis/${encodeURIComponent(stockCode)}/realtime`,
   }),
-  stockAnalysisDailyBars: (stockCode: string, params: { limit?: number } = {}) => requestData<StockAnalysisSeries<StockDailyBar>>({
+  stockAnalysisDailyBars: (stockCode: string, params: { limit?: number } = {}) => requestData<StockAnalysisSeries<StockDailyChartBar>>({
     method: 'GET',
     url: `/market-data/stock-analysis/${encodeURIComponent(stockCode)}/daily-bars`,
     params: {

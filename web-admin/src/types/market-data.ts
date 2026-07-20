@@ -181,6 +181,14 @@ export interface StockDailyBar {
   turnover_rate?: number | null;
 }
 
+export interface StockDailyChartBar extends StockDailyBar {
+  ma5: number | null;
+  ma10: number | null;
+  ma20: number | null;
+  ma30: number | null;
+  ma60: number | null;
+}
+
 export interface StockMinuteBar {
   stock_code: string;
   trade_date?: string;
