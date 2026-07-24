@@ -7,6 +7,8 @@ raw transport adapters; factor computation is delegated to ``indicator_engine``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from datetime import date, datetime
 from time import perf_counter
@@ -61,12 +63,14 @@ class DailyMarketCloseIngestRequest(BaseModel):
     calculate_technical_snapshot: bool = True
     calculate_stock_fund_factors: bool = True
     calculate_external_technical_factors: bool = True
+    merge_external_technical_factors: bool = False
     calculate_sector_factors: bool = True
     fail_on_enrichment_error: bool = False
     enrichment_block_concurrency: int = Field(default=4, ge=1, le=10)
-    minute_retention_trade_days: int = Field(default=10, ge=1, le=60)
-    minute_max_concurrency: int = Field(default=4, ge=1, le=10)
+    minute_retention_trade_days: int = Field(default=30, ge=1, le=60)
+    minute_max_concurrency: int = Field(default=10, ge=1, le=10)
     minute_batch_size: int = Field(default=200, ge=20, le=1000)
+    minute_factor_stock_batch_size: int = Field(default=200, ge=50, le=500)
     ingest_mode: Literal["append_safe", "rebuild"] = "append_safe"
 
 
@@ -98,6 +102,12 @@ class DailyMarketCloseIngestResult(BaseModel):
     technical_snapshot_rows: int = 0
     sector_factor_rows: int = 0
     enrichment_blocks: list[dict] = Field(default_factory=list)
+    stage_timings: dict[str, int] = Field(default_factory=dict)
+    block_status: dict[str, dict] = Field(default_factory=dict)
+    coverage: dict[str, float] = Field(default_factory=dict)
+    core_ready: bool = False
+    report_quality: Literal["complete", "degraded", "blocked", "not_applicable"] = "blocked"
+    missing_blocks: list[str] = Field(default_factory=list)
     pruned_partitions: list[str] = Field(default_factory=list)
     rebuild_deleted: dict[str, int] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
@@ -119,7 +129,173 @@ class DailyMarketCloseIngestService:
         self.tushare_daily_adapter = TushareStockDailyAdapter()
         self.tushare_market_adapter = TushareMarketAdapter()
 
+    async def run_minute(self, payload: DailyMarketCloseIngestRequest) -> DailyMarketCloseIngestResult:
+        """Persist current-day MooTDX minute bars and their reusable minute factors."""
+        started = perf_counter()
+        trade_date = payload.trade_date or datetime.now(SHANGHAI).date()
+        result = DailyMarketCloseIngestResult(
+            trade_date=trade_date,
+            report_quality="not_applicable",
+        )
+        trade_day = await self.repository.get_trade_day(trade_date)
+        if trade_day is None:
+            raise DailyMarketCloseIngestError(f"交易日历缺少 {trade_date.isoformat()}，请先同步 t_trade_calendar")
+        if not trade_day.is_open:
+            result.status = "skipped"
+            result.warnings.append(f"{trade_date.isoformat()} 为非交易日，未执行分钟沉淀")
+            return result
+        today = datetime.now(SHANGHAI).date()
+        if trade_date != today:
+            result.status = "skipped"
+            result.warnings.append("MooTDX 分钟任务只处理当前交易日，不执行历史分钟补数")
+            return result
+
+        universe = [
+            code
+            for code in await self.repository.list_active_stock_codes()
+            if self._supports_mootdx_intraday(code)
+        ]
+        result.universe_count = len(universe)
+        result.minute_target_count = len(universe)
+        if not universe:
+            raise DailyMarketCloseIngestError("all_a_share 动态范围为空，未发现可获取分钟线的沪深 active 股票")
+
+        partition_started = perf_counter()
+        await ensure_market_partitions(
+            self.repository.session,
+            trade_date=trade_date,
+            include_minute_bar=True,
+            include_minute_factor=payload.calculate_minute_factors,
+        )
+        await self.repository.commit()
+        result.stage_timings["partition_preflight"] = int((perf_counter() - partition_started) * 1000)
+
+        if payload.ingest_mode == "rebuild":
+            result.rebuild_deleted = await self.repository.clear_minute_ingest_data(trade_date)
+            await self.repository.commit()
+
+        minute_started = perf_counter()
+        minute_result = await self._sync_intraday(
+            universe,
+            trade_date=trade_date,
+            sync_minute=True,
+            max_concurrency=payload.minute_max_concurrency,
+            minute_batch_size=payload.minute_batch_size,
+            append_safe=payload.ingest_mode == "append_safe",
+        )
+        result.minute_complete_count = minute_result["minute_complete_count"]
+        result.minute_partial_count = minute_result["minute_partial_count"]
+        result.minute_failed_count = minute_result["minute_failed_count"]
+        result.minute_batch_count = minute_result["minute_batch_count"]
+        result.minute_batches = minute_result["minute_batches"]
+        result.errors.extend(minute_result["errors"])
+        result.stage_timings["minute_bars"] = int((perf_counter() - minute_started) * 1000)
+
+        minute_counts = await self.repository.minute_bar_counts(
+            stock_codes=universe,
+            trade_date=trade_date,
+        )
+        if payload.calculate_minute_factors:
+            factor_started = perf_counter()
+            indicator_repository = IndicatorRepository(self.repository.session)
+            factor_rows = 0
+            factor_counts_before = await self.repository.minute_factor_counts(
+                stock_codes=universe,
+                trade_date=trade_date,
+            )
+            factor_targets = [
+                code
+                for code in universe
+                if (
+                    payload.ingest_mode == "rebuild"
+                    or factor_counts_before.get(code, 0) < minute_counts.get(code, 0)
+                )
+            ]
+            for batch_no, codes in enumerate(
+                self._chunks(factor_targets, payload.minute_factor_stock_batch_size),
+                start=1,
+            ):
+                batch_started = perf_counter()
+                try:
+                    written = await indicator_repository.backfill_minute_factors_set_based(
+                        codes,
+                        trade_date=trade_date,
+                    )
+                    await self.repository.commit()
+                    factor_rows += written
+                    logger.info(
+                        "minute factor SQL batch completed: trade_date=%s batch=%s stocks=%s rows=%s elapsed_ms=%s",
+                        trade_date,
+                        batch_no,
+                        len(codes),
+                        written,
+                        int((perf_counter() - batch_started) * 1000),
+                    )
+                except Exception as exc:
+                    await self.repository.rollback()
+                    message = (
+                        f"minute factor batch {batch_no} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    logger.exception(
+                        "minute factor SQL batch failed: trade_date=%s batch=%s stocks=%s",
+                        trade_date,
+                        batch_no,
+                        len(codes),
+                    )
+                    result.errors.append(message)
+            result.minute_factor_rows = factor_rows
+            result.stage_timings["minute_factors"] = int((perf_counter() - factor_started) * 1000)
+
+        minute_coverage = result.minute_complete_count / max(1, result.minute_target_count)
+        factor_counts_after = await self.repository.minute_factor_counts(
+            stock_codes=universe,
+            trade_date=trade_date,
+        )
+        minute_bar_rows = sum(minute_counts.values())
+        minute_factor_rows = sum(
+            min(count, minute_counts.get(code, 0))
+            for code, count in factor_counts_after.items()
+        )
+        result.coverage["minute_bars"] = round(minute_coverage, 6)
+        result.coverage["minute_factors"] = round(
+            min(1.0, minute_factor_rows / max(1, minute_bar_rows)),
+            6,
+        )
+        result.block_status["minute_bars"] = {
+            "status": "complete" if minute_coverage >= 0.95 else "partial",
+            "rows": int(minute_result.get("minute_row_count") or 0),
+        }
+        result.block_status["minute_factors"] = {
+            "status": "complete" if result.coverage["minute_factors"] >= 0.95 else "partial",
+            "rows": minute_factor_rows,
+        }
+        if minute_coverage >= 0.95:
+            retention_started = perf_counter()
+            try:
+                result.pruned_partitions = await self._prune_minute_data(
+                    trade_date,
+                    payload.minute_retention_trade_days,
+                )
+                await self.repository.commit()
+            except Exception as exc:
+                await self.repository.rollback()
+                result.warnings.append(f"分钟分区清理失败，已保留沉淀数据: {exc}")
+            result.stage_timings["retention"] = int((perf_counter() - retention_started) * 1000)
+        else:
+            result.status = "partial"
+            result.missing_blocks.append("minute_bars")
+            result.warnings.append(f"分钟线完整覆盖率 {minute_coverage:.1%}，未执行历史分钟分区清理")
+        if result.coverage["minute_factors"] < 0.95:
+            result.status = "partial"
+            result.missing_blocks.append("minute_factors")
+        if result.errors and result.status == "success":
+            result.status = "partial"
+        result.stage_timings["total"] = int((perf_counter() - started) * 1000)
+        return result
+
     async def run(self, payload: DailyMarketCloseIngestRequest) -> DailyMarketCloseIngestResult:
+        run_started = perf_counter()
         trade_date = payload.trade_date or datetime.now(SHANGHAI).date()
         result = DailyMarketCloseIngestResult(trade_date=trade_date)
         trade_day = await self.repository.get_trade_day(trade_date)
@@ -157,89 +333,42 @@ class DailyMarketCloseIngestService:
             result.rebuild_deleted = await self.repository.clear_daily_close_ingest_data(trade_date)
             await self.repository.commit()
 
-        if payload.sync_daily:
-            daily_records, raw_payload = await self._tushare_records("daily", trade_date)
-            daily_mapping = self.tushare_daily_adapter.map_daily(daily_records, trade_date=trade_date, universe=universe_set)
-            daily_rows = daily_mapping.rows
-            self._log_mapping_summary(daily_mapping)
-            result.warnings.extend(daily_mapping.warnings)
-            min_expected = min(len(universe), max(self.daily_minimum_floor, int(len(universe) * 0.55)))
-            if len(daily_rows) < min_expected:
-                raise DailyMarketCloseIngestError(
-                    f"Tushare daily 返回 {len(daily_rows)} 条，低于全市场保护阈值 {min_expected}；未降级为逐股请求"
-                )
-            result.daily_rows = await self.repository.upsert_daily_bars(daily_rows)
-            self._log_upsert_summary(daily_mapping, result.daily_rows, "t_daily_bar")
-            await self._capture_raw_summary("daily_market_close_daily", trade_date, raw_payload, len(daily_rows))
-            await self.repository.commit()
+        core_started = perf_counter()
+        await self._run_parallel_core_blocks(
+            trade_date=trade_date,
+            payload=payload,
+            result=result,
+            universe_set=universe_set,
+        )
+        if any(
+            (
+                payload.sync_daily,
+                payload.sync_daily_basic,
+                payload.sync_stock_moneyflow,
+                payload.sync_stock_limit_status,
+                payload.sync_index_bars,
+                payload.sync_north_hold,
+                payload.sync_sector_bars,
+            )
+        ):
+            result.stage_timings["core_fact_blocks"] = int((perf_counter() - core_started) * 1000)
 
         daily_codes = await self._daily_codes(trade_date)
         if not daily_codes:
             raise DailyMarketCloseIngestError(f"{trade_date.isoformat()} 没有 Canonical 日线，不能继续分钟和因子沉淀")
-
-        if payload.sync_daily_basic:
-            daily_basic_records, raw_payload = await self._tushare_records("daily_basic", trade_date)
-            daily_basic_mapping = self.tushare_daily_adapter.map_daily_basic(daily_basic_records, trade_date=trade_date, universe=universe_set)
-            basic_rows = daily_basic_mapping.rows
-            self._log_mapping_summary(daily_basic_mapping)
-            result.warnings.extend(daily_basic_mapping.warnings)
-            if len(basic_rows) < max(1, int(len(daily_codes) * 0.5)):
-                raise DailyMarketCloseIngestError(
-                    f"Tushare daily_basic 返回 {len(basic_rows)} 条，低于日线范围的 50%"
-                )
-            result.daily_basic_rows = await self.repository.upsert_daily_basic_rows(basic_rows)
-            self._log_upsert_summary(daily_basic_mapping, result.daily_basic_rows, "t_stock_daily_basic")
-            await self._capture_raw_summary("daily_market_close_daily_basic", trade_date, raw_payload, len(basic_rows))
-            await self.repository.commit()
-
         daily_targets = sorted(set(daily_codes) & universe_set)
-        await self._run_enrichment(
-            "stock moneyflow",
-            payload.sync_stock_moneyflow,
-            payload.fail_on_enrichment_error,
-            result,
-            lambda: self._sync_stock_moneyflow(trade_date, universe_set),
-            "stock_moneyflow_rows",
-        )
-        await self._run_enrichment(
-            "stock limit/suspend",
-            payload.sync_stock_limit_status,
-            payload.fail_on_enrichment_error,
-            result,
-            lambda: self._sync_stock_limit_status(trade_date, universe_set),
-            "stock_limit_rows",
-        )
-        await self._run_enrichment(
-            "index bars",
-            payload.sync_index_bars,
-            payload.fail_on_enrichment_error,
-            result,
-            lambda: self._sync_index_bars(trade_date, result),
-            "index_bar_rows",
-        )
-        await self._run_enrichment(
-            "north hold",
-            payload.sync_north_hold,
-            payload.fail_on_enrichment_error,
-            result,
-            lambda: self._sync_north_hold(trade_date, universe_set, result),
-            "north_hold_rows",
-        )
-        await self._run_enrichment(
-            "sector bars",
-            payload.sync_sector_bars,
-            payload.fail_on_enrichment_error,
-            result,
-            lambda: self._sync_sector_bars(trade_date, result),
-            "sector_bar_rows",
-        )
 
+        enrichment_started = perf_counter()
         await self._run_parallel_enrichment_blocks(
             trade_date=trade_date,
             payload=payload,
             result=result,
             universe_set=universe_set,
         )
+        if result.enrichment_blocks:
+            result.stage_timings["enhancement_fact_blocks"] = int(
+                (perf_counter() - enrichment_started) * 1000
+            )
 
         minute_targets = list(daily_targets)
         if payload.sync_minute:
@@ -275,44 +404,68 @@ class DailyMarketCloseIngestService:
                 result.errors.extend(minute_result["errors"])
                 await self.repository.commit()
 
-        indicator = IndicatorEngineService(IndicatorRepository(self.repository.session))
-        factors = await indicator.calculate_market_close(
-            daily_targets,
-            trade_date=trade_date,
-            calculate_daily=payload.calculate_daily_factors,
-            calculate_minute=False,
-            calculate_snapshot=False,
-            calculate_stock_fund=payload.calculate_stock_fund_factors,
-            include_external_technical=payload.calculate_external_technical_factors,
-            include_chip=False,
-        )
-        intraday_factors = await indicator.calculate_market_close(
-            minute_targets,
-            trade_date=trade_date,
-            calculate_daily=False,
-            calculate_minute=payload.calculate_minute_factors,
-            calculate_snapshot=payload.calculate_technical_snapshot,
-            calculate_stock_fund=False,
-            include_external_technical=False,
-            include_chip=False,
-        )
-        result.daily_factor_rows = factors.daily_factor_rows
-        result.minute_factor_rows = intraday_factors.minute_factor_rows
-        result.technical_snapshot_rows = intraday_factors.technical_snapshot_rows
-        if factors.missing_daily_data:
-            result.warnings.append(f"缺少日线数据导致无法计算日频因子的股票数: {factors.missing_daily_data}")
-        if factors.insufficient_daily_history:
-            result.warnings.append(f"日线历史窗口不足的股票数: {factors.insufficient_daily_history}")
-        if factors.missing_stock_fund_flow:
-            result.warnings.append(f"缺少个股资金流导致资金因子不完整的股票数: {factors.missing_stock_fund_flow}")
-        if factors.missing_stock_technical_factor:
-            result.warnings.append(f"缺少 Tushare 专业技术因子的股票数: {factors.missing_stock_technical_factor}")
-        if intraday_factors.missing_minute_data:
-            result.warnings.append(f"缺少分钟数据的股票数: {intraday_factors.missing_minute_data}")
-        if intraday_factors.missing_snapshot_daily_data:
-            result.warnings.append(f"缺少日线数据导致无法生成技术快照的股票数: {intraday_factors.missing_snapshot_daily_data}")
+        indicator_repository = IndicatorRepository(self.repository.session)
+        if payload.calculate_daily_factors:
+            factor_started = perf_counter()
+            for codes in self._chunks(daily_targets, 500):
+                written = await indicator_repository.backfill_daily_factors_set_based(
+                    codes,
+                    start_date=trade_date,
+                    end_date=trade_date,
+                    history_start=trade_date.fromordinal(trade_date.toordinal() - 100),
+                    fund_history_start=trade_date.fromordinal(trade_date.toordinal() - 20),
+                    only_missing=False,
+                    calculate_stock_fund=payload.calculate_stock_fund_factors,
+                    include_external_technical=payload.calculate_external_technical_factors,
+                )
+                result.daily_factor_rows += written.get(trade_date, 0)
+                await self.repository.commit()
+            result.stage_timings["daily_factors"] = int((perf_counter() - factor_started) * 1000)
+
+        if payload.merge_external_technical_factors:
+            merge_started = perf_counter()
+            for codes in self._chunks(daily_targets, 1000):
+                result.daily_factor_rows += await indicator_repository.merge_external_technical_features(
+                    codes,
+                    trade_date=trade_date,
+                )
+                await self.repository.commit()
+            result.stage_timings["external_technical_merge"] = int(
+                (perf_counter() - merge_started) * 1000
+            )
+
+        if payload.calculate_minute_factors and minute_targets:
+            factor_started = perf_counter()
+            for codes in self._chunks(minute_targets, payload.minute_factor_stock_batch_size):
+                result.minute_factor_rows += await indicator_repository.backfill_minute_factors_set_based(
+                    codes,
+                    trade_date=trade_date,
+                )
+                await self.repository.commit()
+            result.stage_timings["minute_factors"] = int((perf_counter() - factor_started) * 1000)
+
+        if payload.calculate_technical_snapshot:
+            snapshot_started = perf_counter()
+            for codes in self._chunks(daily_targets, 500):
+                written = await indicator_repository.backfill_technical_snapshots_set_based(
+                    codes,
+                    start_date=trade_date,
+                    end_date=trade_date,
+                    only_missing=False,
+                )
+                result.technical_snapshot_rows += written.get(trade_date, 0)
+                await self.repository.commit()
+            result.stage_timings["technical_snapshots"] = int(
+                (perf_counter() - snapshot_started) * 1000
+            )
+
         if payload.calculate_sector_factors:
+            sector_factor_started = perf_counter()
+            indicator = IndicatorEngineService(indicator_repository)
             result.sector_factor_rows = await indicator.calculate_sector_factors(trade_date=trade_date)
+            result.stage_timings["sector_factors"] = int(
+                (perf_counter() - sector_factor_started) * 1000
+            )
 
         if payload.sync_minute and result.minute_target_count:
             coverage = result.minute_complete_count / result.minute_target_count
@@ -335,6 +488,8 @@ class DailyMarketCloseIngestService:
 
         if result.errors and result.status == "success":
             result.status = "partial"
+        await self._finalize_readiness(result, universe_count=len(universe))
+        result.stage_timings["total"] = int((perf_counter() - run_started) * 1000)
         logger.info(
             "daily close ingest finished: trade_date=%s status=%s daily=%s minute_complete=%s/%s factors=%s/%s/%s",
             trade_date,
@@ -348,26 +503,99 @@ class DailyMarketCloseIngestService:
         )
         return result
 
-    async def _run_enrichment(self, label: str, enabled: bool, fail_on_error: bool, result: DailyMarketCloseIngestResult, operation, target) -> None:
-        if not enabled:
+    async def _run_parallel_core_blocks(
+        self,
+        *,
+        trade_date: date,
+        payload: DailyMarketCloseIngestRequest,
+        result: DailyMarketCloseIngestResult,
+        universe_set: set[str],
+    ) -> None:
+        specs: list[dict[str, Any]] = [
+            {
+                "label": "daily",
+                "enabled": payload.sync_daily,
+                "target": "daily_rows",
+                "fail_on_error": True,
+                "operation": lambda service: service._sync_daily_bars(trade_date, universe_set),
+            },
+            {
+                "label": "daily basic",
+                "enabled": payload.sync_daily_basic,
+                "target": "daily_basic_rows",
+                "fail_on_error": True,
+                "operation": lambda service: service._sync_daily_basic(trade_date, universe_set),
+            },
+            {
+                "label": "stock moneyflow",
+                "enabled": payload.sync_stock_moneyflow,
+                "target": "stock_moneyflow_rows",
+                "fail_on_error": payload.fail_on_enrichment_error,
+                "operation": lambda service: service._sync_stock_moneyflow(trade_date, universe_set),
+            },
+            {
+                "label": "stock limit/suspend",
+                "enabled": payload.sync_stock_limit_status,
+                "target": "stock_limit_rows",
+                "fail_on_error": payload.fail_on_enrichment_error,
+                "operation": lambda service: service._sync_stock_limit_status(trade_date, universe_set),
+            },
+            {
+                "label": "index bars",
+                "enabled": payload.sync_index_bars,
+                "target": "index_bar_rows",
+                "fail_on_error": payload.fail_on_enrichment_error,
+                "operation": lambda service: service._sync_index_bars(trade_date, result),
+            },
+            {
+                "label": "north hold",
+                "enabled": payload.sync_north_hold,
+                "target": "north_hold_rows",
+                "fail_on_error": payload.fail_on_enrichment_error,
+                "operation": lambda service: service._sync_north_hold(trade_date, universe_set, result),
+            },
+            {
+                "label": "sector bars",
+                "enabled": payload.sync_sector_bars,
+                "target": "sector_bar_rows",
+                "fail_on_error": payload.fail_on_enrichment_error,
+                "operation": lambda service: service._sync_sector_bars(trade_date, result),
+            },
+        ]
+        enabled_specs = [spec for spec in specs if spec["enabled"]]
+        if not enabled_specs:
             return
-        logger.info("daily close ingest enrichment started: %s", label)
+        semaphore = asyncio.Semaphore(min(payload.enrichment_block_concurrency, len(enabled_specs)))
+
+        async def guarded(spec: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                return await self._run_parallel_enrichment_block(
+                    spec["label"],
+                    spec["operation"],
+                    fail_on_error=bool(spec["fail_on_error"]),
+                    mode="single_date",
+                    range_start_date=trade_date,
+                    range_end_date=trade_date,
+                )
+
+        tasks = [asyncio.create_task(guarded(spec)) for spec in enabled_specs]
         try:
-            value = await operation()
-            if isinstance(target, tuple):
-                for name, item in zip(target, value, strict=False):
-                    setattr(result, name, int(item or 0))
+            block_results = await asyncio.gather(*tasks)
+        except Exception:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        target_by_label = {spec["label"]: spec["target"] for spec in enabled_specs}
+        for block_result in block_results:
+            label = str(block_result.get("label"))
+            if block_result.get("status") == "success":
+                self._apply_enrichment_value(result, target_by_label[label], block_result.get("value"))
             else:
-                setattr(result, target, int(value or 0))
-            await self.repository.commit()
-            logger.info("daily close ingest enrichment finished: %s rows=%s", label, value)
-        except Exception as exc:
-            await self.repository.rollback()
-            message = f"{label} 沉淀失败: {type(exc).__name__}: {exc}"
-            if fail_on_error:
-                raise DailyMarketCloseIngestError(message) from exc
-            logger.warning("daily close ingest enrichment failed: %s", message)
-            result.warnings.append(message)
+                result.warnings.append(str(block_result.get("error") or f"{label} 沉淀失败"))
+            block_result.pop("value", None)
+            result.enrichment_blocks.append(block_result)
 
     def _log_mapping_summary(self, mapping: CanonicalMappingResult) -> None:
         logger.info(
@@ -514,8 +742,17 @@ class DailyMarketCloseIngestService:
         target_by_label = {spec["label"]: spec["target"] for spec in enabled_specs}
         for block_result in block_results:
             label = str(block_result.get("label"))
+            if (
+                label == "market stats"
+                and block_result.get("status") == "success"
+                and int(block_result.get("rows") or 0) == 0
+            ):
+                block_result["status"] = "deferred"
+                block_result["reason"] = "daily_info_not_published"
             if block_result.get("status") == "success":
                 self._apply_enrichment_value(result, target_by_label[label], block_result.get("value"))
+            elif block_result.get("status") == "deferred":
+                result.warnings.append(f"{label} 当日数据尚未发布，已延后到缺口修复任务")
             else:
                 message = str(block_result.get("error") or f"{label} 沉淀失败")
                 result.warnings.append(message)
@@ -633,6 +870,56 @@ class DailyMarketCloseIngestService:
             )
         except TushareRuntimeError as exc:
             raise DailyMarketCloseIngestError(f"Tushare {api_name} 调用失败: {exc}") from exc
+
+    async def _sync_daily_bars(self, trade_date: date, universe: set[str]) -> int:
+        records, raw_payload = await self._tushare_records("daily", trade_date)
+        mapping = self.tushare_daily_adapter.map_daily(
+            records,
+            trade_date=trade_date,
+            universe=universe,
+        )
+        self._log_mapping_summary(mapping)
+        min_expected = min(
+            len(universe),
+            max(self.daily_minimum_floor, int(len(universe) * 0.55)),
+        )
+        if len(mapping.rows) < min_expected:
+            raise DailyMarketCloseIngestError(
+                f"Tushare daily 返回 {len(mapping.rows)} 条，低于全市场保护阈值 {min_expected}；未降级为逐股请求"
+            )
+        upserted = await self.repository.upsert_daily_bars(mapping.rows)
+        self._log_upsert_summary(mapping, upserted, "t_daily_bar")
+        await self._capture_raw_summary(
+            "daily_market_close_daily",
+            trade_date,
+            raw_payload,
+            len(mapping.rows),
+        )
+        return upserted
+
+    async def _sync_daily_basic(self, trade_date: date, universe: set[str]) -> int:
+        records, raw_payload = await self._tushare_records("daily_basic", trade_date)
+        mapping = self.tushare_daily_adapter.map_daily_basic(
+            records,
+            trade_date=trade_date,
+            universe=universe,
+        )
+        self._log_mapping_summary(mapping)
+        min_expected = max(1, int(len(universe) * 0.5))
+        if len(mapping.rows) < min_expected:
+            raise DailyMarketCloseIngestError(
+                f"Tushare daily_basic 返回 {len(mapping.rows)} 条，低于沪深 active 范围的 50%"
+            )
+        upserted = await self.repository.upsert_daily_basic_rows(mapping.rows)
+        self._log_upsert_summary(mapping, upserted, "t_stock_daily_basic")
+        await self._capture_raw_summary(
+            "daily_market_close_daily_basic",
+            trade_date,
+            raw_payload,
+            len(mapping.rows),
+            normalized_table="t_stock_daily_basic",
+        )
+        return upserted
 
     async def _sync_stock_technical_factor_pro(self, trade_date: date, universe: set[str]) -> int:
         response = await self._tushare_response(
@@ -1015,23 +1302,64 @@ class DailyMarketCloseIngestService:
 
     async def _sync_sector_bars(self, trade_date: date, result: DailyMarketCloseIngestResult) -> int:
         sector_map = await self.repository.tushare_ths_sector_map()
-        response = await self._tushare_response("ths_daily", {"trade_date": trade_date}, capability="daily_market_close_sector_bars")
-        records = list(response.records)
-        if not records:
-            result.warnings.append("ths_daily trade_date 全量返回 0，改为按板块 ts_code 逐个补取")
-            for index, raw_code in enumerate(sorted(sector_map), start=1):
-                if index % 200 == 0:
-                    logger.info("daily close ingest ths_daily fallback progress: %s/%s", index, len(sector_map))
-                fallback = await self._tushare_response(
-                    "ths_daily",
-                    {"ts_code": raw_code, "trade_date": trade_date},
-                    capability="daily_market_close_sector_bars",
-                )
-                records.extend(fallback.records)
+        raw_codes = sorted(sector_map)
+        records: list[dict] = []
+        request_count = 0
+        for code_batch in self._chunks(raw_codes, 500):
+            response = await self._tushare_response(
+                "ths_daily",
+                {"ts_code": ",".join(code_batch), "trade_date": trade_date},
+                capability="daily_market_close_sector_bars",
+            )
+            request_count += 1
+            records.extend(response.records)
+
+        returned_codes = {
+            str(record.get("ts_code") or "").strip()
+            for record in records
+            if parse_date(record.get("trade_date")) == trade_date
+        }
+        missing_codes = [code for code in raw_codes if code not in returned_codes]
+        if missing_codes:
+            retry = await self._tushare_response(
+                "ths_daily",
+                {"ts_code": ",".join(missing_codes), "trade_date": trade_date},
+                capability="daily_market_close_sector_bars_retry_missing",
+            )
+            request_count += 1
+            records.extend(retry.records)
+
+        deduplicated: dict[tuple[str, date], dict] = {}
+        for record in records:
+            raw_code = str(record.get("ts_code") or "").strip()
+            row_date = parse_date(record.get("trade_date"))
+            if raw_code and row_date == trade_date:
+                deduplicated[(raw_code, row_date)] = record
+        records = list(deduplicated.values())
+        final_codes = {key[0] for key in deduplicated}
+        missing_codes = [code for code in raw_codes if code not in final_codes]
+        if missing_codes:
+            result.warnings.append(
+                f"ths_daily 批量查询后仍缺少 {len(missing_codes)} 个板块当日行情"
+            )
         mapping = self.tushare_market_adapter.map_ths_daily(records, trade_date=trade_date, sector_map=sector_map)
         self._log_mapping_summary(mapping)
         rows = mapping.rows
-        await self._capture_raw_summary("daily_market_close_sector_bars", trade_date, {"api_name": "ths_daily", "raw_records": len(records)}, len(rows), normalized_table="t_sector_bar")
+        await self._capture_raw_summary(
+            "daily_market_close_sector_bars",
+            trade_date,
+            {
+                "api_name": "ths_daily",
+                "request_mode": "ts_code_batch",
+                "batch_size": 500,
+                "request_count": request_count,
+                "target_codes": len(raw_codes),
+                "raw_records": len(records),
+                "missing_codes": missing_codes[:100],
+            },
+            len(rows),
+            normalized_table="t_sector_bar",
+        )
         upserted = await self.repository.upsert_sector_bar_rows(rows)
         self._log_upsert_summary(mapping, upserted, "t_sector_bar")
         return upserted
@@ -1204,21 +1532,21 @@ class DailyMarketCloseIngestService:
                 minute_batch_size,
                 max_concurrency,
             )
-        for batch_no, batch in enumerate(self._chunks(minute_needed, minute_batch_size), start=1):
-            batch_rows: list[dict] = []
-            batch_fetched_codes: set[str] = set()
-            batch_failed = 0
-            queue: asyncio.Queue[str] = asyncio.Queue()
-            for stock_code in batch:
-                queue.put_nowait(stock_code)
+        if minute_needed:
+            fetch_queue: asyncio.Queue[str] = asyncio.Queue()
+            write_queue: asyncio.Queue[tuple[str, list[dict], str | None] | None] = asyncio.Queue(
+                maxsize=max_concurrency * 2
+            )
+            for stock_code in minute_needed:
+                fetch_queue.put_nowait(stock_code)
+            worker_count = min(max_concurrency, len(minute_needed))
 
             async def minute_worker(worker_id: int) -> None:
-                nonlocal batch_failed
                 provider = MootdxProvider()
                 try:
                     while True:
                         try:
-                            stock_code = queue.get_nowait()
+                            stock_code = fetch_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
                         minute_attempted.add(stock_code)
@@ -1226,39 +1554,98 @@ class DailyMarketCloseIngestService:
                             rows, _ = await provider.minute_bars(stock_code)
                             for row in rows:
                                 row["trade_date"] = trade_date
-                                row["metadata_json"] = {"provider": "mootdx", "api_name": "minute", "ingest": "daily_close"}
-                            batch_rows.extend(rows)
-                            if rows:
-                                batch_fetched_codes.add(stock_code)
+                                row["metadata_json"] = {
+                                    "provider": "mootdx",
+                                    "api_name": "minute",
+                                    "ingest": "daily_close_minute",
+                                }
+                            await write_queue.put((stock_code, rows, None))
                         except Exception as exc:  # provider failures are isolated per symbol
-                            batch_failed += 1
-                            append_error(f"minute {stock_code}: {type(exc).__name__}: {exc}")
+                            await write_queue.put(
+                                (
+                                    stock_code,
+                                    [],
+                                    f"minute {stock_code}: {type(exc).__name__}: {exc}",
+                                )
+                            )
                         finally:
-                            queue.task_done()
+                            fetch_queue.task_done()
                 finally:
-                    await asyncio.to_thread(provider.close)
+                    try:
+                        await asyncio.to_thread(provider.close)
+                    finally:
+                        await write_queue.put(None)
 
-            worker_count = min(max_concurrency, len(batch))
-            await asyncio.gather(*(minute_worker(worker_id) for worker_id in range(worker_count)))
-            if batch_rows:
-                await self.repository.upsert_minute_bars(batch_rows)
-                await self.repository.commit()
-            minute_batches.append(
-                {
-                    "batch_no": batch_no,
-                    "target_count": len(batch),
-                    "fetched_stock_count": len(batch_fetched_codes),
-                    "failed_stock_count": len(batch) - len(batch_fetched_codes),
-                    "row_count": len(batch_rows),
-                }
-            )
-            logger.info(
-                "daily close ingest minute batch completed: batch=%s targets=%s rows=%s failed=%s",
-                batch_no,
-                len(batch),
-                len(batch_rows),
-                batch_failed,
-            )
+            async def minute_writer() -> None:
+                completed_workers = 0
+                batch_no = 0
+                batch_codes: list[str] = []
+                batch_rows: list[dict] = []
+                batch_fetched_codes: set[str] = set()
+                batch_failed = 0
+
+                async def flush() -> None:
+                    nonlocal batch_no, batch_codes, batch_rows, batch_fetched_codes, batch_failed
+                    if not batch_codes:
+                        return
+                    batch_no += 1
+                    if batch_rows:
+                        await self.repository.upsert_minute_bars(batch_rows)
+                        await self.repository.commit()
+                    minute_batches.append(
+                        {
+                            "batch_no": batch_no,
+                            "target_count": len(batch_codes),
+                            "fetched_stock_count": len(batch_fetched_codes),
+                            "failed_stock_count": batch_failed,
+                            "row_count": len(batch_rows),
+                        }
+                    )
+                    logger.info(
+                        "daily close ingest minute write batch completed: batch=%s targets=%s rows=%s failed=%s",
+                        batch_no,
+                        len(batch_codes),
+                        len(batch_rows),
+                        batch_failed,
+                    )
+                    batch_codes = []
+                    batch_rows = []
+                    batch_fetched_codes = set()
+                    batch_failed = 0
+
+                while completed_workers < worker_count:
+                    item = await write_queue.get()
+                    try:
+                        if item is None:
+                            completed_workers += 1
+                            continue
+                        stock_code, rows, error = item
+                        batch_codes.append(stock_code)
+                        if error:
+                            batch_failed += 1
+                            append_error(error)
+                        elif rows:
+                            batch_fetched_codes.add(stock_code)
+                            batch_rows.extend(rows)
+                        else:
+                            batch_failed += 1
+                        if len(batch_codes) >= minute_batch_size:
+                            await flush()
+                    finally:
+                        write_queue.task_done()
+                await flush()
+
+            workers = [asyncio.create_task(minute_worker(worker_id)) for worker_id in range(worker_count)]
+            writer = asyncio.create_task(minute_writer())
+            tasks = [*workers, writer]
+            try:
+                await asyncio.gather(*tasks)
+            except Exception:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
         counts_after = await self.repository.minute_bar_counts(stock_codes=stock_codes, trade_date=trade_date)
         return {
@@ -1268,6 +1655,7 @@ class DailyMarketCloseIngestService:
                 stock_code in minute_attempted and counts_after.get(stock_code, 0) == 0 for stock_code in stock_codes
             ),
             "minute_batch_count": len(minute_batches),
+            "minute_row_count": sum(int(item.get("row_count") or 0) for item in minute_batches),
             "minute_batches": minute_batches[-20:],
             "errors": errors,
         }
@@ -1282,6 +1670,7 @@ class DailyMarketCloseIngestService:
         return code.startswith(("0", "3", "6"))
 
     async def _capture_raw_summary(self, capability: str, trade_date: date, payload: dict, row_count: int, *, normalized_table: str | None = None) -> None:
+        stored_payload = self._compact_raw_payload(payload, row_count=row_count)
         await self.repository.insert_raw(
             {
                 "trace_id": uuid4().hex,
@@ -1289,13 +1678,39 @@ class DailyMarketCloseIngestService:
                 "capability": capability,
                 "request_params": {"trade_date": trade_date.isoformat()},
                 "record_key": trade_date.isoformat(),
-                "payload": payload,
-                "payload_summary": {"row_count": row_count, "raw_payload_keys": sorted(payload.keys())},
+                "payload": stored_payload,
+                "payload_summary": {
+                    "row_count": row_count,
+                    "raw_payload_keys": sorted(payload.keys()),
+                    "storage_mode": "summary" if stored_payload is not payload else "full",
+                },
                 "normalized_table": normalized_table or ("t_daily_bar" if capability.endswith("daily") else "t_stock_daily_basic"),
                 "normalized_pk": trade_date.isoformat(),
                 "status": "captured",
             }
         )
+
+    @staticmethod
+    def _compact_raw_payload(payload: dict, *, row_count: int) -> dict:
+        """Keep audit metadata for large responses without duplicating canonical facts."""
+        if row_count <= 500:
+            return payload
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        data = payload.get("data")
+        items = data.get("items") if isinstance(data, dict) else payload.get("items")
+        fields = data.get("fields") if isinstance(data, dict) else payload.get("fields")
+        sample: list[Any] = []
+        if isinstance(items, list) and items:
+            sample = [items[0]]
+            if len(items) > 1:
+                sample.append(items[-1])
+        return {
+            "row_count": row_count,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "raw_payload_keys": sorted(payload.keys()),
+            "fields": fields if isinstance(fields, list) else None,
+            "sample_first_last": sample,
+        }
 
     @staticmethod
     def _net(buy: float | None, sell: float | None) -> float | None:
@@ -1325,3 +1740,142 @@ class DailyMarketCloseIngestService:
         dropped = await self.repository.drop_minute_partitions_before(cutoff)
         logger.info("minute partition retention completed: cutoff=%s dropped=%s", cutoff, dropped)
         return dropped
+
+    async def assess_readiness(
+        self,
+        trade_date: date,
+        *,
+        universe_count: int | None = None,
+    ) -> dict[str, Any]:
+        counts = await self.repository.daily_close_asset_counts(trade_date)
+        raw_capabilities = set(counts.pop("raw_capabilities", set()))
+        active_count = int(universe_count or counts.get("active_stock") or 0)
+        daily_count = int(counts.get("daily_bar") or 0)
+        daily_denominator = max(1, daily_count)
+        sector_denominator = max(1, int(counts.get("tushare_sector") or 0))
+
+        coverage = {
+            "daily_bars": min(1.0, daily_count / max(1, active_count)),
+            "daily_basic": min(1.0, int(counts.get("daily_basic") or 0) / daily_denominator),
+            "stock_moneyflow": min(1.0, int(counts.get("stock_moneyflow") or 0) / daily_denominator),
+            "daily_factors": min(1.0, int(counts.get("daily_factor") or 0) / daily_denominator),
+            "technical_snapshots": min(
+                1.0,
+                int(counts.get("technical_snapshot") or 0) / daily_denominator,
+            ),
+            "stock_technical": min(
+                1.0,
+                int(counts.get("stock_technical") or 0) / daily_denominator,
+            ),
+            "index_bars": min(
+                1.0,
+                int(counts.get("index_bar") or 0) / len(self.core_index_codes),
+            ),
+            "index_daily_basic": min(
+                1.0,
+                int(counts.get("index_daily_basic") or 0) / len(self.core_index_codes),
+            ),
+            "sector_bars": min(
+                1.0,
+                int(counts.get("sector_bar") or 0) / sector_denominator,
+            ),
+        }
+        event_complete = {
+            "daily_market_close_stock_limit",
+            "daily_market_close_stock_suspend",
+        }.issubset(raw_capabilities)
+        lhb_complete = {
+            "daily_market_close_lhb",
+            "daily_market_close_lhb_seats",
+        }.issubset(raw_capabilities)
+        sector_moneyflow_complete = (
+            int(counts.get("sector_moneyflow") or 0) > 0
+            and {
+                "daily_market_close_moneyflow_cnt_ths",
+                "daily_market_close_moneyflow_ind_ths",
+            }.issubset(raw_capabilities)
+        )
+        core_checks = {
+            "daily_bars": coverage["daily_bars"] >= 0.95,
+            "daily_basic": coverage["daily_basic"] >= 0.95,
+            "stock_moneyflow": coverage["stock_moneyflow"] >= 0.95,
+            "stock_events": event_complete,
+            "index_bars": coverage["index_bars"] >= 0.85,
+            "sector_bars": coverage["sector_bars"] >= 0.90,
+            "daily_factors": coverage["daily_factors"] >= 0.95,
+            "technical_snapshots": coverage["technical_snapshots"] >= 0.95,
+        }
+        enhancement_checks = {
+            "stock_technical": coverage["stock_technical"] >= 0.95,
+            "lhb": lhb_complete,
+            "index_daily_basic": coverage["index_daily_basic"] >= 0.85,
+            "sector_moneyflow": sector_moneyflow_complete,
+            "sector_factors": int(counts.get("sector_factor") or 0) > 0,
+        }
+        optional_checks = {
+            "market_stats": int(counts.get("market_stat") or 0) > 0,
+        }
+        block_status: dict[str, dict] = {}
+        for name, complete in {**core_checks, **enhancement_checks}.items():
+            block_status[name] = {
+                "status": "complete" if complete else "missing",
+                "rows": int(
+                    counts.get(
+                        {
+                            "daily_bars": "daily_bar",
+                            "stock_events": "limit_event",
+                            "daily_factors": "daily_factor",
+                            "technical_snapshots": "technical_snapshot",
+                            "stock_technical": "stock_technical",
+                            "lhb": "lhb_event",
+                            "sector_factors": "sector_factor",
+                        }.get(name, name),
+                        0,
+                    )
+                    or 0
+                ),
+            }
+        block_status["market_stats"] = {
+            "status": "complete" if optional_checks["market_stats"] else "deferred",
+            "rows": int(counts.get("market_stat") or 0),
+        }
+        core_ready = all(core_checks.values())
+        enhancement_ready = all(enhancement_checks.values())
+        missing_blocks = [
+            name
+            for name, complete in {**core_checks, **enhancement_checks, **optional_checks}.items()
+            if not complete
+        ]
+        return {
+            "counts": counts,
+            "coverage": {key: round(value, 6) for key, value in coverage.items()},
+            "block_status": block_status,
+            "core_ready": core_ready,
+            "enhancement_ready": enhancement_ready,
+            "report_quality": (
+                "complete"
+                if core_ready and enhancement_ready
+                else "degraded"
+                if core_ready
+                else "blocked"
+            ),
+            "missing_blocks": missing_blocks,
+        }
+
+    async def _finalize_readiness(
+        self,
+        result: DailyMarketCloseIngestResult,
+        *,
+        universe_count: int,
+    ) -> None:
+        readiness = await self.assess_readiness(
+            result.trade_date,
+            universe_count=universe_count,
+        )
+        result.coverage = readiness["coverage"]
+        result.block_status = readiness["block_status"]
+        result.core_ready = bool(readiness["core_ready"])
+        result.report_quality = readiness["report_quality"]
+        result.missing_blocks = list(readiness["missing_blocks"])
+        if not result.core_ready and result.status == "success":
+            result.status = "partial"

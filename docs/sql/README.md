@@ -61,10 +61,11 @@
 55. `55-data-asset-history-pipelines.sql`：建立历史初始化入口基线。新增 `t_stock_factor_daily.ma30/ma60` 和 `t_index_factor_daily`，seed 个股/板块/指数各“日频事实 + 日频因子”两段任务，并删除被替换的 7 条旧任务定义；历史运行日志保留。
 56. `56-sector-history-range-backfill.sql`：修正历史板块日频事实任务参数。`ths_daily` 改为逐板块一次完整日期区间请求，默认 12 个板块 worker；板块资金流默认使用已实测验证的 20 交易日窗口和 2 个窗口 worker。
 57. `57-stock-history-limit-events.sql`：将 `limit_list_d/suspend_d` 按交易日全市场查询阶段加入 `backfill_stock_daily_facts`，补齐 `t_limit_event_daily` 的历史涨跌停与停牌事件；把旧 `Z` 池归一为 `limit_break`，并兼容特定历史区间 U 池标志为空但带 `up_stat` 的响应。
+58. `58-daily-close-four-stage-pipeline.sql`：将每日收盘流水线升级为 15:30 分钟线/分钟因子、18:00 核心事实、21:30 增强事实、次日 08:00 缺口修复四级任务；分钟因子保留落库并按 200 股票分片集合计算。
 
 ## 产品化初始化规划
 
-当前 01-56 是开发期演进 SQL，适合追踪架构变更，但不适合作为最终产品部署入口。下一轮数据库收敛需要生成：
+当前 01-58 是开发期演进 SQL，适合追踪架构变更，但不适合作为最终产品部署入口。下一轮数据库收敛需要生成：
 
 ```text
 docs/sql/init.sql
@@ -92,6 +93,8 @@ docs/sql/db-init.sql
 如果数据库是在 `t_daily_bar.volume_hand/volume_share` 仍为 `INTEGER` 的早期脚本上创建的，执行 `16` 后还需要执行 `17-market-volume-bigint-fix.sql`，否则全市场 `daily` 可能因单只股票成交量超过 PostgreSQL int32 上限而失败。
 
 `18-market-partition-owner-fix.sql` 必须由 `postgres` 或当前分区父表 owner 执行。后端应用账号需要成为 `t_minute_bar/t_stock_factor_minute` 分区体系 owner，才能在每日收盘任务中自动创建当天分区并清理过期分区。
+
+`58-daily-close-four-stage-pipeline.sql` 不删除业务数据。它新增并默认启用 `daily_close_minute_ingest`，更新三个既有收盘任务的 cron、参数、超时和重试策略。脚本执行后需要 reload Scheduler；分钟线和分钟因子都保留最近 30 个交易日，分钟因子默认每 200 只股票一个 PostgreSQL 事务，可在 50–500 之间调整。
 
 `19-daily-close-ingest-batching.sql` 只更新调度任务元数据，不修改行情事实表。已执行过 `16` 的数据库曾用它展示 `minute_batch_size` 和 `quote_batch_size` 参数；后续 `45` 会废弃 EOD quote，因此新环境不应再把 `quote_batch_size` 作为常规参数。
 

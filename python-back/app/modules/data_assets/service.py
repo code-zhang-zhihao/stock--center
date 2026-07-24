@@ -166,11 +166,11 @@ ASSET_DEFINITIONS: tuple[AssetDefinition, ...] = (
     asset("sector_bars", "板块日线", "daily_fact", "t_sector_bar", "daily", "核心收盘", ["daily_close_core_ingest", "backfill_sector_daily_facts"], "trade_date", None, "sector_code", expected_lag_trade_days=2),
     asset("sector_fund_flow", "板块资金流", "daily_fact", "t_sector_fund_flow_daily", "daily", "晚间增强", ["daily_close_enrichment_ingest", "daily_close_repair_ingest", "backfill_sector_daily_facts"], "trade_date", None, "sector_code", expected_lag_trade_days=5),
     asset("stock_technical_factor", "Tushare 专业技术因子", "daily_fact", "t_stock_technical_factor_daily", "daily", "晚间增强", ["daily_close_enrichment_ingest", "daily_close_repair_ingest", "backfill_stock_daily_facts"], "trade_date", None, "stock_code", expected_lag_trade_days=5, coverage_scope="active_stock_daily"),
-    asset("minute_bars", "分钟线", "minute_snapshot", "t_minute_bar", "minute", "核心收盘", ["daily_close_core_ingest"], "trade_date", None, "stock_code", expected_lag_trade_days=3, approximate_row_count=True, coverage_scope="active_stock_daily"),
+    asset("minute_bars", "分钟线", "minute_snapshot", "t_minute_bar", "minute", "分钟沉淀", ["daily_close_minute_ingest"], "trade_date", None, "stock_code", expected_lag_trade_days=3, approximate_row_count=True, coverage_scope="active_stock_daily"),
     asset("stock_factor_daily", "个股日频因子", "derived", "t_stock_factor_daily", "daily", "核心/增强因子", ["daily_close_core_ingest", "daily_close_enrichment_ingest", "daily_close_repair_ingest", "backfill_stock_daily_factors"], "trade_date", None, "stock_code", expected_lag_trade_days=2, coverage_scope="active_stock_daily"),
-    asset("stock_factor_minute", "分钟因子", "derived", "t_stock_factor_minute", "minute", "核心因子", ["daily_close_core_ingest"], "trade_date", None, "stock_code", expected_lag_trade_days=3, approximate_row_count=True, coverage_scope="active_stock_daily"),
+    asset("stock_factor_minute", "分钟因子", "derived", "t_stock_factor_minute", "minute", "分钟沉淀", ["daily_close_minute_ingest"], "trade_date", None, "stock_code", expected_lag_trade_days=3, approximate_row_count=True, coverage_scope="active_stock_daily"),
     asset("technical_snapshots", "技术快照", "derived", "t_technical_indicator_snapshot", "eod", "核心因子/修复", ["daily_close_core_ingest", "backfill_stock_daily_factors"], None, "snapshot_time", "stock_code", expected_lag_trade_days=3, coverage_scope="active_stock_daily"),
-    asset("sector_factor_daily", "板块日频因子", "derived", "t_sector_factor_daily", "daily", "核心/增强因子", ["daily_close_core_ingest", "daily_close_enrichment_ingest", "daily_close_repair_ingest", "backfill_sector_daily_factors"], "trade_date", None, "sector_code", expected_lag_trade_days=3),
+    asset("sector_factor_daily", "板块日频因子", "derived", "t_sector_factor_daily", "daily", "增强因子", ["daily_close_enrichment_ingest", "daily_close_repair_ingest", "backfill_sector_daily_factors"], "trade_date", None, "sector_code", expected_lag_trade_days=3),
     asset("index_factor_daily", "指数日频因子", "derived", "t_index_factor_daily", "daily", "历史因子", ["backfill_index_daily_factors"], "trade_date", None, "index_code", expected_lag_trade_days=3),
 )
 
@@ -179,6 +179,7 @@ SCHEDULER_JOB_CODES = (
     "sync_stock_basic",
     "sync_sector_catalog",
     "sync_index_catalog",
+    "daily_close_minute_ingest",
     "daily_close_core_ingest",
     "daily_close_enrichment_ingest",
     "daily_close_repair_ingest",

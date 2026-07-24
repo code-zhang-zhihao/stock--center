@@ -117,10 +117,14 @@ stock_center_back.egg-info/dependency_links.txt
 stock_center_back.egg-info/requires.txt
 stock_center_back.egg-info/top_level.txt
 tests/test_config_value_endpoint.py
+tests/test_daily_close_pipeline.py
 tests/test_indicator_engine.py
+tests/test_market_data_history_backfill.py
+tests/test_market_data_stock_basic_sync.py
 tests/test_realtime_market_service.py
 tests/test_scheduler_result_summary.py
 tests/test_scheduler_validation.py
+tests/test_stock_analysis.py
 tests/test_stock_pool_service.py
 tests/test_tushare_catalog.py
 tests/test_tushare_market_adapter.py

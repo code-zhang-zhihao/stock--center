@@ -23,7 +23,7 @@
 | 数据资产巡检 | `python-back/app/modules/data_assets/` | `service.py` | 表级健康、覆盖率、生产任务与缓存。 | [数据库表索引](30-模块地图/数据库表索引.md) |
 | 调度中心 | `python-back/app/modules/scheduler_center/` | `service.py`、`runtime.py`、`handlers.py` | 定义、触发、限时、重试、运行日志与取消。 | [调度中心模块](30-模块地图/调度中心模块.md) |
 | 管理后台 | `web-admin/src/` | `router/index.ts` | 数据中心、任务中心、板块与个股行情页面。 | [前端配置中心模块](30-模块地图/前端配置中心模块.md) |
-| 数据库演进 | `docs/sql/` | `README.md`、`55-data-asset-history-pipelines.sql`、`56-sector-history-range-backfill.sql` | Schema、索引、任务 seed 和升级顺序。 | [数据库表索引](30-模块地图/数据库表索引.md) |
+| 数据库演进 | `docs/sql/` | `README.md`、`55-data-asset-history-pipelines.sql`、`58-daily-close-four-stage-pipeline.sql` | Schema、索引、历史任务和每日四级流水线升级顺序。 | [数据库表索引](30-模块地图/数据库表索引.md) |
 
 ## 推荐阅读顺序
 
@@ -34,4 +34,4 @@
 5. [调度中心模块](30-模块地图/调度中心模块.md)
 6. [数据库表索引](30-模块地图/数据库表索引.md)
 
-最后一次基于代码核验：2026-07-20。
+最后一次基于代码核验：2026-07-24。

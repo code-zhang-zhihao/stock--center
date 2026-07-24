@@ -816,11 +816,11 @@ _COMMON_CLOSE_SCHEMA = {
 }
 
 _MINUTE_SCHEMA = {
-    "minute_retention_trade_days": {"label": "分钟数据保留交易日", "type": "number", "default": 10, "required": False, "min": 1, "max": 60},
+    "minute_retention_trade_days": {"label": "分钟数据保留交易日", "type": "number", "default": 30, "required": False, "min": 1, "max": 60},
     "minute_max_concurrency": {
         "label": "MooTDX worker 数",
         "type": "number",
-        "default": 4,
+        "default": 10,
         "required": False,
         "min": 1,
         "max": 10,
@@ -833,7 +833,16 @@ _MINUTE_SCHEMA = {
         "required": False,
         "min": 20,
         "max": 1000,
-        "description": "分钟线按批次拉取并提交，降低内存峰值和单次失败影响范围。",
+        "description": "分钟线生产者/消费者流水线每累计多少只股票提交一次。",
+    },
+    "minute_factor_stock_batch_size": {
+        "label": "分钟因子 SQL 分片股票数",
+        "type": "number",
+        "default": 200,
+        "required": False,
+        "min": 50,
+        "max": 500,
+        "description": "每片使用 PostgreSQL 集合计算并独立提交；200 只约对应 4.8 万行。",
     },
 }
 
@@ -876,7 +885,7 @@ class _DailyCloseBaseHandler:
     job_type = "market_data"
     force_async = True
 
-    async def _run_payload(self, context: JobExecutionContext) -> JobResult:
+    async def _run_payload(self, context: JobExecutionContext, *, minute_only: bool = False) -> JobResult:
         payload = DailyMarketCloseIngestRequest(**{**self.default_payload, **context.payload})
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
@@ -884,7 +893,7 @@ class _DailyCloseBaseHandler:
                 MarketDataRepository(session),
                 ConfigCenterRepository(session),
             )
-            result = await service.run(payload)
+            result = await service.run_minute(payload) if minute_only else await service.run(payload)
         return JobResult(
             status=result.status if result.status == "skipped" else "success",
             affected_rows=_daily_close_affected_rows(result),
@@ -892,12 +901,48 @@ class _DailyCloseBaseHandler:
         )
 
 
-class DailyCloseCoreIngestHandler(_DailyCloseBaseHandler):
-    job_code = "daily_close_core_ingest"
+class DailyCloseMinuteIngestHandler(_DailyCloseBaseHandler):
+    job_code = "daily_close_minute_ingest"
     parameter_schema = {
         **_COMMON_CLOSE_SCHEMA,
         **_MINUTE_SCHEMA,
     }
+    default_payload = {
+        "sync_daily": False,
+        "sync_daily_basic": False,
+        "sync_stock_technical_factor_pro": False,
+        "sync_stock_moneyflow": False,
+        "sync_stock_limit_status": False,
+        "sync_lhb": False,
+        "sync_index_bars": False,
+        "sync_index_daily_basic": False,
+        "sync_north_hold": False,
+        "sync_market_stats": False,
+        "sync_sector_bars": False,
+        "sync_sector_moneyflow": False,
+        "sync_minute": True,
+        "calculate_daily_factors": False,
+        "calculate_minute_factors": True,
+        "calculate_technical_snapshot": False,
+        "calculate_stock_fund_factors": False,
+        "calculate_external_technical_factors": False,
+        "merge_external_technical_factors": False,
+        "calculate_sector_factors": False,
+        "fail_on_enrichment_error": False,
+        "minute_retention_trade_days": 30,
+        "minute_max_concurrency": 10,
+        "minute_batch_size": 200,
+        "minute_factor_stock_batch_size": 200,
+        "ingest_mode": "append_safe",
+    }
+
+    async def run(self, context: JobExecutionContext) -> JobResult:
+        return await self._run_payload(context, minute_only=True)
+
+
+class DailyCloseCoreIngestHandler(_DailyCloseBaseHandler):
+    job_code = "daily_close_core_ingest"
+    parameter_schema = {**_COMMON_CLOSE_SCHEMA}
     default_payload = {
         "sync_daily": True,
         "sync_daily_basic": True,
@@ -911,17 +956,15 @@ class DailyCloseCoreIngestHandler(_DailyCloseBaseHandler):
         "sync_market_stats": False,
         "sync_sector_bars": True,
         "sync_sector_moneyflow": False,
-        "sync_minute": True,
+        "sync_minute": False,
         "calculate_daily_factors": True,
-        "calculate_minute_factors": True,
+        "calculate_minute_factors": False,
         "calculate_technical_snapshot": True,
         "calculate_stock_fund_factors": True,
         "calculate_external_technical_factors": False,
-        "calculate_sector_factors": True,
+        "merge_external_technical_factors": False,
+        "calculate_sector_factors": False,
         "fail_on_enrichment_error": False,
-        "minute_retention_trade_days": 10,
-        "minute_max_concurrency": 4,
-        "minute_batch_size": 200,
         "ingest_mode": "append_safe",
     }
 
@@ -949,11 +992,12 @@ class DailyCloseEnrichmentIngestHandler(_DailyCloseBaseHandler):
         "sync_sector_bars": False,
         "sync_sector_moneyflow": True,
         "sync_minute": False,
-        "calculate_daily_factors": True,
+        "calculate_daily_factors": False,
         "calculate_minute_factors": False,
         "calculate_technical_snapshot": False,
-        "calculate_stock_fund_factors": True,
+        "calculate_stock_fund_factors": False,
         "calculate_external_technical_factors": True,
+        "merge_external_technical_factors": True,
         "calculate_sector_factors": True,
         "fail_on_enrichment_error": False,
         "enrichment_block_concurrency": 4,
@@ -995,60 +1039,76 @@ class DailyCloseRepairIngestHandler:
                 from zoneinfo import ZoneInfo
 
                 up_to = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-                dates = await repository.recent_open_trade_dates(
+                dates = await repository.recent_daily_trade_dates(
                     up_to=up_to,
                     limit=int(payload.get("repair_trade_days") or 3),
                 )
-            enhancement_start_date = min(dates) if dates else None
-            enhancement_end_date = max(dates) if dates else None
-            for index, trade_date in enumerate(dates):
-                sync_range_enhancement = index == 0
+            for trade_date in dates:
+                readiness = await service.assess_readiness(trade_date)
+                missing = set(readiness["missing_blocks"])
+                if not missing:
+                    summaries.append(
+                        {
+                            "trade_date": trade_date.isoformat(),
+                            "status": "skipped",
+                            "reason": "no_daily_close_gaps",
+                            **readiness,
+                        }
+                    )
+                    continue
+
+                repair_daily = "daily_bars" in missing
+                repair_daily_basic = "daily_basic" in missing or repair_daily
+                repair_moneyflow = "stock_moneyflow" in missing or repair_daily
+                repair_events = "stock_events" in missing
+                repair_index_bars = "index_bars" in missing
+                repair_sector_bars = "sector_bars" in missing
+                repair_daily_factors = (
+                    "daily_factors" in missing
+                    or repair_daily
+                    or repair_moneyflow
+                )
+                repair_snapshots = "technical_snapshots" in missing or repair_daily_factors
+                repair_technical = "stock_technical" in missing
+                repair_lhb = "lhb" in missing
+                repair_index_daily_basic = "index_daily_basic" in missing
+                repair_market_stats = "market_stats" in missing
+                repair_sector_moneyflow = "sector_moneyflow" in missing
+                repair_sector_factors = (
+                    "sector_factors" in missing
+                    or repair_sector_bars
+                    or repair_sector_moneyflow
+                )
                 result = await service.run(
                     DailyMarketCloseIngestRequest(
                         trade_date=trade_date,
-                        sync_daily=False,
-                        sync_daily_basic=False,
-                        sync_stock_technical_factor_pro=True,
-                        enhancement_start_date=enhancement_start_date if sync_range_enhancement else None,
-                        enhancement_end_date=enhancement_end_date if sync_range_enhancement else None,
-                        sync_stock_moneyflow=False,
-                        sync_stock_limit_status=False,
-                        sync_lhb=True,
-                        sync_lhb_events=sync_range_enhancement,
-                        sync_lhb_seats=True,
-                        sync_index_bars=False,
-                        sync_index_daily_basic=sync_range_enhancement,
+                        sync_daily=repair_daily,
+                        sync_daily_basic=repair_daily_basic,
+                        sync_stock_technical_factor_pro=repair_technical,
+                        sync_stock_moneyflow=repair_moneyflow,
+                        sync_stock_limit_status=repair_events,
+                        sync_lhb=repair_lhb,
+                        sync_lhb_events=repair_lhb,
+                        sync_lhb_seats=repair_lhb,
+                        sync_index_bars=repair_index_bars,
+                        sync_index_daily_basic=repair_index_daily_basic,
                         sync_north_hold=False,
-                        sync_market_stats=sync_range_enhancement,
-                        sync_sector_bars=False,
-                        sync_sector_moneyflow=sync_range_enhancement,
+                        sync_market_stats=repair_market_stats,
+                        sync_sector_bars=repair_sector_bars,
+                        sync_sector_moneyflow=repair_sector_moneyflow,
                         sync_minute=False,
-                        calculate_daily_factors=True,
+                        calculate_daily_factors=repair_daily_factors,
                         calculate_minute_factors=False,
-                        calculate_technical_snapshot=False,
-                        calculate_stock_fund_factors=True,
-                        calculate_external_technical_factors=True,
-                        calculate_sector_factors=True,
+                        calculate_technical_snapshot=repair_snapshots,
+                        calculate_stock_fund_factors=repair_daily_factors,
+                        calculate_external_technical_factors=False,
+                        merge_external_technical_factors=repair_technical or repair_daily_factors,
+                        calculate_sector_factors=repair_sector_factors,
                         fail_on_enrichment_error=bool(payload.get("fail_on_enrichment_error")),
                         enrichment_block_concurrency=int(payload.get("enrichment_block_concurrency") or 4),
                         ingest_mode="append_safe",
                     )
                 )
-                if not sync_range_enhancement:
-                    result.enrichment_blocks.extend(
-                        [
-                            {
-                                "label": label,
-                                "status": "reused",
-                                "mode": "date_range",
-                                "range_start_date": enhancement_start_date.isoformat() if enhancement_start_date else None,
-                                "range_end_date": enhancement_end_date.isoformat() if enhancement_end_date else None,
-                                "reused_for_trade_date": trade_date.isoformat(),
-                                "rows": 0,
-                            }
-                            for label in ("lhb events", "index daily basic", "market stats", "sector moneyflow")
-                        ]
-                    )
                 affected_rows += _daily_close_affected_rows(result)
                 summaries.append(result.model_dump(mode="json"))
         status = "success"
@@ -1083,6 +1143,7 @@ def register_market_data_jobs() -> None:
     job_handler_registry.register(BackfillSectorDailyFactorsHandler())
     job_handler_registry.register(BackfillIndexDailyFactsHandler())
     job_handler_registry.register(BackfillIndexDailyFactorsHandler())
+    job_handler_registry.register(DailyCloseMinuteIngestHandler())
     job_handler_registry.register(DailyCloseCoreIngestHandler())
     job_handler_registry.register(DailyCloseEnrichmentIngestHandler())
     job_handler_registry.register(DailyCloseRepairIngestHandler())

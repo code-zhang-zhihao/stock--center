@@ -30,6 +30,18 @@ from app.modules.market_data.partitioning import ensure_market_partitions
 
 MAX_POSTGRES_QUERY_PARAMS = 30000
 DEFAULT_BULK_UPSERT_BATCH_SIZE = 1000
+TUSHARE_TECHNICAL_FEATURE_NAMES = (
+    "ma_bfq_5", "ma_bfq_10", "ma_bfq_20", "ma_bfq_60", "ma_bfq_90", "ma_bfq_250",
+    "ema_bfq_5", "ema_bfq_10", "ema_bfq_20", "ema_bfq_60",
+    "macd_bfq", "macd_dif_bfq", "macd_dea_bfq",
+    "kdj_bfq", "kdj_k_bfq", "kdj_d_bfq",
+    "rsi_bfq_6", "rsi_bfq_12", "rsi_bfq_24",
+    "boll_upper_bfq", "boll_mid_bfq", "boll_lower_bfq",
+    "atr_bfq", "cci_bfq", "vr_bfq", "wr_bfq", "wr1_bfq",
+    "bias1_bfq", "bias2_bfq", "bias3_bfq",
+    "obv_bfq", "mfi_bfq", "roc_bfq", "mtm_bfq",
+    "updays", "downdays", "topdays", "lowdays",
+)
 
 
 def _chunked(rows: list[dict], batch_size: int):
@@ -567,7 +579,6 @@ class IndicatorRepository:
                     ) * 100 AS fund_strength_percentile
                 FROM t_stock_fund_flow_daily
                 WHERE :calculate_stock_fund
-                  AND stock_code = ANY(CAST(:stock_codes AS varchar[]))
                   AND trade_date BETWEEN :start_date AND :end_date
                   AND main_net_inflow IS NOT NULL
             ),
@@ -740,6 +751,50 @@ class IndicatorRepository:
             written[trade_date] = written.get(trade_date, 0) + 1
         return written
 
+    async def merge_external_technical_features(
+        self,
+        stock_codes: list[str],
+        *,
+        trade_date: date,
+    ) -> int:
+        """Merge only the selected Tushare technical fields into existing daily factors."""
+        if not stock_codes:
+            return 0
+        technical_pairs = ", ".join(
+            f"'{name}', technical.factors -> '{name}'"
+            for name in TUSHARE_TECHNICAL_FEATURE_NAMES
+        )
+        statement = text(
+            f"""
+            WITH selected AS (
+                SELECT
+                    technical.stock_code,
+                    technical.trade_date,
+                    jsonb_strip_nulls(jsonb_build_object({technical_pairs}))
+                        || jsonb_build_object('source', 'tushare:stk_factor_pro') AS factors
+                FROM t_stock_technical_factor_daily AS technical
+                WHERE technical.stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                  AND technical.trade_date = :trade_date
+            )
+            UPDATE t_stock_factor_daily AS factor
+            SET features = coalesce(factor.features, '{{}}'::jsonb)
+                || jsonb_build_object('tushare_technical', selected.factors)
+            FROM selected
+            WHERE factor.stock_code = selected.stock_code
+              AND factor.trade_date = selected.trade_date
+              AND factor.source = 'system:daily_close'
+              AND selected.factors <> jsonb_build_object('source', 'tushare:stk_factor_pro')
+            RETURNING factor.id
+            """
+        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
+        rows = (
+            await self.session.execute(
+                statement,
+                {"stock_codes": stock_codes, "trade_date": trade_date},
+            )
+        ).all()
+        return len(rows)
+
     async def clear_technical_snapshot_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
         if not stock_codes:
             return 0
@@ -798,7 +853,7 @@ class IndicatorRepository:
         end_date: date,
         only_missing: bool,
     ) -> dict[date, int]:
-        """Build historical EOD snapshots from daily bars and daily factors only."""
+        """Build EOD snapshots from canonical daily/minute bars and daily factors."""
         if not stock_codes:
             return {}
         conflict_clause = (
@@ -839,6 +894,44 @@ class IndicatorRepository:
                 ORDER BY stock_code, trade_date,
                     CASE WHEN source = 'system:daily_close' THEN 0 ELSE 9 END,
                     created_at DESC, id DESC
+            ),
+            minute_metrics AS (
+                SELECT
+                    minute.stock_code,
+                    minute.trade_date,
+                    minute.bar_time,
+                    minute.price,
+                    minute.volume_hand,
+                    min(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                    ) AS day_low,
+                    max(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                    ) AS day_high,
+                    avg(minute.volume_hand) FILTER (
+                        WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
+                    ) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time
+                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+                    ) AS previous_volume_mean_20,
+                    count(minute.volume_hand) FILTER (
+                        WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
+                    ) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time
+                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+                    ) AS previous_volume_count_20,
+                    row_number() OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time DESC, minute.id DESC
+                    ) AS latest_rank
+                FROM t_minute_bar AS minute
+                WHERE minute.stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                  AND minute.trade_date BETWEEN :start_date AND :end_date
+            ),
+            latest_minute AS (
+                SELECT * FROM minute_metrics WHERE latest_rank = 1
             )
             INSERT INTO t_technical_indicator_snapshot (
                 stock_code, snapshot_time, source, last_price, change_pct,
@@ -850,8 +943,15 @@ class IndicatorRepository:
                 'system:daily_close',
                 bar.close_price,
                 bar.change_pct,
-                bar.change_pct,
-                NULL,
+                coalesce(
+                    (minute.price - minute.day_low) / NULLIF(minute.day_high - minute.day_low, 0),
+                    bar.change_pct
+                ),
+                CASE
+                    WHEN minute.previous_volume_count_20 = 20
+                     AND minute.previous_volume_mean_20 <> 0
+                    THEN LEAST(minute.volume_hand / minute.previous_volume_mean_20 * 20, 100)
+                END,
                 CASE
                     WHEN factor.ma5 IS NULL OR factor.ma10 IS NULL THEN NULL
                     ELSE LEAST(
@@ -864,7 +964,7 @@ class IndicatorRepository:
                 END,
                 jsonb_build_object(
                     'daily_factor_trade_date', CASE WHEN factor.trade_date IS NULL THEN NULL ELSE factor.trade_date::text END,
-                    'minute_factor_bar_time', NULL,
+                    'minute_factor_bar_time', CASE WHEN minute.bar_time IS NULL THEN NULL ELSE minute.bar_time::text END,
                     'daily_bar_id', bar.id,
                     'price_source', 't_daily_bar'
                 ),
@@ -873,6 +973,9 @@ class IndicatorRepository:
             LEFT JOIN factors AS factor
               ON factor.stock_code = bar.stock_code
              AND factor.trade_date = bar.trade_date
+            LEFT JOIN latest_minute AS minute
+              ON minute.stock_code = bar.stock_code
+             AND minute.trade_date = bar.trade_date
             WHERE bar.source_rank = 1
             ON CONFLICT (stock_code, snapshot_time, source) {conflict_clause}
             RETURNING (snapshot_time AT TIME ZONE 'Asia/Shanghai')::date
@@ -907,6 +1010,132 @@ class IndicatorRepository:
             )
             deleted += int(result.rowcount or 0)
         return deleted
+
+    async def backfill_minute_factors_set_based(
+        self,
+        stock_codes: list[str],
+        *,
+        trade_date: date,
+    ) -> int:
+        """Calculate and upsert one trading day's minute factors inside PostgreSQL."""
+        if not stock_codes:
+            return 0
+        statement = text(
+            """
+            WITH minute_metrics AS (
+                SELECT
+                    minute.stock_code,
+                    minute.trade_date,
+                    minute.bar_time,
+                    minute.price,
+                    minute.volume_hand,
+                    sum(minute.amount_yuan) FILTER (
+                        WHERE minute.amount_yuan IS NOT NULL
+                          AND minute.volume_hand IS NOT NULL
+                          AND minute.volume_hand > 0
+                    ) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS cumulative_amount,
+                    sum(minute.volume_hand) FILTER (
+                        WHERE minute.amount_yuan IS NOT NULL
+                          AND minute.volume_hand IS NOT NULL
+                          AND minute.volume_hand > 0
+                    ) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS cumulative_amount_volume,
+                    first_value(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                    ) AS first_price,
+                    min(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_low,
+                    max(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_high,
+                    avg(minute.volume_hand) FILTER (
+                        WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
+                    ) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+                    ) AS previous_volume_mean_20,
+                    count(minute.volume_hand) FILTER (
+                        WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
+                    ) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+                    ) AS previous_volume_count_20,
+                    count(*) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                    ) AS day_bar_count,
+                    row_number() OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                    ) AS minute_index
+                FROM t_minute_bar AS minute
+                WHERE minute.stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                  AND minute.trade_date = :trade_date
+            ),
+            upserted AS (
+                INSERT INTO t_stock_factor_minute (
+                    stock_code, trade_date, bar_time, source,
+                    vwap, minute_return, volume_spike_ratio, intraday_strength,
+                    features, created_at
+                )
+                SELECT
+                    stock_code,
+                    trade_date,
+                    bar_time,
+                    'system:daily_close',
+                    cumulative_amount / NULLIF(cumulative_amount_volume * 100, 0),
+                    (price - first_price) / NULLIF(first_price, 0) * 100,
+                    CASE
+                        WHEN previous_volume_count_20 = 20
+                        THEN volume_hand / NULLIF(previous_volume_mean_20, 0)
+                    END,
+                    (price - running_low) / NULLIF(running_high - running_low, 0),
+                    jsonb_build_object(
+                        'minute_index', minute_index,
+                        'day_bar_count', day_bar_count,
+                        'volume_baseline', CASE
+                            WHEN previous_volume_count_20 = 20 THEN 'previous_20_minutes'
+                        END,
+                        'amount_based_features_available', cumulative_amount IS NOT NULL,
+                        'intraday_strength_kind', 'running_range_position'
+                    ),
+                    now()
+                FROM minute_metrics
+                WHERE price IS NOT NULL
+                ON CONFLICT (stock_code, trade_date, bar_time, source)
+                DO UPDATE SET
+                    vwap = EXCLUDED.vwap,
+                    minute_return = EXCLUDED.minute_return,
+                    volume_spike_ratio = EXCLUDED.volume_spike_ratio,
+                    intraday_strength = EXCLUDED.intraday_strength,
+                    features = EXCLUDED.features
+                RETURNING 1
+            )
+            SELECT count(*) FROM upserted
+            """
+        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
+        return int(
+            await self.session.scalar(
+                statement,
+                {"stock_codes": stock_codes, "trade_date": trade_date},
+            )
+            or 0
+        )
 
     async def clear_sector_factor_rows(self, *, trade_date: date) -> int:
         result = await self.session.execute(delete(SectorFactorDaily).where(SectorFactorDaily.trade_date == trade_date))

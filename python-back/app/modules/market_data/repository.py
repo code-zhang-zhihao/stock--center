@@ -349,6 +349,89 @@ class MarketDataRepository:
         )
         return list(result.scalars().all())
 
+    async def recent_daily_trade_dates(self, *, up_to: date, limit: int) -> list[date]:
+        """Return recent trading dates that already have canonical stock daily bars."""
+        result = await self.session.execute(
+            select(DailyBar.trade_date)
+            .where(DailyBar.trade_date <= up_to)
+            .distinct()
+            .order_by(DailyBar.trade_date.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
+
+    async def daily_close_asset_counts(self, trade_date: date) -> dict[str, int | set[str]]:
+        """Read the small count/marker set used by repair and report readiness."""
+        start = datetime.combine(trade_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
+        end = datetime.combine(
+            trade_date.fromordinal(trade_date.toordinal() + 1),
+            datetime.min.time(),
+            tzinfo=ZoneInfo("Asia/Shanghai"),
+        )
+        row = (
+            await self.session.execute(
+                text(
+                    """
+                    SELECT
+                        (SELECT count(*) FROM t_stock WHERE status = 'active') AS active_stock,
+                        (SELECT count(DISTINCT stock_code) FROM t_daily_bar WHERE trade_date = :trade_date) AS daily_bar,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_daily_basic WHERE trade_date = :trade_date) AS daily_basic,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_fund_flow_daily WHERE trade_date = :trade_date) AS stock_moneyflow,
+                        (SELECT count(*) FROM t_limit_event_daily WHERE trade_date = :trade_date) AS limit_event,
+                        (SELECT count(*) FROM t_lhb_event WHERE trade_date = :trade_date) AS lhb_event,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_technical_factor_daily WHERE trade_date = :trade_date) AS stock_technical,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily
+                            WHERE trade_date = :trade_date AND source = 'system:daily_close') AS daily_factor,
+                        (SELECT count(DISTINCT stock_code) FROM t_technical_indicator_snapshot
+                            WHERE snapshot_time >= :snapshot_start AND snapshot_time < :snapshot_end
+                              AND source = 'system:daily_close') AS technical_snapshot,
+                        (SELECT count(DISTINCT index_code) FROM t_index_bar WHERE trade_date = :trade_date) AS index_bar,
+                        (SELECT count(DISTINCT index_code) FROM t_index_daily_basic WHERE trade_date = :trade_date) AS index_daily_basic,
+                        (SELECT count(DISTINCT sector_code) FROM t_sector_bar WHERE trade_date = :trade_date) AS sector_bar,
+                        (SELECT count(DISTINCT sector_code) FROM t_sector_fund_flow_daily WHERE trade_date = :trade_date) AS sector_moneyflow,
+                        (SELECT count(DISTINCT sector_code) FROM t_sector_factor_daily WHERE trade_date = :trade_date) AS sector_factor,
+                        (SELECT count(*) FROM t_market_daily_stat WHERE trade_date = :trade_date) AS market_stat,
+                        (SELECT count(*) FROM t_sector_basic
+                            WHERE source LIKE 'tushare:%'
+                              AND sector_code LIKE 'ths_%'
+                              AND metadata ->> 'raw_code' IS NOT NULL) AS tushare_sector
+                    """
+                ),
+                {
+                    "trade_date": trade_date,
+                    "snapshot_start": start,
+                    "snapshot_end": end,
+                },
+            )
+        ).mappings().one()
+        capabilities = set(
+            (
+                await self.session.execute(
+                    select(ProviderRawRecord.capability).where(
+                        ProviderRawRecord.record_key == trade_date.isoformat(),
+                        ProviderRawRecord.status == "captured",
+                        ProviderRawRecord.capability.in_(
+                            (
+                                "daily_market_close_stock_limit",
+                                "daily_market_close_stock_suspend",
+                                "daily_market_close_lhb",
+                                "daily_market_close_lhb_seats",
+                                "daily_market_close_index_daily_basic",
+                                "daily_market_close_market_stats",
+                                "daily_market_close_sector_bars",
+                                "daily_market_close_moneyflow_cnt_ths",
+                                "daily_market_close_moneyflow_ind_ths",
+                            )
+                        ),
+                    )
+                )
+            ).scalars().all()
+        )
+        return {
+            **{key: int(value or 0) for key, value in row.items()},
+            "raw_capabilities": capabilities,
+        }
+
     async def delete_trade_calendar_year(self, *, year: int, market: str = "CN") -> int:
         result = await self.session.execute(
             delete(TradeCalendar).where(
@@ -1017,6 +1100,22 @@ class MarketDataRepository:
         )
         return {row[0]: int(row[1]) for row in result.all()}
 
+    async def minute_factor_counts(self, *, stock_codes: list[str], trade_date: date) -> dict[str, int]:
+        if not stock_codes:
+            return {}
+        from app.modules.market_data.models import StockFactorMinute
+
+        result = await self.session.execute(
+            select(StockFactorMinute.stock_code, func.count(StockFactorMinute.id))
+            .where(
+                StockFactorMinute.stock_code.in_(stock_codes),
+                StockFactorMinute.trade_date == trade_date,
+                StockFactorMinute.source == "system:daily_close",
+            )
+            .group_by(StockFactorMinute.stock_code)
+        )
+        return {row[0]: int(row[1]) for row in result.all()}
+
     async def ensure_minute_bar_partition(self, trade_date: date) -> None:
         await ensure_market_partition(self.session, parent_table="t_minute_bar", trade_date=trade_date)
 
@@ -1039,6 +1138,27 @@ class MarketDataRepository:
                 await self.session.execute(text(f"DROP TABLE IF EXISTS {child_name}"))
                 dropped.append(str(child_name))
         return dropped
+
+    async def clear_minute_ingest_data(self, trade_date: date) -> dict[str, int]:
+        """Clear only current minute bars/factors for an explicit minute rebuild."""
+        from app.modules.market_data.models import StockFactorMinute
+
+        deleted: dict[str, int] = {}
+        result = await self.session.execute(
+            delete(MinuteBar).where(
+                MinuteBar.trade_date == trade_date,
+                MinuteBar.source == "mootdx",
+            )
+        )
+        deleted["minute"] = int(result.rowcount or 0)
+        result = await self.session.execute(
+            delete(StockFactorMinute).where(
+                StockFactorMinute.trade_date == trade_date,
+                StockFactorMinute.source == "system:daily_close",
+            )
+        )
+        deleted["minute_factor"] = int(result.rowcount or 0)
+        return deleted
 
     async def clear_daily_close_ingest_data(self, trade_date: date) -> dict[str, int]:
         """Remove only data produced by this job for a targeted rebuild."""
