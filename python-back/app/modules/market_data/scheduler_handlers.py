@@ -1,3 +1,5 @@
+import asyncio
+
 from app.db.session import get_sessionmaker
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.indicator_engine.backfill import FactorBackfillRequest, FactorBackfillService
@@ -893,7 +895,10 @@ class _DailyCloseBaseHandler:
                 MarketDataRepository(session),
                 ConfigCenterRepository(session),
             )
-            result = await service.run_minute(payload) if minute_only else await service.run(payload)
+            try:
+                result = await service.run_minute(payload) if minute_only else await service.run(payload)
+            finally:
+                await asyncio.to_thread(service.close)
         return JobResult(
             status=result.status if result.status == "skipped" else "success",
             affected_rows=_daily_close_affected_rows(result),

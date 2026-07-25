@@ -119,15 +119,26 @@ class DailyMarketCloseIngestService:
 
     minute_complete_threshold = 230
     daily_minimum_floor = 3000
+    index_akshare_timeout_seconds = 5
     core_index_codes = ("000001.SH", "399001.SZ", "399006.SZ", "000300.SH", "000905.SH", "000852.SH", "000016.SH")
 
     def __init__(self, repository: MarketDataRepository, config_repository: ConfigCenterRepository) -> None:
         self.repository = repository
         self.config_repository = config_repository
         self.tushare = TushareProviderFactory(config_repository)
-        self.mootdx = MootdxProvider()
+        # Index fallback must be bounded.  A TDX host can accept TCP while
+        # returning no protocol data; do not let seven core indexes each wait
+        # through the provider's general-purpose 30-second retry policy.
+        self.mootdx = MootdxProvider(
+            timeout_seconds=2,
+            auto_retry=0,
+            fallback_server_limit=4,
+        )
         self.tushare_daily_adapter = TushareStockDailyAdapter()
         self.tushare_market_adapter = TushareMarketAdapter()
+
+    def close(self) -> None:
+        self.mootdx.close()
 
     async def run_minute(self, payload: DailyMarketCloseIngestRequest) -> DailyMarketCloseIngestResult:
         """Persist current-day MooTDX minute bars and their reusable minute factors."""
@@ -813,6 +824,8 @@ class DailyMarketCloseIngestService:
                     "rows": 0,
                     "error": message,
                 }
+            finally:
+                await asyncio.to_thread(service.close)
 
         elapsed_ms = int((perf_counter() - started) * 1000)
         rows = self._enrichment_row_count(value)
@@ -1060,34 +1073,120 @@ class DailyMarketCloseIngestService:
         return await self.repository.upsert_lhb_seat_rows(seats)
 
     async def _sync_index_bars(self, trade_date: date, result: DailyMarketCloseIngestResult) -> int:
-        rows = []
-        missing_codes = []
+        core_codes = {
+            normalize_symbol(index_code): index_code
+            for index_code in self.core_index_codes
+        }
+        response = await self._tushare_response(
+            "index_daily",
+            {"trade_date": trade_date},
+            capability="daily_market_close_index_bars",
+        )
+        records = list(response.records)
         fallback_used: dict[str, str] = {}
-        for index_code in self.core_index_codes:
-            response = await self._tushare_response("index_daily", {"ts_code": index_code, "trade_date": trade_date}, capability="daily_market_close_index_bars")
-            records = list(response.records)
-            if not records:
-                records = await self._akshare_index_daily_records(index_code, trade_date)
-                if records:
-                    fallback_used[normalize_symbol(index_code)] = "akshare:stock_zh_index_daily_em"
-            if not records:
-                records = await self._mootdx_index_daily_records(index_code, trade_date)
-                if records:
-                    fallback_used[normalize_symbol(index_code)] = "mootdx:index"
-            if not records:
-                missing_codes.append(index_code)
-            mapping = self.tushare_market_adapter.map_index_daily(
-                records,
-                trade_date=trade_date,
-                index_codes={normalize_symbol(index_code)},
+        returned_codes = {
+            normalize_symbol(str(record.get("ts_code") or ""))
+            for record in records
+        }
+        missing_normalized = [
+            code
+            for code in core_codes
+            if code not in returned_codes
+        ]
+
+        if missing_normalized:
+            async def fetch_akshare(code: str) -> list[dict]:
+                try:
+                    return await asyncio.wait_for(
+                        self._akshare_index_daily_records(
+                            core_codes[code],
+                            trade_date,
+                        ),
+                        timeout=self.index_akshare_timeout_seconds,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "daily close ingest akshare index fallback timed out: "
+                        "index=%s timeout_seconds=%s",
+                        core_codes[code],
+                        self.index_akshare_timeout_seconds,
+                    )
+                    return []
+
+            akshare_results = await asyncio.gather(
+                *(fetch_akshare(code) for code in missing_normalized)
             )
-            self._log_mapping_summary(mapping)
-            result.warnings.extend(mapping.warnings)
-            rows.extend(mapping.rows)
+            for code, fallback_records in zip(
+                missing_normalized,
+                akshare_results,
+                strict=True,
+            ):
+                if not fallback_records:
+                    continue
+                records.extend(fallback_records)
+                fallback_used[code] = "akshare:stock_zh_index_daily_em"
+
+        returned_codes = {
+            normalize_symbol(str(record.get("ts_code") or ""))
+            for record in records
+        }
+        tdx_candidates = [
+            code
+            for code in core_codes
+            if code not in returned_codes
+        ]
+        tdx_error: str | None = None
+        for code in tdx_candidates:
+            try:
+                fallback_records = await self._mootdx_index_daily_records(
+                    core_codes[code],
+                    trade_date,
+                )
+            except Exception as exc:
+                # One provider-level failure means the bounded host scan found
+                # no usable TDX node.  Repeating the same scan for every index
+                # only multiplies the delay without improving coverage.
+                tdx_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "daily close ingest mootdx index fallback unavailable: "
+                    "first_index=%s remaining=%s error=%s",
+                    core_codes[code],
+                    len(tdx_candidates),
+                    tdx_error,
+                )
+                break
+            if fallback_records:
+                records.extend(fallback_records)
+                fallback_used[code] = "mootdx:index"
+
+        mapping = self.tushare_market_adapter.map_index_daily(
+            records,
+            trade_date=trade_date,
+            index_codes=set(core_codes),
+        )
+        self._log_mapping_summary(mapping)
+        result.warnings.extend(mapping.warnings)
+        rows = mapping.rows
+        mapped_codes = {
+            normalize_symbol(str(row.get("index_code") or ""))
+            for row in rows
+        }
+        missing_codes = [
+            index_code
+            for code, index_code in core_codes.items()
+            if code not in mapped_codes
+        ]
         await self._capture_raw_summary(
             "daily_market_close_index_bars",
             trade_date,
-            {"index_codes": list(self.core_index_codes), "missing_codes": missing_codes, "fallback_used": fallback_used},
+            {
+                "index_codes": list(self.core_index_codes),
+                "tushare_request_mode": "batch_trade_date",
+                "tushare_rows": len(response.records),
+                "missing_codes": missing_codes,
+                "fallback_used": fallback_used,
+                "mootdx_error": tdx_error,
+            },
             len(rows),
             normalized_table="t_index_bar",
         )
@@ -1095,6 +1194,11 @@ class DailyMarketCloseIngestService:
             result.warnings.append(
                 "index_daily fallback_used: "
                 + ", ".join(f"{code}->{source}" for code, source in sorted(fallback_used.items()))
+            )
+        if tdx_error:
+            result.warnings.append(
+                "MooTDX index fallback unavailable after bounded host scan: "
+                + tdx_error[:300]
             )
         if missing_codes:
             result.warnings.append(f"index_daily 缺失指数: {', '.join(missing_codes)}")
@@ -1158,11 +1262,7 @@ class DailyMarketCloseIngestService:
             return []
 
     async def _mootdx_index_daily_records(self, index_code: str, trade_date: date) -> list[dict]:
-        try:
-            rows, _raw = await self.mootdx.index_bars(normalize_symbol(index_code), limit=10)
-        except Exception as exc:
-            logger.warning("daily close ingest mootdx index fallback failed: %s %s", index_code, exc)
-            return []
+        rows, _raw = await self.mootdx.index_bars(normalize_symbol(index_code), limit=10)
         records: list[dict] = []
         for row in rows:
             if row.get("trade_date") != trade_date:

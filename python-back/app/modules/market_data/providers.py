@@ -1055,7 +1055,28 @@ class MootdxProvider:
     auto_retry = 3
     fallback_server_limit = 12
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        auto_retry: int | None = None,
+        fallback_server_limit: int | None = None,
+    ) -> None:
+        self.timeout_seconds = (
+            max(float(timeout_seconds), 0.1)
+            if timeout_seconds is not None
+            else type(self).timeout_seconds
+        )
+        self.auto_retry = (
+            max(int(auto_retry), 0)
+            if auto_retry is not None
+            else type(self).auto_retry
+        )
+        self.fallback_server_limit = (
+            max(int(fallback_server_limit), 1)
+            if fallback_server_limit is not None
+            else type(self).fallback_server_limit
+        )
         self._client = None
         self._client_label = None
         self._client_lock = threading.RLock()
@@ -1402,7 +1423,12 @@ class MootdxProvider:
 
     def _index_bars_sync(self, index_code: str, limit: int) -> tuple[list[dict], list[dict]]:
         code = normalize_symbol(index_code).replace("sh", "").replace("sz", "")
-        raw = frame_records(self._call_quotes(lambda quotes: quotes.index(symbol=code, frequency="day", offset=limit)))
+        raw = frame_records(
+            self._call_quotes(
+                lambda quotes: quotes.index(symbol=code, frequency="day", offset=limit),
+                require_records=True,
+            )
+        )
         rows = []
         for item in raw:
             trade_date = parse_date(first(item, ["datetime", "date", "__index__"]))
