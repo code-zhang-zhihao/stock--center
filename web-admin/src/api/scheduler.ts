@@ -1,10 +1,15 @@
 import { requestData } from './client';
-import type { SchedulerJob, SchedulerRun, SchedulerRunPage, SchedulerStatus } from '@/types/scheduler';
+import type { SchedulerJob, SchedulerRun, SchedulerRunPage, SchedulerStatus, SchedulerTag } from '@/types/scheduler';
 
 export const schedulerApi = {
   status: () => requestData<SchedulerStatus>({ method: 'GET', url: '/scheduler/status' }),
-  jobs: (includeHidden = false) =>
-    requestData<SchedulerJob[]>({ method: 'GET', url: '/scheduler/jobs', params: { include_hidden: includeHidden } }),
+  jobs: (tagCode?: string | null) =>
+    requestData<SchedulerJob[]>({
+      method: 'GET',
+      url: '/scheduler/jobs',
+      params: tagCode ? { tag_code: tagCode } : undefined,
+    }),
+  tags: () => requestData<SchedulerTag[]>({ method: 'GET', url: '/scheduler/tags' }),
   updateJob: (jobCode: string, payload: Record<string, unknown>) =>
     requestData<SchedulerJob>({ method: 'PATCH', url: `/scheduler/jobs/${encodeURIComponent(jobCode)}`, data: payload }),
   pauseJob: (jobCode: string) => requestData<SchedulerJob>({ method: 'POST', url: `/scheduler/jobs/${jobCode}/pause` }),

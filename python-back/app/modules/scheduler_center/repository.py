@@ -4,7 +4,7 @@ from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.scheduler_center.models import SchedulerJob, SchedulerJobRun
+from app.modules.scheduler_center.models import SchedulerJob, SchedulerJobRun, SchedulerJobTag, SchedulerTag
 
 _UNSET = object()
 
@@ -13,12 +13,75 @@ class SchedulerRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def list_jobs(self, *, include_hidden: bool = False) -> list[SchedulerJob]:
+    async def list_jobs(
+        self,
+        *,
+        include_hidden: bool = False,
+        tag_code: str | None = None,
+    ) -> list[SchedulerJob]:
         stmt = select(SchedulerJob)
         if not include_hidden:
             stmt = stmt.where(SchedulerJob.is_hidden.is_(False))
+        if tag_code:
+            stmt = stmt.where(
+                SchedulerJob.job_code.in_(
+                    select(SchedulerJobTag.job_code).where(SchedulerJobTag.tag_code == tag_code)
+                )
+            )
         result = await self.session.execute(stmt.order_by(SchedulerJob.job_type, SchedulerJob.job_code))
         return list(result.scalars().all())
+
+    async def list_job_tags(self, job_codes: list[str]) -> dict[str, list[dict]]:
+        if not job_codes:
+            return {}
+        rows = await self.session.execute(
+            select(
+                SchedulerJobTag.job_code,
+                SchedulerTag.tag_code,
+                SchedulerTag.tag_name,
+                SchedulerTag.sort_order,
+            )
+            .join(SchedulerTag, SchedulerTag.tag_code == SchedulerJobTag.tag_code)
+            .where(SchedulerJobTag.job_code.in_(job_codes))
+            .order_by(SchedulerJobTag.job_code, SchedulerTag.sort_order, SchedulerTag.tag_code)
+        )
+        tags_by_job: dict[str, list[dict]] = {}
+        for row in rows.mappings():
+            tags_by_job.setdefault(str(row["job_code"]), []).append(
+                {
+                    "tag_code": row["tag_code"],
+                    "tag_name": row["tag_name"],
+                    "sort_order": row["sort_order"],
+                }
+            )
+        return tags_by_job
+
+    async def list_tags(self, *, include_disabled: bool = False) -> list[dict]:
+        stmt = (
+            select(
+                SchedulerTag.id,
+                SchedulerTag.tag_code,
+                SchedulerTag.tag_name,
+                SchedulerTag.sort_order,
+                SchedulerTag.is_enabled,
+                SchedulerTag.metadata_json.label("metadata"),
+                func.count(SchedulerJobTag.job_code).label("job_count"),
+            )
+            .outerjoin(SchedulerJobTag, SchedulerJobTag.tag_code == SchedulerTag.tag_code)
+            .group_by(
+                SchedulerTag.id,
+                SchedulerTag.tag_code,
+                SchedulerTag.tag_name,
+                SchedulerTag.sort_order,
+                SchedulerTag.is_enabled,
+                SchedulerTag.metadata_json,
+            )
+            .order_by(SchedulerTag.sort_order, SchedulerTag.tag_code)
+        )
+        if not include_disabled:
+            stmt = stmt.where(SchedulerTag.is_enabled.is_(True))
+        rows = await self.session.execute(stmt)
+        return [dict(row) for row in rows.mappings().all()]
 
     async def list_enabled_cron_jobs(self) -> list[SchedulerJob]:
         result = await self.session.execute(

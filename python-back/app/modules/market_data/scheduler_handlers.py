@@ -1124,19 +1124,6 @@ class DailyCloseRepairIngestHandler:
         return JobResult(status=status, affected_rows=affected_rows, summary={"repaired_trade_days": summaries})
 
 
-class DailyMarketCloseIngestHandler(DailyCloseCoreIngestHandler):
-    job_code = "daily_market_close_ingest"
-    default_payload = {
-        **DailyCloseCoreIngestHandler.default_payload,
-        "sync_stock_technical_factor_pro": True,
-        "sync_lhb": True,
-        "sync_index_daily_basic": True,
-        "sync_market_stats": True,
-        "sync_sector_moneyflow": True,
-        "calculate_external_technical_factors": True,
-    }
-
-
 def register_market_data_jobs() -> None:
     job_handler_registry.register(SyncSectorCatalogHandler())
     job_handler_registry.register(SyncTradeCalendarHandler())
@@ -1152,4 +1139,3 @@ def register_market_data_jobs() -> None:
     job_handler_registry.register(DailyCloseCoreIngestHandler())
     job_handler_registry.register(DailyCloseEnrichmentIngestHandler())
     job_handler_registry.register(DailyCloseRepairIngestHandler())
-    job_handler_registry.register(DailyMarketCloseIngestHandler())

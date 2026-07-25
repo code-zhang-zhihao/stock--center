@@ -8,6 +8,19 @@ JobStatus = Literal["queued", "running", "success", "failed", "timeout", "cancel
 TriggerSource = Literal["manual", "cron", "retry", "system"]
 
 
+class SchedulerJobTagRead(BaseModel):
+    tag_code: str
+    tag_name: str
+    sort_order: int
+
+
+class SchedulerTagRead(SchedulerJobTagRead):
+    id: int
+    is_enabled: bool
+    metadata: dict = Field(default_factory=dict)
+    job_count: int = 0
+
+
 class SchedulerJobCreate(BaseModel):
     job_code: str = Field(min_length=1, max_length=120)
     job_name: str = Field(min_length=1, max_length=160)
@@ -68,6 +81,7 @@ class SchedulerJobRead(BaseModel):
     is_enabled: bool
     is_system: bool
     is_hidden: bool
+    tags: list[SchedulerJobTagRead] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime

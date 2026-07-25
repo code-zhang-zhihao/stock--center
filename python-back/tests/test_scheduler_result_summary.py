@@ -18,7 +18,7 @@ def test_finish_run_json_encodes_result_summary_values() -> None:
             return SimpleNamespace(
                 id=1,
                 run_id="run-1",
-                job_code="daily_market_close_ingest",
+                job_code="daily_close_core_ingest",
                 trigger_source="manual",
                 status=values["status"],
                 payload={},

@@ -11,6 +11,19 @@ export interface SchedulerParameterSpec {
 
 export type SchedulerParameterSchema = Record<string, SchedulerParameterSpec>;
 
+export interface SchedulerJobTag {
+  tag_code: string;
+  tag_name: string;
+  sort_order: number;
+}
+
+export interface SchedulerTag extends SchedulerJobTag {
+  id: number;
+  is_enabled: boolean;
+  metadata: Record<string, unknown>;
+  job_count: number;
+}
+
 export interface SchedulerJob {
   id: number;
   job_code: string;
@@ -32,6 +45,7 @@ export interface SchedulerJob {
   is_enabled: boolean;
   is_system: boolean;
   is_hidden: boolean;
+  tags: SchedulerJobTag[];
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;

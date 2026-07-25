@@ -62,6 +62,7 @@
 56. `56-sector-history-range-backfill.sql`：修正历史板块日频事实任务参数。`ths_daily` 改为逐板块一次完整日期区间请求，默认 12 个板块 worker；板块资金流默认使用已实测验证的 20 交易日窗口和 2 个窗口 worker。
 57. `57-stock-history-limit-events.sql`：将 `limit_list_d/suspend_d` 按交易日全市场查询阶段加入 `backfill_stock_daily_facts`，补齐 `t_limit_event_daily` 的历史涨跌停与停牌事件；把旧 `Z` 池归一为 `limit_break`，并兼容特定历史区间 U 池标志为空但带 `up_stat` 的响应。
 58. `58-daily-close-four-stage-pipeline.sql`：将每日收盘流水线升级为 15:30 分钟线/分钟因子、18:00 核心事实、21:30 增强事实、次日 08:00 缺口修复四级任务；分钟因子保留落库并按 200 股票分片集合计算。
+59. `59-scheduler-job-tags-and-retire-obsolete-jobs.sql`：新增调度标签及任务-标签关联表，seed 历史/每日/主数据/策略标签，并删除三个无效或已替换的任务定义。
 
 ## 产品化初始化规划
 
@@ -95,6 +96,8 @@ docs/sql/db-init.sql
 `18-market-partition-owner-fix.sql` 必须由 `postgres` 或当前分区父表 owner 执行。后端应用账号需要成为 `t_minute_bar/t_stock_factor_minute` 分区体系 owner，才能在每日收盘任务中自动创建当天分区并清理过期分区。
 
 `58-daily-close-four-stage-pipeline.sql` 不删除业务数据。它新增并默认启用 `daily_close_minute_ingest`，更新三个既有收盘任务的 cron、参数、超时和重试策略。脚本执行后需要 reload Scheduler；分钟线和分钟因子都保留最近 30 个交易日，分钟因子默认每 200 只股票一个 PostgreSQL 事务，可在 50–500 之间调整。
+
+`59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 
 `19-daily-close-ingest-batching.sql` 只更新调度任务元数据，不修改行情事实表。已执行过 `16` 的数据库曾用它展示 `minute_batch_size` 和 `quote_batch_size` 参数；后续 `45` 会废弃 EOD quote，因此新环境不应再把 `quote_batch_size` 作为常规参数。
 

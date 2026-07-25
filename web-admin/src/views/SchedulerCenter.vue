@@ -30,8 +30,15 @@
       <section class="object-panel">
         <div class="panel-title">
           <span>任务定义</span>
-          <n-checkbox v-model:checked="includeHidden">包含内部任务</n-checkbox>
+          <n-select v-model:value="enabledFilter" class="status-filter" size="small" :options="enabledFilterOptions" />
         </div>
+        <n-select
+          v-model:value="selectedTagCode"
+          clearable
+          size="small"
+          :options="tagOptions"
+          placeholder="按标签筛选"
+        />
         <n-input v-model:value="keyword" clearable size="small" placeholder="筛选任务名称 / code" />
         <div class="job-list-region">
           <n-spin :show="loading">
@@ -48,6 +55,7 @@
                 <div class="object-main"><span>{{ job.job_name }}</span><code>{{ job.job_code }}</code></div>
                 <div class="object-meta">
                   <n-tag size="small" :type="job.is_enabled ? 'success' : 'warning'" :bordered="false">{{ job.is_enabled ? 'enabled' : 'disabled' }}</n-tag>
+                  <n-tag v-for="tag in job.tags" :key="tag.tag_code" size="small" :type="tagStyle(tag.tag_code)" :bordered="false">{{ tag.tag_name }}</n-tag>
                   <n-tag v-if="job.is_hidden" size="small" :bordered="false">hidden</n-tag>
                 </div>
               </button>
@@ -64,6 +72,7 @@
               <div class="title-row">
                 <h2>{{ selectedJob.job_name }}</h2>
                 <n-tag size="small" :type="selectedJob.is_enabled ? 'success' : 'warning'">{{ selectedJob.is_enabled ? 'enabled' : 'disabled' }}</n-tag>
+                <n-tag v-for="tag in selectedJob.tags" :key="tag.tag_code" size="small" :type="tagStyle(tag.tag_code)">{{ tag.tag_name }}</n-tag>
                 <n-tag v-if="selectedJob.is_system" size="small" type="info">system</n-tag>
               </div>
               <div class="mono muted">{{ selectedJob.job_type }} / {{ selectedJob.job_code }}</div>
@@ -91,6 +100,7 @@
             <n-tab-pane name="definition" tab="任务信息">
               <div class="definition-grid">
                 <div class="definition-item"><span>描述</span><p>{{ selectedJob.description || '-' }}</p></div>
+                <div class="definition-item"><span>标签</span><p>{{ selectedJob.tags.map((tag) => tag.tag_name).join('、') || '未分类' }}</p></div>
                 <div class="definition-item"><span>固定时区</span><p>{{ selectedJob.timezone }}</p></div>
                 <div class="definition-item"><span>单次尝试超时 / 重试</span><p>{{ selectedJob.timeout_seconds ? `${selectedJob.timeout_seconds}s` : '不限制' }} / {{ selectedJob.retry_count }} 次，每次间隔 {{ selectedJob.retry_interval_seconds }}s</p></div>
                 <div class="definition-item"><span>默认参数</span><pre>{{ stringifyJson(selectedJob.default_payload) }}</pre></div>
@@ -176,7 +186,7 @@ import {
 } from 'naive-ui';
 import SchedulerPayloadForm from '@/components/SchedulerPayloadForm.vue';
 import { schedulerApi } from '@/api/scheduler';
-import type { SchedulerJob, SchedulerParameterSchema, SchedulerRun, SchedulerRunListItem, SchedulerStatus } from '@/types/scheduler';
+import type { SchedulerJob, SchedulerParameterSchema, SchedulerRun, SchedulerRunListItem, SchedulerStatus, SchedulerTag } from '@/types/scheduler';
 import { formatTime, parseJsonObject, stringifyJson } from '@/utils/json';
 
 type ScheduleMode = 'manual' | 'daily' | 'weekly' | 'monthly' | 'custom';
@@ -218,10 +228,12 @@ const savingJobState = ref(false);
 const savingSettings = ref(false);
 const runningJob = ref(false);
 const cancellingRunId = ref<string | null>(null);
-const includeHidden = ref(true);
 const keyword = ref('');
+const selectedTagCode = ref<string | null>(null);
+const enabledFilter = ref<'enabled' | 'disabled' | 'all'>('enabled');
 const status = ref<SchedulerStatus | null>(null);
 const jobs = ref<SchedulerJob[]>([]);
+const tags = ref<SchedulerTag[]>([]);
 const selectedJob = ref<SchedulerJob | null>(null);
 const runs = ref<SchedulerRunListItem[]>([]);
 const settingsModalOpen = ref(false);
@@ -241,9 +253,18 @@ const runDetail = ref<SchedulerRun | null>(null);
 
 const filteredJobs = computed(() => {
   const needle = keyword.value.trim().toLowerCase();
-  if (!needle) return jobs.value;
-  return jobs.value.filter((job) => [job.job_name, job.job_code, job.job_type].some((value) => value.toLowerCase().includes(needle)));
+  return jobs.value.filter((job) => {
+    if (enabledFilter.value === 'enabled' && !job.is_enabled) return false;
+    if (enabledFilter.value === 'disabled' && job.is_enabled) return false;
+    return !needle || [job.job_name, job.job_code, job.job_type].some((value) => value.toLowerCase().includes(needle));
+  });
 });
+const tagOptions = computed(() => tags.value.map((tag) => ({ label: `${tag.tag_name}（${tag.job_count}）`, value: tag.tag_code })));
+const enabledFilterOptions = [
+  { label: '仅已启用', value: 'enabled' },
+  { label: '仅已暂停', value: 'disabled' },
+  { label: '全部状态', value: 'all' },
+];
 const settingsCron = computed(() => buildCron(settingsForm.value));
 const schedulePreviewText = computed(() => settingsForm.value.mode === 'manual'
   ? '仅手动运行：不会注册 APScheduler 定时触发。'
@@ -282,14 +303,15 @@ const runColumns: DataTableColumns<SchedulerRunListItem> = [
   },
 ];
 
-watch(includeHidden, () => void loadJobs());
+watch(selectedTagCode, () => void refreshJobsForFilter());
+watch(enabledFilter, () => selectJob(selectedJob.value?.job_code || null));
 onMounted(() => void reloadAll());
 
 async function reloadAll() {
   loading.value = true;
   try {
-    await Promise.all([loadStatus(), loadJobs()]);
-    selectJob(selectedJob.value?.job_code || jobs.value[0]?.job_code || null);
+    await Promise.all([loadStatus(), loadTags(), loadJobs()]);
+    selectJob(selectedJob.value?.job_code || null);
   } finally { loading.value = false; }
 }
 
@@ -297,23 +319,35 @@ async function loadStatus() {
   try { status.value = await schedulerApi.status(); } catch (error) { message.error(errorMessage(error, '加载调度状态失败')); }
 }
 
+async function loadTags() {
+  try {
+    tags.value = await schedulerApi.tags();
+    if (selectedTagCode.value && !tags.value.some((tag) => tag.tag_code === selectedTagCode.value)) selectedTagCode.value = null;
+  } catch (error) { message.error(errorMessage(error, '加载任务标签失败')); }
+}
+
 async function loadJobs() {
-  try { jobs.value = await schedulerApi.jobs(includeHidden.value); } catch (error) { message.error(errorMessage(error, '加载任务失败')); }
+  try { jobs.value = await schedulerApi.jobs(selectedTagCode.value); } catch (error) { message.error(errorMessage(error, '加载任务失败')); }
+}
+
+async function refreshJobsForFilter() {
+  await loadJobs();
+  selectJob(selectedJob.value?.job_code || null);
 }
 
 async function reloadScheduler() {
   reloadingScheduler.value = true;
   try {
     status.value = await schedulerApi.reload();
-    await loadJobs();
+    await Promise.all([loadTags(), loadJobs()]);
     selectJob(selectedJob.value?.job_code || null);
     message.success('调度器已重载');
   } catch (error) { message.error(errorMessage(error, '重载调度器失败')); } finally { reloadingScheduler.value = false; }
 }
 
 function selectJob(jobCode: string | null) {
-  if (!jobCode) { selectedJob.value = null; runs.value = []; return; }
-  selectedJob.value = jobs.value.find((job) => job.job_code === jobCode) || jobs.value[0] || null;
+  selectedJob.value = (jobCode ? filteredJobs.value.find((job) => job.job_code === jobCode) : null) || filteredJobs.value[0] || null;
+  if (!selectedJob.value) { runs.value = []; return; }
   if (selectedJob.value) void loadRuns(selectedJob.value.job_code);
 }
 
@@ -391,7 +425,7 @@ async function runSelectedJob() {
     const run = await schedulerApi.runJob(selectedJob.value.job_code, overrides, runAsync.value);
     runModalOpen.value = false;
     message.success(`任务已触发：${run.status}`);
-    await Promise.all([loadJobs(), loadRuns(selectedJob.value.job_code)]);
+    await Promise.all([loadTags(), loadJobs(), loadRuns(selectedJob.value.job_code)]);
   } catch (error) { message.error(errorMessage(error, '运行任务失败')); } finally { runningJob.value = false; }
 }
 
@@ -417,7 +451,7 @@ async function cancelRun(row: SchedulerRunListItem) {
 }
 
 async function refreshSelectedJob(jobCode: string) {
-  await Promise.all([loadStatus(), loadJobs()]);
+  await Promise.all([loadStatus(), loadTags(), loadJobs()]);
   selectJob(jobCode);
 }
 
@@ -469,6 +503,9 @@ function scheduleSummary(cronExpr: string | null) {
 }
 
 function formatClock(hour: number, minute: number) { return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`; }
+function tagStyle(tagCode: string) {
+  return tagCode === 'history' ? 'warning' : tagCode === 'daily' ? 'success' : tagCode === 'master_data' ? 'info' : tagCode === 'strategy' ? 'error' : 'default';
+}
 function splitPayload(payload: Record<string, unknown>, schema: SchedulerParameterSchema): [Record<string, unknown>, Record<string, unknown>] {
   const known: Record<string, unknown> = {};
   const extras: Record<string, unknown> = {};
@@ -507,6 +544,7 @@ function errorMessage(error: unknown, fallback: string): string { return error i
 .object-panel { display: flex; flex-direction: column; gap: 12px; height: calc(100vh - 170px); min-height: 520px; }
 .job-list-region { min-height: 0; flex: 1; overflow-y: auto; }
 .panel-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; font-weight: 700; }
+.status-filter { width: 120px; }
 .object-list { display: grid; gap: 8px; }
 .object-item { width: 100%; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff; padding: 10px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; text-align: left; cursor: pointer; }
 .object-item:hover, .object-item.active { border-color: #1f8a70; background: #f4fbf8; }

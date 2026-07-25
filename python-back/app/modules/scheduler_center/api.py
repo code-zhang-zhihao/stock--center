@@ -30,12 +30,21 @@ async def _reload_scheduler() -> None:
 @router.get("/jobs")
 async def list_jobs(
     include_hidden: bool = False,
+    tag_code: str | None = Query(default=None, min_length=1, max_length=64),
     session: AsyncSession = Depends(get_session),
 ):
     try:
-        return ApiResponse.ok(await service(session).list_jobs(include_hidden=include_hidden))
+        return ApiResponse.ok(await service(session).list_jobs(include_hidden=include_hidden, tag_code=tag_code))
     except Exception as exc:
         return ApiResponse.fail(code="scheduler_jobs_query_failed", message=str(exc))
+
+
+@router.get("/tags")
+async def list_tags(session: AsyncSession = Depends(get_session)):
+    try:
+        return ApiResponse.ok(await service(session).list_tags())
+    except Exception as exc:
+        return ApiResponse.fail(code="scheduler_tags_query_failed", message=str(exc))
 
 
 @router.get("/jobs/{job_code}")

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -60,4 +60,32 @@ class SchedulerJobRun(Base):
     error_code: Mapped[str | None] = mapped_column(String(120))
     error_message: Mapped[str | None] = mapped_column(Text)
     result_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at = created_at_column()
+
+
+class SchedulerTag(Base):
+    __tablename__ = "t_scheduler_tag"
+    __table_args__ = (UniqueConstraint("tag_code", name="uq_t_scheduler_tag_code"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tag_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    tag_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    created_at = created_at_column()
+    updated_at = updated_at_column()
+
+
+class SchedulerJobTag(Base):
+    __tablename__ = "t_scheduler_job_tag"
+
+    job_code: Mapped[str] = mapped_column(
+        ForeignKey("t_scheduler_job.job_code", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tag_code: Mapped[str] = mapped_column(
+        ForeignKey("t_scheduler_tag.tag_code", ondelete="CASCADE"),
+        primary_key=True,
+    )
     created_at = created_at_column()

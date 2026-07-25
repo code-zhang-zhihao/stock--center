@@ -13,8 +13,10 @@ from app.modules.scheduler_center.schemas import (
     JobResult,
     SchedulerJobCreate,
     SchedulerJobRead,
+    SchedulerJobTagRead,
     SchedulerJobUpdate,
     SchedulerRunRead,
+    SchedulerTagRead,
 )
 from app.modules.scheduler_center.validation import CronValidationError, PayloadValidationError, validate_cron_expr, validate_payload
 
@@ -41,13 +43,25 @@ class SchedulerService:
     def __init__(self, repository: SchedulerRepository) -> None:
         self.repository = repository
 
-    async def list_jobs(self, *, include_hidden: bool = False) -> list[SchedulerJobRead]:
-        rows = await self.repository.list_jobs(include_hidden=include_hidden)
-        return [self._job_read(row) for row in rows]
+    async def list_jobs(
+        self,
+        *,
+        include_hidden: bool = False,
+        tag_code: str | None = None,
+    ) -> list[SchedulerJobRead]:
+        rows = await self.repository.list_jobs(include_hidden=include_hidden, tag_code=tag_code)
+        tags_by_job = await self.repository.list_job_tags([row.job_code for row in rows])
+        return [self._job_read(row, tags=tags_by_job.get(row.job_code, [])) for row in rows]
+
+    async def list_tags(self) -> list[SchedulerTagRead]:
+        return [SchedulerTagRead(**row) for row in await self.repository.list_tags()]
 
     async def get_job(self, job_code: str) -> SchedulerJobRead | None:
         row = await self.repository.get_job(job_code)
-        return self._job_read(row) if row else None
+        if row is None:
+            return None
+        tags = (await self.repository.list_job_tags([job_code])).get(job_code, [])
+        return self._job_read(row, tags=tags)
 
     async def create_or_update_job(self, payload: SchedulerJobCreate) -> SchedulerJobRead:
         values = self._job_create_values(payload)
@@ -360,7 +374,7 @@ class SchedulerService:
             raise SchedulerError("invalid_job_payload", str(exc)) from exc
 
     @staticmethod
-    def _job_read(row: SchedulerJob) -> SchedulerJobRead:
+    def _job_read(row: SchedulerJob, *, tags: list[dict] | None = None) -> SchedulerJobRead:
         return SchedulerJobRead(
             id=row.id,
             job_code=row.job_code,
@@ -382,6 +396,7 @@ class SchedulerService:
             is_enabled=row.is_enabled,
             is_system=row.is_system,
             is_hidden=row.is_hidden,
+            tags=[SchedulerJobTagRead(**tag) for tag in (tags or [])],
             metadata=row.metadata_json or {},
             created_at=row.created_at,
             updated_at=row.updated_at,
