@@ -168,7 +168,7 @@
         <n-form-item :label="secretInputLabel">
           <n-input v-model:value="valueForm.secret" type="password" show-password-on="click" />
         </n-form-item>
-        <n-form-item v-if="isTushareTokenConfig" label="专属 API URL" class="span-2">
+        <n-form-item v-if="isEndpointValueConfig" label="专属 API URL" class="span-2">
           <n-input v-model:value="valueForm.endpoint_url" placeholder="留空则使用默认 API URL" />
         </n-form-item>
         <n-form-item label="运行时用途">
@@ -207,7 +207,7 @@
         <n-form-item :label="`替换 ${secretInputLabel}`">
           <n-input v-model:value="valueEditForm.secret" type="password" show-password-on="click" placeholder="留空则不修改" />
         </n-form-item>
-        <n-form-item v-if="isTushareTokenConfig" label="专属 API URL" class="span-2">
+        <n-form-item v-if="isEndpointValueConfig" label="专属 API URL" class="span-2">
           <n-input v-model:value="valueEditForm.endpoint_url" placeholder="留空则使用默认 API URL" />
         </n-form-item>
         <n-form-item label="优先级">
@@ -272,7 +272,7 @@ const categories = [
   { value: 'search' as const, label: 'Search', icon: Search, description: '问财、妙想、Kimi Search 的共享 Key 池。' },
   { value: 'llm' as const, label: 'LLM', icon: Bot, description: '固定 LLM 模型配置、默认模型和 Key 池。' },
   { value: 'notification' as const, label: 'Notification', icon: Bell, description: '飞书、邮件、自定义 Webhook 的渠道配置。' },
-  { value: 'market_data' as const, label: '数据源', icon: Database, description: 'Tushare Pro、Redis Cache 等数据源与运行参数。' },
+  { value: 'market_data' as const, label: '数据源', icon: Database, description: 'Tushare Pro、TickFlow、Redis Cache 等数据源与运行参数。' },
 ];
 
 const activeCategory = ref<ConfigCategory>(normalizeCategory(route.params.domain));
@@ -325,6 +325,7 @@ const valueEditForm = reactive({
 const valueStatusOptions = ['active', 'cooldown', 'invalid', 'disabled'].map((value) => ({ label: value, value }));
 const valueKindOptions = computed(() => {
   if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return [{ label: 'redis_url', value: 'redis_url' }];
+  if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tickflow') return [{ label: 'api_key', value: 'api_key' }];
   if (activeCategory.value === 'market_data') return [{ label: 'token', value: 'token' }];
   if (activeCategory.value !== 'notification') return [{ label: 'api_key', value: 'api_key' }];
   if (selectedItem.value?.config.config_code === 'email') return [{ label: 'smtp_password', value: 'smtp_password' }];
@@ -338,6 +339,8 @@ const valueKindOptions = computed(() => {
 const activeCategoryMeta = computed(() => categories.find((item) => item.value === activeCategory.value) || categories[0]);
 const activeItems = computed(() => itemsByCategory[activeCategory.value]);
 const isTushareTokenConfig = computed(() => activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tushare_pro');
+const isTickflowApiConfig = computed(() => activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tickflow');
+const isEndpointValueConfig = computed(() => isTushareTokenConfig.value || isTickflowApiConfig.value);
 const isRedisCacheConfig = computed(() => activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache');
 const optionsTabLabel = computed(() => activeCategory.value === 'llm' ? '模型参数' : activeCategory.value === 'market_data' ? '数据源参数' : '渠道参数');
 const categoryCounts = computed(() => ({
@@ -358,6 +361,7 @@ const showValuesTab = computed(() => activeCategory.value !== 'notification');
 const optionRows = computed(() => (selectedItem.value?.options || []).map((option, index) => ({ ...option, rowIndex: index })));
 const optionHelperText = computed(() => {
   if (isRedisCacheConfig.value) return 'Redis URL 放在敏感值池；这里只维护缓存后端、Key 前缀、超时和数据中心缓存 TTL。';
+  if (isTickflowApiConfig.value) return 'TickFlow 仅用于实时 Quote；MooTDX 继续负责实时分钟线。专属 URL 留空即可使用 SDK 默认入口。';
   if (activeCategory.value === 'market_data') return '默认 API URL 仅供未设置专属 URL 的 Token 使用。';
   if (activeCategory.value === 'notification') return '通知渠道参数直接在这里维护，包括 Webhook URL、SMTP Password 和 Token。';
   return '这里只编辑非敏感模型参数；API Key 放在敏感值池。';
@@ -365,6 +369,7 @@ const optionHelperText = computed(() => {
 const secretInputLabel = computed(() => {
   if (isRedisCacheConfig.value) return 'Redis URL';
   if (isTushareTokenConfig.value) return 'Token';
+  if (isTickflowApiConfig.value) return 'TickFlow API Key';
   return 'API Key / Secret';
 });
 const runtimePurposeLabel = computed(() => {
@@ -374,6 +379,7 @@ const runtimePurposeLabel = computed(() => {
   if (code === 'kimi_search') return 'Kimi Web Search';
   if (activeCategory.value === 'llm') return 'LLM 调用入口';
   if (code === 'tushare_pro') return 'Tushare Pro 行情与专题数据入口';
+  if (code === 'tickflow') return '实时 Quote 入口（分钟线仍由 MooTDX 提供）';
   if (code === 'redis_cache') return '数据中心缓存与通用运行时缓存';
   if (code === 'feishu') return '飞书 Webhook';
   if (code === 'email') return 'SMTP Password';
@@ -421,7 +427,7 @@ const valueColumns = computed<DataTableColumns<ConfigValue>>(() => {
     },
   },
   ];
-  if (isTushareTokenConfig.value) {
+  if (isEndpointValueConfig.value) {
     columns.splice(4, 0, {
       title: '生效入口',
       key: 'endpoint_url',
@@ -599,7 +605,7 @@ async function saveValue() {
       value_name: valueForm.value_name,
       value_kind: valueForm.value_kind,
       secret: valueForm.secret,
-      endpoint_url: isTushareTokenConfig.value ? (valueForm.endpoint_url.trim() || null) : undefined,
+      endpoint_url: isEndpointValueConfig.value ? (valueForm.endpoint_url.trim() || null) : undefined,
       priority: valueForm.priority,
       weight: valueForm.weight,
       status: 'active',
@@ -640,7 +646,7 @@ async function saveValueEdit() {
       value_name: valueEditForm.value_name,
       status: valueEditForm.status,
       ...(valueEditForm.secret.trim() ? { secret: valueEditForm.secret.trim() } : {}),
-      ...(isTushareTokenConfig.value ? { endpoint_url: valueEditForm.endpoint_url.trim() || null } : {}),
+      ...(isEndpointValueConfig.value ? { endpoint_url: valueEditForm.endpoint_url.trim() || null } : {}),
       priority: valueEditForm.priority,
       weight: valueEditForm.weight,
       is_enabled: valueEditForm.is_enabled,
@@ -692,7 +698,8 @@ async function testValue(row: ConfigValue) {
     if (result.available) {
       const isTushareToken = activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tushare_pro';
       const isRedisUrl = activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache';
-      message.success(isTushareToken ? 'Tushare 日线连通性正常' : isRedisUrl ? 'Redis 连接正常' : `敏感值可用：${result.fingerprint}`);
+      const isTickflowApi = activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tickflow';
+      message.success(isTushareToken ? 'Tushare 日线连通性正常' : isTickflowApi ? 'TickFlow Quote 连通性正常' : isRedisUrl ? 'Redis 连接正常' : `敏感值可用：${result.fingerprint}`);
     }
     else message.warning(`敏感值不可用：${result.error || result.status}`);
   } catch (error) {
@@ -702,6 +709,7 @@ async function testValue(row: ConfigValue) {
 
 function defaultValueKind(): string {
   if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return 'redis_url';
+  if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tickflow') return 'api_key';
   if (activeCategory.value === 'market_data') return 'token';
   if (activeCategory.value !== 'notification') return 'api_key';
   if (selectedItem.value?.config.config_code === 'email') return 'smtp_password';
@@ -710,6 +718,7 @@ function defaultValueKind(): string {
 
 function defaultValueName(): string {
   if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return 'redis_connection';
+  if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tickflow') return 'tickflow_api_key';
   if (activeCategory.value === 'market_data') return 'tushare_token';
   if (activeCategory.value === 'notification') return defaultValueKind();
   return 'primary';

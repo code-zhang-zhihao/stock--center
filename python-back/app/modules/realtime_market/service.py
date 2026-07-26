@@ -14,6 +14,11 @@ from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.market_data.providers import MootdxProvider, normalize_symbol
 from app.modules.realtime_market.repository import RealtimeMarketRepository
 from app.modules.realtime_market.schemas import RealtimeMinuteMeta, RealtimeRoundMeta, RealtimeSettings, RealtimeStatus
+from app.modules.realtime_market.tickflow_runtime import (
+    TickflowCredentials,
+    TickflowProviderFactory,
+    TickflowQuoteProvider,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,8 +53,10 @@ class RealtimeMarketService:
         self._last_quote_round = RealtimeRoundMeta()
         self._last_minute_round = RealtimeMinuteMeta()
         self._error: str | None = None
-        self._quote_providers: list[MootdxProvider] = []
+        self._quote_providers: list[TickflowQuoteProvider | MootdxProvider] = []
         self._minute_providers: list[MootdxProvider] = []
+        self._quote_provider_identity: tuple[object, ...] | None = None
+        self._tickflow_credentials: TickflowCredentials | None = None
         self._subscribers: dict[str, tuple[set[str], asyncio.Queue]] = {}
         self._on_demand_locks: dict[str, asyncio.Lock] = {}
         self._on_demand_attempted_at: dict[str, float] = {}
@@ -71,8 +78,7 @@ class RealtimeMarketService:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        for provider in [*self._quote_providers, *self._minute_providers]:
-            provider.close()
+        self._close_providers([*self._quote_providers, *self._minute_providers])
         self._quote_providers = []
         self._minute_providers = []
         logger.info("realtime market runtime stopped")
@@ -89,6 +95,8 @@ class RealtimeMarketService:
             running=self._running,
             enabled=settings.enabled,
             market_session=await self._is_open_market_session(now),
+            quote_provider=settings.quote_provider,
+            minute_provider="mootdx",
             cache_backend=backend,
             cache_prefix=runtime_config.redis_key_prefix,
             quote_cache_count=len(self._quotes),
@@ -146,8 +154,10 @@ class RealtimeMarketService:
             "minute_meta": meta,
             "meta": {
                 "query_mode": "realtime_on_demand" if fetch_mode == "on_demand" else "realtime_cache",
-                "resolved_source": "mootdx" if quote or code in self._minutes else None,
-                "attempted_engines": ["mootdx"],
+                "resolved_source": quote.get("source") if quote else (meta.get("source") if meta else None),
+                "attempted_engines": list(dict.fromkeys([settings.quote_provider, "mootdx"])),
+                "quote_source": quote.get("source") if quote else None,
+                "minute_source": meta.get("source") if meta else None,
                 "fallback_used": False,
                 "persisted": False,
                 "cache": "realtime_market",
@@ -183,14 +193,17 @@ class RealtimeMarketService:
         # A recorded no-data/provider-error result is a cache entry too. Retrying
         # it on every browser refresh would create a request storm for suspended
         # securities or a temporarily unhealthy TDX server.
+        if self._minute_meta_by_stock.get(code, {}).get("status") == "not_available_before_continuous_session":
+            return True
         return code not in self._quotes or (code not in self._minutes and code not in self._minute_meta_by_stock)
 
     async def _fetch_stock_on_demand(self, code: str, settings: RealtimeSettings) -> str:
-        """Fill an individual intraday cache miss directly from MooTDX.
+        """Fill an individual intraday cache miss from the capability providers.
 
-        This is deliberately a display-path fallback: it only runs during an
-        open session, uses short-lived provider clients, writes the realtime
-        cache, and never lands rows in PostgreSQL or provider raw tables.
+        TickFlow provides the quote; MooTDX continues to provide the 1-minute
+        bars during continuous trading. This remains a display-path fallback:
+        it only writes realtime cache and never lands rows in PostgreSQL or
+        provider raw tables.
         """
         lock = self._on_demand_locks.setdefault(code, asyncio.Lock())
         async with lock:
@@ -202,15 +215,18 @@ class RealtimeMarketService:
             self._on_demand_attempted_at[code] = now_clock
             self._on_demand_errors.pop(code, None)
             started = clock.monotonic()
-            quote_provider = self._new_realtime_provider()
-            minute_provider = self._new_realtime_provider()
+            await self._ensure_provider_pools(settings)
+            quote_provider = self._new_quote_provider(settings.quote_provider)
+            minute_provider = self._new_minute_provider()
             try:
                 logger.info("realtime stock on-demand fetch started: stock_code=%s", code)
-                quote_result, minute_result = await asyncio.gather(
-                    quote_provider.quote(code),
-                    minute_provider.minute_bars(code),
-                    return_exceptions=True,
-                )
+                minute_enabled = self._is_continuous_market_session(datetime.now(tz=SHANGHAI))
+                requests = [quote_provider.quote(code)]
+                if minute_enabled:
+                    requests.append(minute_provider.minute_bars(code))
+                results = await asyncio.gather(*requests, return_exceptions=True)
+                quote_result = results[0]
+                minute_result = results[1] if minute_enabled else None
                 timestamp = datetime.now(tz=ZoneInfo("UTC"))
                 error_parts: list[str] = []
                 if isinstance(quote_result, Exception):
@@ -228,12 +244,20 @@ class RealtimeMarketService:
                     else:
                         error_parts.append("quote: no_quote_data")
 
-                if isinstance(minute_result, Exception):
+                if not minute_enabled:
+                    self._minute_meta_by_stock[code] = {
+                        "status": "not_available_before_continuous_session",
+                        "updated_at": timestamp.isoformat(),
+                        "fetch_mode": "on_demand",
+                        "source": "mootdx",
+                    }
+                elif isinstance(minute_result, Exception):
                     error_parts.append(f"minute: {type(minute_result).__name__}: {minute_result}")
                     self._minute_meta_by_stock[code] = {
                         "status": "provider_error",
                         "updated_at": timestamp.isoformat(),
                         "fetch_mode": "on_demand",
+                        "source": "mootdx",
                     }
                 else:
                     rows, _ = minute_result
@@ -245,6 +269,7 @@ class RealtimeMarketService:
                             "updated_at": timestamp.isoformat(),
                             "bar_count": len(clean_rows),
                             "fetch_mode": "on_demand",
+                            "source": "mootdx",
                             "features": self._minute_features(clean_rows),
                         }
                         await self._persist_minute_cache(code, clean_rows, self._minute_meta_by_stock[code])
@@ -253,11 +278,12 @@ class RealtimeMarketService:
                             "status": "no_intraday_data",
                             "updated_at": timestamp.isoformat(),
                             "fetch_mode": "on_demand",
+                            "source": "mootdx",
                         }
                         error_parts.append("minute: no_intraday_data")
 
                 if error_parts:
-                    self._on_demand_errors[code] = "on_demand_mootdx: " + " | ".join(error_parts[:2])
+                    self._on_demand_errors[code] = f"on_demand_{settings.quote_provider}_mootdx: " + " | ".join(error_parts[:2])
                 else:
                     self._on_demand_errors.pop(code, None)
                 logger.info(
@@ -271,12 +297,11 @@ class RealtimeMarketService:
                 )
                 return "on_demand"
             except Exception as exc:
-                self._on_demand_errors[code] = f"on_demand_mootdx: {type(exc).__name__}: {exc}"
+                self._on_demand_errors[code] = f"on_demand_{settings.quote_provider}_mootdx: {type(exc).__name__}: {exc}"
                 logger.warning("realtime stock on-demand fetch failed: stock_code=%s error=%s", code, exc)
                 return "unavailable"
             finally:
-                quote_provider.close()
-                minute_provider.close()
+                self._close_providers([quote_provider, minute_provider])
 
     async def pool(self, pool_code: str) -> dict | None:
         return self._pool_summaries.get(pool_code)
@@ -350,6 +375,7 @@ class RealtimeMarketService:
                 round_id=round_id,
                 started_at=now.astimezone(ZoneInfo("UTC")),
                 finished_at=datetime.now(tz=ZoneInfo("UTC")),
+                provider=settings.quote_provider,
                 expected_count=expected_count,
                 received_count=len(received_codes),
                 missing_count=max(0, expected_count - len(received_codes)),
@@ -363,12 +389,12 @@ class RealtimeMarketService:
                 logger.warning("realtime quote round degraded: round_id=%s expected=%s received=%s errors=%s", round_id, expected_count, len(received_codes), len(batch_errors))
                 # Minute-line guarantees are independent from the full-market quote feed.
                 # Holding/focus/page targets still need their refresh when quote_batch is degraded.
-                if force or clock.monotonic() - self._last_minute_refresh_clock >= settings.minute_refresh_interval_seconds:
+                if self._is_continuous_market_session(now) and (force or clock.monotonic() - self._last_minute_refresh_clock >= settings.minute_refresh_interval_seconds):
                     await self._refresh_minutes(settings, round_id)
                     self._last_minute_refresh_clock = clock.monotonic()
                 return
             self._error = None
-            if force or clock.monotonic() - self._last_minute_refresh_clock >= settings.minute_refresh_interval_seconds:
+            if self._is_continuous_market_session(now) and (force or clock.monotonic() - self._last_minute_refresh_clock >= settings.minute_refresh_interval_seconds):
                 await self._refresh_minutes(settings, round_id)
                 self._last_minute_refresh_clock = clock.monotonic()
             logger.info(
@@ -402,7 +428,7 @@ class RealtimeMarketService:
         logger.info("realtime reference loaded: active=%s sectors=%s pools=%s", len(active_codes), len(sector_info), len(pools))
 
     async def _fetch_quotes(self, settings: RealtimeSettings) -> tuple[list[dict], list[str], bool]:
-        self._ensure_provider_pools(settings)
+        await self._ensure_provider_pools(settings)
         batches = [self._active_codes[index:index + settings.quote_batch_size] for index in range(0, len(self._active_codes), settings.quote_batch_size)]
         queue: asyncio.Queue[list[str]] = asyncio.Queue()
         for batch in batches:
@@ -411,7 +437,7 @@ class RealtimeMarketService:
         errors: list[str] = []
         transport_failed = asyncio.Event()
 
-        async def worker(provider: MootdxProvider) -> None:
+        async def worker(provider: TickflowQuoteProvider | MootdxProvider) -> None:
             while True:
                 if transport_failed.is_set():
                     return
@@ -437,7 +463,7 @@ class RealtimeMarketService:
         started = clock.monotonic()
         registered = self._registered_minute_targets(settings)
         selected = self._select_minute_targets(registered, settings)
-        self._ensure_provider_pools(settings)
+        await self._ensure_provider_pools(settings)
         queue: asyncio.Queue[str] = asyncio.Queue()
         for code in selected:
             queue.put_nowait(code)
@@ -460,7 +486,7 @@ class RealtimeMarketService:
                     timestamp = datetime.now(tz=ZoneInfo("UTC"))
                     if not rows:
                         empty += 1
-                        self._minute_meta_by_stock[code] = {"status": "no_intraday_data", "updated_at": timestamp.isoformat(), "round_id": round_id}
+                        self._minute_meta_by_stock[code] = {"status": "no_intraday_data", "updated_at": timestamp.isoformat(), "round_id": round_id, "source": "mootdx"}
                         continue
                     clean_rows = [self._normalize_minute(row) for row in rows]
                     self._minutes[code] = clean_rows
@@ -469,6 +495,7 @@ class RealtimeMarketService:
                         "updated_at": timestamp.isoformat(),
                         "bar_count": len(clean_rows),
                         "round_id": round_id,
+                        "source": "mootdx",
                         "features": self._minute_features(clean_rows),
                     }
                     updated += 1
@@ -476,7 +503,7 @@ class RealtimeMarketService:
                     await self._publish(f"stock:{code}", await self.stock(code))
                 except Exception as exc:
                     errors.append(f"minute[{code}]: {type(exc).__name__}: {exc}")
-                    self._minute_meta_by_stock[code] = {"status": "provider_error", "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat()}
+                    self._minute_meta_by_stock[code] = {"status": "provider_error", "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(), "source": "mootdx"}
                     transport_failed.set()
 
         await asyncio.gather(*(worker(provider) for provider in self._minute_providers))
@@ -555,7 +582,7 @@ class RealtimeMarketService:
         return {
             "as_of": datetime.now(tz=ZoneInfo("UTC")).isoformat(),
             "round_id": round_id,
-            "provider": "mootdx",
+            "provider": next((str(item.get("source")) for item in values if item.get("source")), self._settings.quote_provider),
             "items": {
                 "quote_count": len(values),
                 "up_count": up,
@@ -643,29 +670,63 @@ class RealtimeMarketService:
                 except asyncio.QueueFull:
                     pass
 
-    def _ensure_provider_pools(self, settings: RealtimeSettings) -> None:
-        self._resize_pool("quote", settings.quote_provider_pool_size)
-        self._resize_pool("minute", settings.minute_provider_pool_size)
-
-    def _resize_pool(self, kind: str, expected_size: int) -> None:
-        current = self._quote_providers if kind == "quote" else self._minute_providers
-        if len(current) == expected_size:
-            return
-        for provider in current:
-            provider.close()
-        updated = [self._new_realtime_provider() for _ in range(expected_size)]
-        if kind == "quote":
-            self._quote_providers = updated
+    async def _ensure_provider_pools(self, settings: RealtimeSettings) -> None:
+        if settings.quote_provider == "tickflow":
+            sessionmaker = get_sessionmaker()
+            async with sessionmaker() as session:
+                credentials = await TickflowProviderFactory(ConfigCenterRepository(session)).resolve_credentials()
+            identity = ("tickflow", credentials.fingerprint, credentials.endpoint_url, credentials.timeout_seconds)
+            if identity != self._quote_provider_identity:
+                self._close_providers(self._quote_providers)
+                self._quote_providers = []
+                self._quote_provider_identity = identity
+            self._tickflow_credentials = credentials
         else:
-            self._minute_providers = updated
+            identity = ("mootdx", None)
+            if identity != self._quote_provider_identity:
+                self._close_providers(self._quote_providers)
+                self._quote_providers = []
+                self._quote_provider_identity = identity
+            self._tickflow_credentials = None
+        self._resize_quote_pool(settings.quote_provider_pool_size, settings.quote_provider)
+        self._resize_minute_pool(settings.minute_provider_pool_size)
+
+    def _resize_quote_pool(self, expected_size: int, provider_code: str) -> None:
+        if len(self._quote_providers) == expected_size:
+            return
+        self._close_providers(self._quote_providers)
+        self._quote_providers = [self._new_quote_provider(provider_code) for _ in range(expected_size)]
+
+    def _resize_minute_pool(self, expected_size: int) -> None:
+        if len(self._minute_providers) == expected_size:
+            return
+        self._close_providers(self._minute_providers)
+        self._minute_providers = [self._new_minute_provider() for _ in range(expected_size)]
+
+    def _new_quote_provider(self, provider_code: str) -> TickflowQuoteProvider | MootdxProvider:
+        if provider_code == "mootdx":
+            return self._new_minute_provider()
+        if self._tickflow_credentials is None:
+            raise RuntimeError("TickFlow quote credentials are not loaded")
+        return TickflowQuoteProvider(self._tickflow_credentials)
 
     @staticmethod
-    def _new_realtime_provider() -> MootdxProvider:
+    def _new_minute_provider() -> MootdxProvider:
         provider = MootdxProvider()
         provider.timeout_seconds = 5
         provider.auto_retry = 1
         provider.fallback_server_limit = 2
         return provider
+
+    @staticmethod
+    def _close_providers(providers: list[object]) -> None:
+        for provider in providers:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # pragma: no cover - defensive close only.
+                    logger.debug("realtime provider close ignored: %s", exc)
 
     async def _load_settings(self, *, force: bool = False) -> RealtimeSettings:
         if not force and clock.monotonic() - self._settings_loaded_at < 30:
@@ -687,11 +748,14 @@ class RealtimeMarketService:
         return self._settings
 
     def _normalize_quote(self, row: dict) -> dict:
+        stock_code = normalize_symbol(str(row.get("stock_code") or ""))
         return {
-            "stock_code": normalize_symbol(str(row.get("stock_code") or "")),
-            "stock_name": self._stock_names.get(normalize_symbol(str(row.get("stock_code") or ""))),
+            "stock_code": stock_code,
+            "stock_name": row.get("stock_name") or self._stock_names.get(stock_code),
             "quote_time": row.get("quote_time").isoformat() if isinstance(row.get("quote_time"), datetime) else str(row.get("quote_time") or ""),
-            "source": "mootdx",
+            "source": str(row.get("source") or "mootdx"),
+            "source_symbol": row.get("source_symbol"),
+            "session": row.get("session"),
             "last_price": row.get("last_price"),
             "pre_close_price": row.get("pre_close_price"),
             "change_amount": row.get("change_amount"),
@@ -700,7 +764,9 @@ class RealtimeMarketService:
             "high_price": row.get("high_price"),
             "low_price": row.get("low_price"),
             "volume_hand": row.get("volume_hand"),
+            "volume_share": row.get("volume_share"),
             "amount_yuan": row.get("amount_yuan"),
+            "metadata": row.get("metadata_json") if isinstance(row.get("metadata_json"), dict) else None,
         }
 
     @staticmethod
@@ -758,6 +824,15 @@ class RealtimeMarketService:
 
     @staticmethod
     def _is_market_session(now: datetime) -> bool:
+        if now.weekday() >= 5:
+            return False
+        current = now.timetz().replace(tzinfo=None)
+        # TickFlow quote polling also covers the opening auction. MooTDX minute
+        # bars are deliberately gated by _is_continuous_market_session below.
+        return time(9, 15) <= current <= time(11, 30) or time(12, 55) <= current <= time(15, 0)
+
+    @staticmethod
+    def _is_continuous_market_session(now: datetime) -> bool:
         if now.weekday() >= 5:
             return False
         current = now.timetz().replace(tzinfo=None)

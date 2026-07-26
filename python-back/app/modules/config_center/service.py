@@ -164,6 +164,13 @@ class ConfigCenterService:
                 available = bool(probe.get("available"))
                 error = probe.get("error")
                 details = {key: value for key, value in probe.items() if key not in {"available", "error"}}
+            elif available and config and config.category_code == "market_data" and config.config_code == "tickflow":
+                from app.modules.realtime_market.tickflow_runtime import TickflowProviderFactory
+
+                probe = await TickflowProviderFactory(self.repository).probe_value(value_id)
+                available = probe.available
+                error = probe.error
+                details = probe.details
         except Exception as exc:
             error = str(exc)
         await self.repository.record_call(
@@ -284,5 +291,9 @@ class ConfigCenterService:
     def _validate_endpoint_url(config: SystemConfig, value_kind: str, endpoint_url: str | None) -> None:
         if endpoint_url is None:
             return
-        if config.category_code != "market_data" or config.config_code != "tushare_pro" or value_kind != "token":
-            raise ValueError("endpoint_url is only supported by market_data/tushare_pro token values")
+        supported = (
+            (config.category_code == "market_data" and config.config_code == "tushare_pro" and value_kind == "token")
+            or (config.category_code == "market_data" and config.config_code == "tickflow" and value_kind == "api_key")
+        )
+        if not supported:
+            raise ValueError("endpoint_url is only supported by market_data/tushare_pro tokens or market_data/tickflow API keys")

@@ -96,8 +96,13 @@ def test_on_demand_fetch_fills_individual_quote_and_minute_cache(monkeypatch):
 
     async def run() -> None:
         service = RealtimeMarketService()
-        providers = [QuoteProvider(), MinuteProvider()]
-        service._new_realtime_provider = lambda: providers.pop(0)
+        async def ensure_provider_pools(_settings):
+            return None
+
+        service._ensure_provider_pools = ensure_provider_pools
+        service._new_quote_provider = lambda _provider_code: QuoteProvider()
+        service._new_minute_provider = lambda: MinuteProvider()
+        service._is_continuous_market_session = lambda _now: True
         service._persist_minute_cache = lambda *_args, **_kwargs: asyncio.sleep(0)
         async def fake_key(*parts):
             return ":".join(parts)
@@ -115,7 +120,7 @@ def test_on_demand_fetch_fills_individual_quote_and_minute_cache(monkeypatch):
     asyncio.run(run())
 
 
-def test_empty_quote_batch_is_a_degraded_input_not_a_successful_round():
+def test_empty_quote_batch_is_a_degraded_input_not_a_successful_round(monkeypatch):
     class EmptyQuoteProvider:
         async def quote_batch(self, stock_codes):
             return [], []
@@ -124,6 +129,9 @@ def test_empty_quote_batch_is_a_degraded_input_not_a_successful_round():
         service = RealtimeMarketService()
         service._active_codes = ["600519"]
         service._quote_providers = [EmptyQuoteProvider()]
+        async def ensure_provider_pools(_settings):
+            return None
+        service._ensure_provider_pools = ensure_provider_pools
         rows, errors, transport_failed = await service._fetch_quotes(RealtimeSettings(quote_provider_pool_size=1))
         assert rows == []
         assert errors == ["quote_batch[600519..600519]: no_quote_data"]
