@@ -80,7 +80,7 @@ ON CONFLICT (job_code) DO UPDATE SET
 
 UPDATE t_scheduler_job
 SET
-    description = '18:00 并行沉淀个股日线、daily_basic、资金流、涨跌停/停复牌、核心指数和板块日线；使用 PostgreSQL 集合计算日频基础因子和技术快照，不再重复获取分钟线。',
+    description = '18:00 并行沉淀个股日线、daily_basic、资金流和核心指数；使用 PostgreSQL 集合计算日频基础因子和技术快照，不再重复获取分钟线。涨跌停/炸板与板块日线延后至 21:30 增强阶段。',
     parameter_schema = '{
         "trade_date":{"label":"交易日期","type":"string","required":false,"description":"为空时使用当前上海交易日。"},
         "ingest_mode":{"label":"入库模式","type":"string","default":"append_safe","required":false,"options":["append_safe","rebuild"]},
@@ -92,13 +92,13 @@ SET
         "sync_daily_basic":true,
         "sync_stock_technical_factor_pro":false,
         "sync_stock_moneyflow":true,
-        "sync_stock_limit_status":true,
+        "sync_stock_limit_status":false,
         "sync_lhb":false,
         "sync_index_bars":true,
         "sync_index_daily_basic":false,
         "sync_north_hold":false,
         "sync_market_stats":false,
-        "sync_sector_bars":true,
+        "sync_sector_bars":false,
         "sync_sector_moneyflow":false,
         "sync_minute":false,
         "calculate_daily_factors":true,
@@ -115,13 +115,13 @@ SET
     retry_count = 1,
     retry_interval_seconds = 300,
     metadata = COALESCE(metadata, '{}'::jsonb)
-        || '{"stage":"core","pipeline_version":4,"minute_stage_removed":true,"sector_bar_batch_size":500,"factor_mode":"postgres_set_based","source":"58-daily-close-four-stage-pipeline.sql"}'::jsonb,
+        || '{"stage":"core","pipeline_version":5,"minute_stage_removed":true,"late_facts_moved_to_enrichment":true,"factor_mode":"postgres_set_based","source":"58-daily-close-four-stage-pipeline.sql"}'::jsonb,
     updated_at = now()
 WHERE job_code = 'daily_close_core_ingest';
 
 UPDATE t_scheduler_job
 SET
-    description = '21:30 并行沉淀专业技术因子、龙虎榜、指数每日指标、市场统计和板块资金流；专业技术因子只定向合并到已有日频因子，daily_info 未发布时记为 deferred。',
+    description = '21:30 并行沉淀涨跌停/炸板与停复牌、板块日线、专业技术因子、龙虎榜、指数每日指标、市场统计和板块资金流；专业技术因子只定向合并到已有日频因子，daily_info 未发布时记为 deferred。',
     parameter_schema = '{
         "trade_date":{"label":"交易日期","type":"string","required":false,"description":"为空时使用当前上海交易日。"},
         "ingest_mode":{"label":"入库模式","type":"string","default":"append_safe","required":false,"options":["append_safe","rebuild"]},
@@ -134,13 +134,13 @@ SET
         "sync_daily_basic":false,
         "sync_stock_technical_factor_pro":true,
         "sync_stock_moneyflow":false,
-        "sync_stock_limit_status":false,
+        "sync_stock_limit_status":true,
         "sync_lhb":true,
         "sync_index_bars":false,
         "sync_index_daily_basic":true,
         "sync_north_hold":false,
         "sync_market_stats":true,
-        "sync_sector_bars":false,
+        "sync_sector_bars":true,
         "sync_sector_moneyflow":true,
         "sync_minute":false,
         "calculate_daily_factors":false,
@@ -158,7 +158,7 @@ SET
     retry_count = 1,
     retry_interval_seconds = 300,
     metadata = COALESCE(metadata, '{}'::jsonb)
-        || '{"stage":"enrichment","pipeline_version":4,"technical_factor_mode":"targeted_merge","late_optional_blocks":["market_stats"],"source":"58-daily-close-four-stage-pipeline.sql"}'::jsonb,
+        || '{"stage":"enrichment","pipeline_version":5,"technical_factor_mode":"targeted_merge","late_fact_blocks":["stock_limit_status","sector_bars"],"late_optional_blocks":["market_stats"],"sector_bar_batch_size":500,"source":"58-daily-close-four-stage-pipeline.sql"}'::jsonb,
     updated_at = now()
 WHERE job_code = 'daily_close_enrichment_ingest';
 

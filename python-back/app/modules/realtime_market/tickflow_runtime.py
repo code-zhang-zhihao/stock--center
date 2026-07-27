@@ -426,6 +426,112 @@ class TickflowQuoteProvider:
         }
 
 
+class TickflowKlineProvider:
+    """Small TickFlow K-line adapter for daily canonical fact ingestion.
+
+    The realtime service continues to own Quote and depth polling.  This
+    adapter is deliberately narrow: the close-ingest pipeline uses it only for
+    the seven current-day core index daily bars, while historical daily facts
+    remain on Tushare.
+    """
+
+    source = "tickflow"
+
+    def __init__(
+        self,
+        credentials: TickflowCredentials,
+        *,
+        client_factory: Callable[[TickflowCredentials], Any] | None = None,
+    ) -> None:
+        self.credentials = credentials
+        self._client_factory = client_factory or self._default_client
+        self._client: Any | None = None
+
+    async def daily_bars(self, source_symbol: str, *, count: int = 2) -> list[dict]:
+        """Return normalized unadjusted daily bars for an explicit source symbol."""
+        symbol = str(source_symbol).strip().upper()
+        if not symbol:
+            raise TickflowRuntimeError("TickFlow K-line symbol is required")
+        if count < 1:
+            raise TickflowRuntimeError("TickFlow K-line count must be positive")
+        return await asyncio.to_thread(self._daily_bars_sync, symbol, count)
+
+    def close(self) -> None:
+        client = self._client
+        self._client = None
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def _default_client(self, credentials: TickflowCredentials):
+        try:
+            from tickflow import TickFlow
+        except ImportError as exc:  # pragma: no cover - dependency is declared, retained for deployment diagnostics.
+            raise TickflowRuntimeError("TickFlow SDK is not installed") from exc
+        kwargs: dict[str, Any] = {
+            "api_key": credentials.api_key,
+            "timeout": credentials.timeout_seconds,
+            "max_retries": 1,
+        }
+        if credentials.endpoint_url:
+            kwargs["base_url"] = credentials.endpoint_url
+        return TickFlow(**kwargs)
+
+    def _daily_bars_sync(self, source_symbol: str, count: int) -> list[dict]:
+        client = self._get_client()
+        try:
+            response = client.klines.get(
+                source_symbol,
+                period="1d",
+                count=count,
+                adjust="none",
+                as_dataframe=False,
+            )
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow daily K-line request failed: {exc}") from exc
+        payload = _object_to_mapping(response)
+        nested = payload.get("data")
+        if isinstance(nested, dict):
+            payload = nested
+        timestamps = payload.get("timestamp")
+        if not isinstance(timestamps, list):
+            raise TickflowRuntimeError("TickFlow daily K-line response has no timestamp list")
+
+        def value_at(field: str, index: int) -> Any:
+            values = payload.get(field)
+            return values[index] if isinstance(values, list) and index < len(values) else None
+
+        rows: list[dict] = []
+        for index, timestamp in enumerate(timestamps):
+            open_price = safe_float(value_at("open", index))
+            high_price = safe_float(value_at("high", index))
+            low_price = safe_float(value_at("low", index))
+            close_price = safe_float(value_at("close", index))
+            if close_price is None:
+                continue
+            rows.append(
+                {
+                    "source_symbol": source_symbol,
+                    "bar_time": _as_utc_datetime(timestamp),
+                    "open_price": open_price,
+                    "high_price": high_price,
+                    "low_price": low_price,
+                    "close_price": close_price,
+                    "previous_close_price": safe_float(value_at("prev_close", index)),
+                    "volume": safe_float(value_at("volume", index)),
+                    "amount_yuan": safe_float(value_at("amount", index)),
+                }
+            )
+        return rows
+
+    def _get_client(self) -> Any:
+        client = self._client
+        if client is None:
+            client = self._client_factory(self.credentials)
+            self._client = client
+        return client
+
+
 def _object_to_mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value

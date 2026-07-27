@@ -61,12 +61,13 @@
 55. `55-data-asset-history-pipelines.sql`：建立历史初始化入口基线。新增 `t_stock_factor_daily.ma30/ma60` 和 `t_index_factor_daily`，seed 个股/板块/指数各“日频事实 + 日频因子”两段任务，并删除被替换的 7 条旧任务定义；历史运行日志保留。
 56. `56-sector-history-range-backfill.sql`：修正历史板块日频事实任务参数。`ths_daily` 改为逐板块一次完整日期区间请求，默认 12 个板块 worker；板块资金流默认使用已实测验证的 20 交易日窗口和 2 个窗口 worker。
 57. `57-stock-history-limit-events.sql`：将 `limit_list_d/suspend_d` 按交易日全市场查询阶段加入 `backfill_stock_daily_facts`，补齐 `t_limit_event_daily` 的历史涨跌停与停牌事件；把旧 `Z` 池归一为 `limit_break`，并兼容特定历史区间 U 池标志为空但带 `up_stat` 的响应。
-58. `58-daily-close-four-stage-pipeline.sql`：将每日收盘流水线升级为 15:30 分钟线/分钟因子、18:00 核心事实、21:30 增强事实、次日 08:00 缺口修复四级任务；分钟因子保留落库并按 200 股票分片集合计算。
+58. `58-daily-close-four-stage-pipeline.sql`：将每日收盘流水线升级为 15:30 分钟线/分钟因子、18:00 核心事实、21:30 增强事实、次日 08:00 缺口修复四级任务；分钟因子保留落库并按 200 股票分片集合计算。当前基线把涨跌停/炸板、停复牌与板块日线置于 21:30 增强阶段。
 59. `59-scheduler-job-tags-and-retire-obsolete-jobs.sql`：新增调度标签及任务-标签关联表，seed 历史/每日/主数据/策略标签，并删除三个无效或已替换的任务定义。
 60. `60-tickflow-realtime-quote.sql`：新增 `market_data/tickflow` 加密 API Key 配置，并将实时 Quote 路由设为 TickFlow；MooTDX 实时分钟线配置与缓存链路保持不变。
 61. `61-realtime-research-foundation.sql`：第一期实时研究底座。增加 ST 主数据标识、TickFlow 标的池目录/成员有效期、REST Quote/五档深度额度配置，并将实时默认值收口为 60 秒全市场、10 秒候选 Quote/深度、6 路 MooTDX 分钟线。
 62. `62-data-assets-cache-performance-indexes.sql`：为数据中心的最新交易日覆盖率补充 `trade_date + stock_code` 前导索引，并刷新大表统计信息；必须由对应表 owner 在非事务会话执行。
 63. `63-realtime-runtime-stabilization.sql`：创建股票池一对一实时策略表，seed 系统池实时优先级/Quote/分钟档位，禁用动态全市场池作为目标，并将 TickFlow 实时限频安全比例设为 90%。
+64. `64-daily-close-late-facts-enrichment.sql`：将已执行旧四级流水线的涨跌停/炸板、停复牌和板块日线从 18:00 核心任务迁到 21:30 增强任务，只更新调度描述、默认 payload 和 metadata。
 
 ## 产品化初始化规划
 
@@ -100,6 +101,8 @@ docs/sql/db-init.sql
 `18-market-partition-owner-fix.sql` 必须由 `postgres` 或当前分区父表 owner 执行。后端应用账号需要成为 `t_minute_bar/t_stock_factor_minute` 分区体系 owner，才能在每日收盘任务中自动创建当天分区并清理过期分区。
 
 `58-daily-close-four-stage-pipeline.sql` 不删除业务数据。它新增并默认启用 `daily_close_minute_ingest`，更新三个既有收盘任务的 cron、参数、超时和重试策略。脚本执行后需要 reload Scheduler；分钟线和分钟因子都保留最近 30 个交易日，分钟因子默认每 200 只股票一个 PostgreSQL 事务，可在 50–500 之间调整。
+
+`64-daily-close-late-facts-enrichment.sql` 适用于已经执行过旧版 `58` 的数据库。它只把 `daily_close_core_ingest.default_payload` 中的 `sync_stock_limit_status/sync_sector_bars` 改为 `false`，并把同两个开关在 `daily_close_enrichment_ingest.default_payload` 中改为 `true`；不会删除已入库事件、板块行情或历史运行记录。执行后 reload Scheduler。新环境执行已更新的 `58` 后也可以安全执行 `64`，结果一致。
 
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 

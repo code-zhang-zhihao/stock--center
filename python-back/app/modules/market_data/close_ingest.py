@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
@@ -23,12 +23,17 @@ from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.indicator_engine.repository import IndicatorRepository
 from app.modules.indicator_engine.service import IndicatorEngineService
 from app.modules.market_data.contracts import CanonicalMappingResult
-from app.modules.market_data.providers import frame_records, first, MootdxProvider, normalize_symbol, parse_date, safe_float, safe_int
+from app.modules.market_data.providers import MootdxProvider, normalize_symbol, parse_date, safe_float, safe_int
 from app.modules.market_data.partitioning import ensure_market_partitions
 from app.modules.market_data.repository import MarketDataRepository
 from app.modules.market_data.tushare.contracts import TushareApiRequest
 from app.modules.market_data.tushare.adapters import TushareMarketAdapter, TushareStockDailyAdapter
 from app.modules.market_data.tushare_runtime import TushareProviderFactory, TushareRuntimeError
+from app.modules.realtime_market.tickflow_runtime import (
+    TickflowKlineProvider,
+    TickflowProviderFactory,
+    TickflowRuntimeError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -119,16 +124,15 @@ class DailyMarketCloseIngestService:
 
     minute_complete_threshold = 230
     daily_minimum_floor = 3000
-    index_akshare_timeout_seconds = 5
+    core_index_tickflow_max_concurrency = 3
     core_index_codes = ("000001.SH", "399001.SZ", "399006.SZ", "000300.SH", "000905.SH", "000852.SH", "000016.SH")
 
     def __init__(self, repository: MarketDataRepository, config_repository: ConfigCenterRepository) -> None:
         self.repository = repository
         self.config_repository = config_repository
         self.tushare = TushareProviderFactory(config_repository)
-        # Index fallback must be bounded.  A TDX host can accept TCP while
-        # returning no protocol data; do not let seven core indexes each wait
-        # through the provider's general-purpose 30-second retry policy.
+        # This client is used only by the minute-ingest stage.  Core index
+        # daily bars use TickFlow/Tushare and must never enter a TDX host scan.
         self.mootdx = MootdxProvider(
             timeout_seconds=2,
             auto_retry=0,
@@ -356,10 +360,8 @@ class DailyMarketCloseIngestService:
                 payload.sync_daily,
                 payload.sync_daily_basic,
                 payload.sync_stock_moneyflow,
-                payload.sync_stock_limit_status,
                 payload.sync_index_bars,
                 payload.sync_north_hold,
-                payload.sync_sector_bars,
             )
         ):
             result.stage_timings["core_fact_blocks"] = int((perf_counter() - core_started) * 1000)
@@ -545,13 +547,6 @@ class DailyMarketCloseIngestService:
                 "operation": lambda service: service._sync_stock_moneyflow(trade_date, universe_set),
             },
             {
-                "label": "stock limit/suspend",
-                "enabled": payload.sync_stock_limit_status,
-                "target": "stock_limit_rows",
-                "fail_on_error": payload.fail_on_enrichment_error,
-                "operation": lambda service: service._sync_stock_limit_status(trade_date, universe_set),
-            },
-            {
                 "label": "index bars",
                 "enabled": payload.sync_index_bars,
                 "target": "index_bar_rows",
@@ -564,13 +559,6 @@ class DailyMarketCloseIngestService:
                 "target": "north_hold_rows",
                 "fail_on_error": payload.fail_on_enrichment_error,
                 "operation": lambda service: service._sync_north_hold(trade_date, universe_set, result),
-            },
-            {
-                "label": "sector bars",
-                "enabled": payload.sync_sector_bars,
-                "target": "sector_bar_rows",
-                "fail_on_error": payload.fail_on_enrichment_error,
-                "operation": lambda service: service._sync_sector_bars(trade_date, result),
             },
         ]
         enabled_specs = [spec for spec in specs if spec["enabled"]]
@@ -646,6 +634,24 @@ class DailyMarketCloseIngestService:
         universe_set: set[str],
     ) -> None:
         block_specs: list[dict[str, Any]] = [
+            {
+                "label": "stock limit/suspend",
+                "enabled": payload.sync_stock_limit_status,
+                "target": "stock_limit_rows",
+                "mode": "single_date",
+                "range_start_date": trade_date,
+                "range_end_date": trade_date,
+                "operation": lambda service: service._sync_stock_limit_status(trade_date, universe_set),
+            },
+            {
+                "label": "sector bars",
+                "enabled": payload.sync_sector_bars,
+                "target": "sector_bar_rows",
+                "mode": "single_date",
+                "range_start_date": trade_date,
+                "range_end_date": trade_date,
+                "operation": lambda service: service._sync_sector_bars(trade_date, result),
+            },
             {
                 "label": "stock technical factor pro",
                 "enabled": payload.sync_stock_technical_factor_pro,
@@ -1077,140 +1083,112 @@ class DailyMarketCloseIngestService:
             normalize_symbol(index_code): index_code
             for index_code in self.core_index_codes
         }
-        response = await self._tushare_response(
-            "index_daily",
-            {"trade_date": trade_date},
-            capability="daily_market_close_index_bars",
-        )
-        records = list(response.records)
-        fallback_used: dict[str, str] = {}
-        returned_codes = {
-            normalize_symbol(str(record.get("ts_code") or ""))
-            for record in records
+        tickflow_rows, tickflow_errors = await self._tickflow_index_daily_rows(trade_date)
+        rows_by_code = {
+            normalize_symbol(str(row.get("index_code") or "")): row
+            for row in tickflow_rows
+            if normalize_symbol(str(row.get("index_code") or "")) in core_codes
         }
-        missing_normalized = [
-            code
-            for code in core_codes
-            if code not in returned_codes
-        ]
+        tickflow_missing = [code for code in core_codes if code not in rows_by_code]
+        tickflow_missing_set = set(tickflow_missing)
+        tushare_rows: list[dict] = []
+        tushare_raw_rows = 0
+        tushare_error: str | None = None
 
-        if missing_normalized:
-            async def fetch_akshare(code: str) -> list[dict]:
-                try:
-                    return await asyncio.wait_for(
-                        self._akshare_index_daily_records(
-                            core_codes[code],
-                            trade_date,
-                        ),
-                        timeout=self.index_akshare_timeout_seconds,
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        "daily close ingest akshare index fallback timed out: "
-                        "index=%s timeout_seconds=%s",
-                        core_codes[code],
-                        self.index_akshare_timeout_seconds,
-                    )
-                    return []
-
-            akshare_results = await asyncio.gather(
-                *(fetch_akshare(code) for code in missing_normalized)
-            )
-            for code, fallback_records in zip(
-                missing_normalized,
-                akshare_results,
-                strict=True,
-            ):
-                if not fallback_records:
-                    continue
-                records.extend(fallback_records)
-                fallback_used[code] = "akshare:stock_zh_index_daily_em"
-
-        returned_codes = {
-            normalize_symbol(str(record.get("ts_code") or ""))
-            for record in records
-        }
-        tdx_candidates = [
-            code
-            for code in core_codes
-            if code not in returned_codes
-        ]
-        tdx_error: str | None = None
-        for code in tdx_candidates:
+        if tickflow_missing:
             try:
-                fallback_records = await self._mootdx_index_daily_records(
-                    core_codes[code],
+                response = await self._tushare_response(
+                    "index_daily",
+                    {"trade_date": trade_date},
+                    capability="daily_market_close_index_bars_tushare_fallback",
+                )
+                tushare_raw_rows = len(response.records)
+                fallback_records = [
+                    record
+                    for record in response.records
+                    if normalize_symbol(str(record.get("ts_code") or "")) in tickflow_missing_set
+                ]
+                mapping = self.tushare_market_adapter.map_index_daily(
+                    fallback_records,
+                    trade_date=trade_date,
+                    index_codes=tickflow_missing_set,
+                )
+                self._log_mapping_summary(mapping)
+                result.warnings.extend(mapping.warnings)
+                tushare_rows = mapping.rows
+                rows_by_code.update(
+                    {
+                        normalize_symbol(str(row.get("index_code") or "")): row
+                        for row in tushare_rows
+                    }
+                )
+                await self._capture_raw_summary(
+                    "daily_market_close_index_bars_tushare_fallback",
                     trade_date,
+                    response.raw_payload,
+                    len(tushare_rows),
+                    normalized_table="t_index_bar",
+                    provider_code="tushare",
                 )
-            except Exception as exc:
-                # One provider-level failure means the bounded host scan found
-                # no usable TDX node.  Repeating the same scan for every index
-                # only multiplies the delay without improving coverage.
-                tdx_error = f"{type(exc).__name__}: {exc}"
+            except DailyMarketCloseIngestError as exc:
+                tushare_error = str(exc)
                 logger.warning(
-                    "daily close ingest mootdx index fallback unavailable: "
-                    "first_index=%s remaining=%s error=%s",
-                    core_codes[code],
-                    len(tdx_candidates),
-                    tdx_error,
+                    "daily close ingest Tushare index fallback failed: missing=%s error=%s",
+                    [core_codes[code] for code in tickflow_missing],
+                    tushare_error,
                 )
-                break
-            if fallback_records:
-                records.extend(fallback_records)
-                fallback_used[code] = "mootdx:index"
 
-        mapping = self.tushare_market_adapter.map_index_daily(
-            records,
-            trade_date=trade_date,
-            index_codes=set(core_codes),
-        )
-        self._log_mapping_summary(mapping)
-        result.warnings.extend(mapping.warnings)
-        rows = mapping.rows
-        mapped_codes = {
-            normalize_symbol(str(row.get("index_code") or ""))
-            for row in rows
+        rows = [rows_by_code[code] for code in core_codes if code in rows_by_code]
+        missing_codes = [index_code for code, index_code in core_codes.items() if code not in rows_by_code]
+        fallback_used = {
+            code: "tushare:index_daily"
+            for code in tickflow_missing
+            if code in rows_by_code
         }
-        missing_codes = [
-            index_code
-            for code, index_code in core_codes.items()
-            if code not in mapped_codes
-        ]
         await self._capture_raw_summary(
             "daily_market_close_index_bars",
             trade_date,
             {
+                "api_name": "klines",
+                "period": "1d",
+                "adjust": "none",
                 "index_codes": list(self.core_index_codes),
-                "tushare_request_mode": "batch_trade_date",
-                "tushare_rows": len(response.records),
+                "tickflow_request_count": len(self.core_index_codes),
+                "tickflow_rows": len(tickflow_rows),
+                "tickflow_errors": tickflow_errors,
+                "tushare_fallback_requested": [core_codes[code] for code in tickflow_missing],
+                "tushare_raw_rows": tushare_raw_rows,
+                "tushare_error": tushare_error,
                 "missing_codes": missing_codes,
                 "fallback_used": fallback_used,
-                "mootdx_error": tdx_error,
             },
-            len(rows),
+            len(tickflow_rows),
             normalized_table="t_index_bar",
+            provider_code="tickflow",
         )
         if fallback_used:
             result.warnings.append(
-                "index_daily fallback_used: "
-                + ", ".join(f"{code}->{source}" for code, source in sorted(fallback_used.items()))
+                "index_daily Tushare fallback_used: "
+                + ", ".join(f"{core_codes[code]}->{source}" for code, source in sorted(fallback_used.items()))
             )
-        if tdx_error:
+        if tickflow_errors:
             result.warnings.append(
-                "MooTDX index fallback unavailable after bounded host scan: "
-                + tdx_error[:300]
+                "TickFlow index daily unavailable: "
+                + ", ".join(f"{core_codes[code]} ({error})" for code, error in sorted(tickflow_errors.items()))[:1000]
             )
+        if tushare_error:
+            result.warnings.append("Tushare index_daily fallback unavailable: " + tushare_error[:300])
         if missing_codes:
             result.warnings.append(f"index_daily 缺失指数: {', '.join(missing_codes)}")
         upserted = await self.repository.upsert_index_bar_rows(rows)
         logger.info(
             "provider canonical upsert: provider=%s api=%s capability=%s table=%s range=%s raw=%s mapped=%s upserted=%s missing=%s warnings=%s",
-            "tushare",
-            "index_daily",
+            "tickflow+tushare",
+            "klines/index_daily",
             "index_daily",
             "t_index_bar",
             {"trade_date": trade_date.isoformat()},
-            "mixed_per_index",
+            {"tickflow": len(tickflow_rows), "tushare": len(tushare_rows)},
             len(rows),
             upserted,
             len(missing_codes),
@@ -1218,72 +1196,92 @@ class DailyMarketCloseIngestService:
         )
         return upserted
 
-    async def _akshare_index_daily_records(self, index_code: str, trade_date: date) -> list[dict]:
-        code = normalize_symbol(index_code)
-        symbol = f"sz{code}" if code.startswith("399") else f"sh{code}"
+    async def _tickflow_index_daily_rows(self, trade_date: date) -> tuple[list[dict], dict[str, str]]:
+        """Fetch only same-day core-index K-lines; stale bars are intentionally rejected."""
+        try:
+            credentials = await TickflowProviderFactory(self.config_repository).resolve_realtime_credentials()
+        except Exception as exc:  # A bad TickFlow configuration must not suppress the Tushare fallback.
+            error = str(exc)
+            return [], {normalize_symbol(index_code): error for index_code in self.core_index_codes}
 
-        def fetch() -> list[dict]:
-            import akshare as ak
+        provider = TickflowKlineProvider(credentials)
+        semaphore = asyncio.Semaphore(self.core_index_tickflow_max_concurrency)
 
-            raw_rows = frame_records(
-                ak.stock_zh_index_daily_em(
-                    symbol=symbol,
-                    start_date=trade_date.strftime("%Y%m%d"),
-                    end_date=trade_date.strftime("%Y%m%d"),
-                )
-            )
-            rows: list[dict] = []
-            for item in raw_rows:
-                row_date = parse_date(first(item, ["date", "日期"]))
-                if row_date != trade_date:
-                    continue
-                amount_yuan = safe_float(first(item, ["amount", "成交额"]))
-                rows.append(
-                    {
-                        "ts_code": code,
-                        "trade_date": row_date,
-                        "source": "akshare:stock_zh_index_daily_em",
-                        "open": safe_float(first(item, ["open", "开盘"])),
-                        "high": safe_float(first(item, ["high", "最高"])),
-                        "low": safe_float(first(item, ["low", "最低"])),
-                        "close": safe_float(first(item, ["close", "收盘"])),
-                        "pct_chg": safe_float(first(item, ["涨跌幅", "change_pct"])),
-                        "vol": safe_float(first(item, ["volume", "成交量"])),
-                        "amount": amount_yuan / 1000 if amount_yuan is not None else None,
-                        "raw": item,
-                    }
-                )
-            return rows
+        async def fetch(index_code: str) -> tuple[dict | None, str | None]:
+            try:
+                async with semaphore:
+                    bars = await provider.daily_bars(index_code, count=2)
+            except TickflowRuntimeError as exc:
+                return None, str(exc)
+            except Exception as exc:  # pragma: no cover - defensive SDK boundary.
+                return None, f"{type(exc).__name__}: {exc}"
+            row = self._tickflow_index_daily_row(index_code, trade_date, bars)
+            if row is None:
+                return None, f"no {trade_date.isoformat()} daily bar returned"
+            return row, None
 
         try:
-            return await asyncio.to_thread(fetch)
-        except Exception as exc:
-            logger.warning("daily close ingest akshare index fallback failed: %s %s", index_code, exc)
-            return []
+            fetched = await asyncio.gather(*(fetch(index_code) for index_code in self.core_index_codes))
+        finally:
+            await asyncio.to_thread(provider.close)
 
-    async def _mootdx_index_daily_records(self, index_code: str, trade_date: date) -> list[dict]:
-        rows, _raw = await self.mootdx.index_bars(normalize_symbol(index_code), limit=10)
-        records: list[dict] = []
-        for row in rows:
-            if row.get("trade_date") != trade_date:
-                continue
-            amount_yuan = safe_float(row.get("amount_yuan"))
-            records.append(
-                {
-                    "ts_code": normalize_symbol(index_code),
-                    "trade_date": row.get("trade_date"),
-                    "source": "mootdx:index",
-                    "open": row.get("open_price"),
-                    "high": row.get("high_price"),
-                    "low": row.get("low_price"),
-                    "close": row.get("close_price"),
-                    "pct_chg": row.get("change_pct"),
-                    "vol": None,
-                    "amount": amount_yuan / 1000 if amount_yuan is not None else None,
-                    "raw": row.get("metadata_json", {}).get("raw", row),
-                }
-            )
-        return records
+        rows: list[dict] = []
+        errors: dict[str, str] = {}
+        for index_code, (row, error) in zip(self.core_index_codes, fetched, strict=True):
+            normalized = normalize_symbol(index_code)
+            if row is not None:
+                rows.append(row)
+            elif error:
+                errors[normalized] = error
+        return rows, errors
+
+    @staticmethod
+    def _tickflow_index_daily_row(index_code: str, trade_date: date, bars: list[dict]) -> dict | None:
+        target_bars = [
+            bar
+            for bar in bars
+            if isinstance(bar.get("bar_time"), datetime)
+            and bar["bar_time"].astimezone(SHANGHAI).date() == trade_date
+        ]
+        if not target_bars:
+            return None
+        current = max(target_bars, key=lambda bar: bar["bar_time"])
+        current_time = current["bar_time"]
+        previous_bars = [
+            bar
+            for bar in bars
+            if isinstance(bar.get("bar_time"), datetime) and bar["bar_time"] < current_time
+        ]
+        previous_close = safe_float(current.get("previous_close_price"))
+        if previous_close is None and previous_bars:
+            previous_close = safe_float(max(previous_bars, key=lambda bar: bar["bar_time"]).get("close_price"))
+        close_price = safe_float(current.get("close_price"))
+        change_pct = (
+            round((close_price - previous_close) / previous_close * 100, 6)
+            if close_price is not None and previous_close not in (None, 0)
+            else None
+        )
+        return {
+            "index_code": normalize_symbol(index_code),
+            "trade_date": trade_date,
+            "source": "tickflow:klines",
+            "open_price": safe_float(current.get("open_price")),
+            "high_price": safe_float(current.get("high_price")),
+            "low_price": safe_float(current.get("low_price")),
+            "close_price": close_price,
+            "change_pct": change_pct,
+            "volume": safe_float(current.get("volume")),
+            "amount_yuan": safe_float(current.get("amount_yuan")),
+            "metadata_json": {
+                "provider": "tickflow",
+                "api_name": "klines",
+                "source_symbol": current.get("source_symbol"),
+                "period": "1d",
+                "adjust": "none",
+                "bar_time_utc": current_time.astimezone(timezone.utc).isoformat(),
+                "amount_unit": "yuan",
+            },
+        }
 
     async def _sync_index_daily_basic(self, trade_date: date, *, start_date: date | None = None, end_date: date | None = None) -> int:
         request_start_date = start_date or trade_date
@@ -1769,12 +1767,21 @@ class DailyMarketCloseIngestService:
         code = normalize_symbol(stock_code)
         return code.startswith(("0", "3", "6"))
 
-    async def _capture_raw_summary(self, capability: str, trade_date: date, payload: dict, row_count: int, *, normalized_table: str | None = None) -> None:
+    async def _capture_raw_summary(
+        self,
+        capability: str,
+        trade_date: date,
+        payload: dict,
+        row_count: int,
+        *,
+        normalized_table: str | None = None,
+        provider_code: str = "tushare",
+    ) -> None:
         stored_payload = self._compact_raw_payload(payload, row_count=row_count)
         await self.repository.insert_raw(
             {
                 "trace_id": uuid4().hex,
-                "provider_code": "tushare",
+                "provider_code": provider_code,
                 "capability": capability,
                 "request_params": {"trade_date": trade_date.isoformat()},
                 "record_key": trade_date.isoformat(),
@@ -1899,16 +1906,16 @@ class DailyMarketCloseIngestService:
             "daily_bars": coverage["daily_bars"] >= 0.95,
             "daily_basic": coverage["daily_basic"] >= 0.95,
             "stock_moneyflow": coverage["stock_moneyflow"] >= 0.95,
-            "stock_events": event_complete,
             "index_bars": coverage["index_bars"] >= 0.85,
-            "sector_bars": coverage["sector_bars"] >= 0.90,
             "daily_factors": coverage["daily_factors"] >= 0.95,
             "technical_snapshots": coverage["technical_snapshots"] >= 0.95,
         }
         enhancement_checks = {
+            "stock_events": event_complete,
             "stock_technical": coverage["stock_technical"] >= 0.95,
             "lhb": lhb_complete,
             "index_daily_basic": coverage["index_daily_basic"] >= 0.85,
+            "sector_bars": coverage["sector_bars"] >= 0.90,
             "sector_moneyflow": sector_moneyflow_complete,
             "sector_factors": int(counts.get("sector_factor") or 0) > 0,
         }
@@ -1923,11 +1930,17 @@ class DailyMarketCloseIngestService:
                     counts.get(
                         {
                             "daily_bars": "daily_bar",
+                            "daily_basic": "daily_basic",
+                            "stock_moneyflow": "stock_moneyflow",
                             "stock_events": "limit_event",
+                            "index_bars": "index_bar",
                             "daily_factors": "daily_factor",
                             "technical_snapshots": "technical_snapshot",
                             "stock_technical": "stock_technical",
                             "lhb": "lhb_event",
+                            "index_daily_basic": "index_daily_basic",
+                            "sector_bars": "sector_bar",
+                            "sector_moneyflow": "sector_moneyflow",
                             "sector_factors": "sector_factor",
                         }.get(name, name),
                         0,
