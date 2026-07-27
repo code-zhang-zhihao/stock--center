@@ -1,9 +1,20 @@
 from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock, StockFactorDaily, TradeCalendar
+from app.modules.market_data.models import (
+    DailyBar,
+    LimitEventDaily,
+    MarketUniverse,
+    MarketUniverseMember,
+    ProviderRawRecord,
+    SectorBasic,
+    SectorComponent,
+    Stock,
+    StockFactorDaily,
+    TradeCalendar,
+)
 from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
 
 
@@ -58,6 +69,143 @@ class RealtimeMarketRepository:
         return trade_date, {
             stock_code: {"ma5": ma5, "ma20": ma20, "ma60": ma60}
             for stock_code, ma5, ma20, ma60 in rows.all()
+        }
+
+    async def latest_post_close_limit_events(self, *, lookback_trade_days: int = 20) -> dict:
+        """Read the completed limit-event facts needed by the post-close board ladder.
+
+        The caller receives the provider completion evidence separately from
+        event rows.  This is important because a legitimate zero-row
+        `limit_list_d` response is different from a date that was never
+        ingested.
+        """
+        active_filters = (
+            Stock.status == "active",
+            Stock.is_st.is_(False),
+            Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
+        )
+        # This must remain an index-friendly date lookup.  Joining the entire
+        # history to the active stock universe before ``max(trade_date)``
+        # forces a costly scan on a large daily-bar table.  We validate active
+        # daily-bar coverage separately below, using the chosen newest date.
+        target_date = (await self.session.execute(select(func.max(DailyBar.trade_date)))).scalar_one_or_none()
+        if target_date is None:
+            return {
+                "trade_date": None,
+                "trade_dates": [],
+                "active_count": 0,
+                "daily_bar_count": 0,
+                "limit_event_complete": False,
+                "completion_capabilities": [],
+                "events": [],
+            }
+
+        trade_dates = (
+            await self.session.execute(
+                select(TradeCalendar.trade_date)
+                .where(
+                    TradeCalendar.market == "CN",
+                    TradeCalendar.is_open.is_(True),
+                    TradeCalendar.trade_date <= target_date,
+                )
+                .order_by(TradeCalendar.trade_date.desc())
+                .limit(max(2, lookback_trade_days))
+            )
+        ).scalars().all()
+        if target_date not in trade_dates:
+            trade_dates = [target_date, *trade_dates]
+        trade_dates = list(dict.fromkeys(trade_dates))[: max(2, lookback_trade_days)]
+
+        completion_rows = await self.session.execute(
+            select(ProviderRawRecord.capability).where(
+                ProviderRawRecord.status == "captured",
+                ProviderRawRecord.normalized_table == "t_limit_event_daily",
+                ProviderRawRecord.normalized_pk == target_date.isoformat(),
+            )
+        )
+        completion_capabilities = sorted({str(value) for value in completion_rows.scalars().all() if value})
+        limit_event_complete = bool(
+            {"daily_market_close_stock_limit", "stock_limit_event_history_backfill"}.intersection(completion_capabilities)
+        )
+
+        active_count = (
+            await self.session.execute(select(func.count()).select_from(Stock).where(*active_filters))
+        ).scalar_one()
+        daily_bar_count = (
+            await self.session.execute(
+                select(func.count())
+                .select_from(DailyBar)
+                .join(Stock, Stock.stock_code == DailyBar.stock_code)
+                .where(DailyBar.trade_date == target_date, *active_filters)
+            )
+        ).scalar_one()
+        rows = await self.session.execute(
+            select(
+                LimitEventDaily.stock_code,
+                Stock.stock_name,
+                LimitEventDaily.trade_date,
+                LimitEventDaily.event_type,
+                LimitEventDaily.close_price,
+                LimitEventDaily.limit_price,
+                LimitEventDaily.first_time,
+                LimitEventDaily.last_time,
+                LimitEventDaily.open_count,
+                LimitEventDaily.turnover_amount,
+                DailyBar.change_pct,
+                DailyBar.amount_yuan,
+            )
+            .join(Stock, Stock.stock_code == LimitEventDaily.stock_code)
+            .outerjoin(
+                DailyBar,
+                and_(
+                    DailyBar.stock_code == LimitEventDaily.stock_code,
+                    DailyBar.trade_date == LimitEventDaily.trade_date,
+                ),
+            )
+            .where(
+                LimitEventDaily.trade_date.in_(trade_dates),
+                LimitEventDaily.event_type.in_(("limit_up", "limit_down", "limit_break")),
+                *active_filters,
+            )
+            .order_by(LimitEventDaily.trade_date.desc(), LimitEventDaily.event_type, LimitEventDaily.stock_code)
+        )
+        return {
+            "trade_date": target_date,
+            "trade_dates": trade_dates,
+            "active_count": int(active_count or 0),
+            "daily_bar_count": int(daily_bar_count or 0),
+            "limit_event_complete": limit_event_complete,
+            "completion_capabilities": completion_capabilities,
+            "events": [
+                {
+                    "stock_code": stock_code,
+                    "stock_name": stock_name,
+                    "trade_date": trade_date,
+                    "event_type": event_type,
+                    "close_price": close_price,
+                    "limit_price": limit_price,
+                    "first_time": first_time,
+                    "last_time": last_time,
+                    "open_count": open_count,
+                    "turnover_amount": turnover_amount,
+                    "change_pct": change_pct,
+                    "amount_yuan": amount_yuan,
+                }
+                for (
+                    stock_code,
+                    stock_name,
+                    trade_date,
+                    event_type,
+                    close_price,
+                    limit_price,
+                    first_time,
+                    last_time,
+                    open_count,
+                    turnover_amount,
+                    change_pct,
+                    amount_yuan,
+                ) in rows.all()
+            ],
         }
 
     async def sector_reference(self) -> tuple[dict[str, dict], dict[str, list[str]], dict[str, list[str]]]:

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from app.modules.realtime_market.schemas import RealtimeBlockMeta, RealtimeSettings
 from app.modules.realtime_market.service import RealtimeMarketService
@@ -183,6 +183,67 @@ def test_market_overview_combines_live_structure_with_completed_daily_ma_referen
     }
     assert overview["items"]["top_amount"][0]["stock_code"] == "600002"
     assert overview["items"]["top_volume"][0]["stock_code"] == "600001"
+
+
+def test_post_close_structure_builds_ladder_only_from_completed_limit_events():
+    target_date = date(2026, 7, 24)
+    raw = {
+        "trade_date": target_date,
+        "trade_dates": [target_date, date(2026, 7, 23), date(2026, 7, 22), date(2026, 7, 21)],
+        "active_count": 4,
+        "daily_bar_count": 4,
+        "limit_event_complete": True,
+        "completion_capabilities": ["daily_market_close_stock_limit"],
+        "events": [
+            {"stock_code": "600001", "stock_name": "三连板", "trade_date": target_date, "event_type": "limit_up", "first_time": time(9, 31), "open_count": 0},
+            {"stock_code": "600001", "stock_name": "三连板", "trade_date": date(2026, 7, 23), "event_type": "limit_up"},
+            {"stock_code": "600001", "stock_name": "三连板", "trade_date": date(2026, 7, 22), "event_type": "limit_up"},
+            {"stock_code": "600002", "stock_name": "二连板", "trade_date": target_date, "event_type": "limit_up", "first_time": time(9, 40), "open_count": 1},
+            {"stock_code": "600002", "stock_name": "二连板", "trade_date": date(2026, 7, 23), "event_type": "limit_up"},
+            {"stock_code": "600003", "stock_name": "首板", "trade_date": target_date, "event_type": "limit_up", "first_time": time(9, 25), "open_count": 0},
+            {"stock_code": "600004", "stock_name": "炸板", "trade_date": target_date, "event_type": "limit_break", "open_count": 3, "turnover_amount": 200_000_000},
+            {"stock_code": "600005", "stock_name": "跌停", "trade_date": target_date, "event_type": "limit_down"},
+        ],
+    }
+
+    structure = RealtimeMarketService._build_post_close_structure(raw)
+
+    assert structure["available"] is True
+    assert structure["trade_date"] == "2026-07-24"
+    assert structure["daily_bar_coverage_pct"] == 100.0
+    assert structure["summary"] == {
+        "limit_up_count": 3,
+        "limit_down_count": 1,
+        "limit_break_count": 1,
+        "seal_rate_pct": 75.0,
+        "highest_board_count": 3,
+        "highest_board_stock_count": 1,
+    }
+    assert [(item["board_count"], item["stocks"][0]["stock_name"]) for item in structure["ladders"]] == [
+        (3, "三连板"),
+        (2, "二连板"),
+        (1, "首板"),
+    ]
+    assert structure["limit_breaks"][0]["stock_name"] == "炸板"
+    assert structure["limit_breaks"][0]["open_count"] == 3
+
+
+def test_post_close_structure_does_not_treat_unfinished_zero_event_date_as_zero_limit_market():
+    structure = RealtimeMarketService._build_post_close_structure(
+        {
+            "trade_date": date(2026, 7, 24),
+            "trade_dates": [date(2026, 7, 24)],
+            "active_count": 2,
+            "daily_bar_count": 2,
+            "limit_event_complete": False,
+            "completion_capabilities": [],
+            "events": [],
+        }
+    )
+
+    assert structure["available"] is False
+    assert structure["reason"] == "limit_event_ingest_incomplete"
+    assert structure["summary"] is None
 
 
 def test_concept_strength_exposes_explainable_heat_and_intraday_rank_delta():

@@ -35,7 +35,7 @@
 </template>
 
 <script setup lang="ts">
-import { Activity, CalendarClock, Database, Gauge, Layers3, LineChart, ListChecks, Settings, ShieldCheck } from 'lucide-vue-next';
+import { Activity, CalendarClock, Database, FileText, Gauge, Layers3, LineChart, ListChecks, Settings, ShieldCheck } from 'lucide-vue-next';
 import { useRoute } from 'vue-router';
 
 const route = useRoute();
@@ -44,6 +44,7 @@ const navItems = [
   { path: '/settings/search', matchPrefix: '/settings', label: '系统设置中心', icon: Settings },
   { path: '/data-center', matchPrefix: '/data-center', label: '数据中心', icon: Database },
   { path: '/market-overview', matchPrefix: '/market-overview', label: '实时市场总览', icon: Gauge },
+  { path: '/post-close-market', matchPrefix: '/post-close-market', label: '盘后市场复盘', icon: FileText },
   { path: '/scheduler', matchPrefix: '/scheduler', label: '调度任务', icon: CalendarClock },
   { path: '/sector-dashboard', matchPrefix: '/sector-dashboard', label: '板块资金大屏', icon: Activity },
   { path: '/sectors', matchPrefix: '/sectors', label: '板块中心', icon: Layers3 },

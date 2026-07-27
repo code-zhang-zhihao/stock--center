@@ -37,6 +37,9 @@ ON_DEMAND_QUOTE_REQUEST_RESERVE = 5
 MARKET_TIMELINE_MAX_ITEMS = 260
 MARKET_EVENT_MAX_ITEMS = 120
 MARKET_EVENT_PER_ROUND_LIMIT = 20
+POST_CLOSE_STRUCTURE_CACHE_SECONDS = 300
+POST_CLOSE_STRUCTURE_PENDING_CACHE_SECONDS = 60
+POST_CLOSE_LADDER_STOCK_LIMIT = 500
 
 
 class RealtimeMarketService:
@@ -52,6 +55,9 @@ class RealtimeMarketService:
         self._stock_names: dict[str, str] = {}
         self._daily_factor_trade_date: date | None = None
         self._daily_factor_reference: dict[str, dict] = {}
+        self._post_close_structure: dict = {"available": False, "reason": "post_close_structure_not_loaded"}
+        self._post_close_structure_loaded_clock = 0.0
+        self._post_close_structure_lock = asyncio.Lock()
         self._sector_info: dict[str, dict] = {}
         self._sector_members: dict[str, list[str]] = {}
         self._stock_sectors: dict[str, list[str]] = {}
@@ -227,6 +233,40 @@ class RealtimeMarketService:
             "trade_date": self._market_history_trade_date.isoformat() if self._market_history_trade_date else None,
             "items": self._market_events[-limit:],
         }
+
+    async def post_close_structure(self) -> dict:
+        """Return completed daily limit-event facts for the market dashboard.
+
+        This path is intentionally read-only and does not depend on a live
+        Quote round.  It is the factual input for later emotion/report logic,
+        not an emotion score or a trading signal by itself.
+        """
+        if clock.monotonic() - self._post_close_structure_loaded_clock < self._post_close_structure_cache_seconds():
+            return self._post_close_structure
+        async with self._post_close_structure_lock:
+            if clock.monotonic() - self._post_close_structure_loaded_clock < self._post_close_structure_cache_seconds():
+                return self._post_close_structure
+            try:
+                sessionmaker = get_sessionmaker()
+                async with sessionmaker() as session:
+                    repository = RealtimeMarketRepository(session)
+                    raw = await repository.latest_post_close_limit_events()
+                self._post_close_structure = self._build_post_close_structure(raw)
+            except Exception as exc:
+                logger.exception("post-close market structure load failed")
+                self._post_close_structure = {
+                    "available": False,
+                    "reason": "post_close_structure_load_failed",
+                    "trade_date": None,
+                    "summary": None,
+                    "ladders": [],
+                    "limit_breaks": [],
+                }
+            self._post_close_structure_loaded_clock = clock.monotonic()
+            return self._post_close_structure
+
+    def _post_close_structure_cache_seconds(self) -> int:
+        return POST_CLOSE_STRUCTURE_CACHE_SECONDS if self._post_close_structure.get("available") else POST_CLOSE_STRUCTURE_PENDING_CACHE_SECONDS
 
     async def quotes(self, stock_codes: list[str] | None = None) -> dict:
         settings = await self._load_settings()
@@ -1395,6 +1435,141 @@ class RealtimeMarketService:
             "range_comparable_count": range_comparable_count,
             "at_high_count": at_high_count,
             "at_low_count": at_low_count,
+        }
+
+    @staticmethod
+    def _build_post_close_structure(raw: dict) -> dict:
+        """Build a consecutive-limit-up ladder from canonical daily events.
+
+        A board only advances when the same active, non-ST stock has a
+        `limit_up` event on each previous open date.  ``limit_break`` is kept
+        separate, so the seal rate is an explicit `limit_up / (limit_up +
+        limit_break)` end-of-day measure rather than a synthetic price rule.
+        """
+        target_date = raw.get("trade_date")
+        if not isinstance(target_date, date):
+            return {
+                "available": False,
+                "reason": "daily_bar_unavailable",
+                "trade_date": None,
+                "daily_bar_coverage_pct": None,
+                "summary": None,
+                "ladders": [],
+                "limit_breaks": [],
+            }
+        coverage_pct = round(
+            int(raw.get("daily_bar_count") or 0) / max(1, int(raw.get("active_count") or 0)) * 100,
+            2,
+        )
+        if not raw.get("daily_bar_count"):
+            return {
+                "available": False,
+                "reason": "daily_bar_unavailable",
+                "trade_date": target_date.isoformat(),
+                "daily_bar_coverage_pct": coverage_pct,
+                "summary": None,
+                "ladders": [],
+                "limit_breaks": [],
+            }
+        if not raw.get("limit_event_complete"):
+            return {
+                "available": False,
+                "reason": "limit_event_ingest_incomplete",
+                "trade_date": target_date.isoformat(),
+                "daily_bar_coverage_pct": coverage_pct,
+                "completion_capabilities": raw.get("completion_capabilities") or [],
+                "summary": None,
+                "ladders": [],
+                "limit_breaks": [],
+            }
+
+        trade_dates = [item for item in raw.get("trade_dates") or [] if isinstance(item, date)]
+        events = [item for item in raw.get("events") or [] if isinstance(item, dict)]
+        limit_up_by_date: dict[date, set[str]] = {}
+        for event in events:
+            event_date = event.get("trade_date")
+            if event.get("event_type") == "limit_up" and isinstance(event_date, date):
+                limit_up_by_date.setdefault(event_date, set()).add(str(event.get("stock_code") or ""))
+
+        current_events = [event for event in events if event.get("trade_date") == target_date]
+        current_limit_ups = [event for event in current_events if event.get("event_type") == "limit_up"]
+        current_limit_downs = [event for event in current_events if event.get("event_type") == "limit_down"]
+        current_limit_breaks = [event for event in current_events if event.get("event_type") == "limit_break"]
+        ladders: dict[int, list[dict]] = {}
+        for event in current_limit_ups:
+            stock_code = str(event.get("stock_code") or "")
+            board_count = 0
+            for trade_date in trade_dates:
+                if stock_code not in limit_up_by_date.get(trade_date, set()):
+                    break
+                board_count += 1
+            ladders.setdefault(max(1, board_count), []).append(
+                RealtimeMarketService._post_close_stock_item(event, board_count=max(1, board_count))
+            )
+        ladder_items = []
+        for board_count in sorted(ladders, reverse=True):
+            stocks = sorted(
+                ladders[board_count],
+                key=lambda item: (
+                    item.get("first_time") is None,
+                    item.get("first_time") or "",
+                    item.get("stock_code") or "",
+                ),
+            )
+            ladder_items.append(
+                {
+                    "board_count": board_count,
+                    "stock_count": len(stocks),
+                    "stocks": stocks[:POST_CLOSE_LADDER_STOCK_LIMIT],
+                    "truncated": len(stocks) > POST_CLOSE_LADDER_STOCK_LIMIT,
+                }
+            )
+        limit_breaks = sorted(
+            (RealtimeMarketService._post_close_stock_item(event) for event in current_limit_breaks),
+            key=lambda item: (
+                -(int(item.get("open_count") or 0)),
+                -(float(item.get("turnover_amount") or 0)),
+                item.get("stock_code") or "",
+            ),
+        )
+        seal_denominator = len(current_limit_ups) + len(current_limit_breaks)
+        highest_ladder = ladder_items[0] if ladder_items else None
+        return {
+            "available": True,
+            "reason": None,
+            "trade_date": target_date.isoformat(),
+            "daily_bar_coverage_pct": coverage_pct,
+            "completion_capabilities": raw.get("completion_capabilities") or [],
+            "summary": {
+                "limit_up_count": len(current_limit_ups),
+                "limit_down_count": len(current_limit_downs),
+                "limit_break_count": len(current_limit_breaks),
+                "seal_rate_pct": round(len(current_limit_ups) / seal_denominator * 100, 2) if seal_denominator else None,
+                "highest_board_count": highest_ladder.get("board_count") if highest_ladder else 0,
+                "highest_board_stock_count": highest_ladder.get("stock_count") if highest_ladder else 0,
+            },
+            "ladders": ladder_items,
+            "limit_breaks": limit_breaks[:POST_CLOSE_LADDER_STOCK_LIMIT],
+            "limit_breaks_truncated": len(limit_breaks) > POST_CLOSE_LADDER_STOCK_LIMIT,
+        }
+
+    @staticmethod
+    def _post_close_stock_item(event: dict, *, board_count: int | None = None) -> dict:
+        def serialize_time(value: object) -> str | None:
+            return value.isoformat() if isinstance(value, time) else None
+
+        return {
+            "stock_code": event.get("stock_code"),
+            "stock_name": event.get("stock_name"),
+            "board_count": board_count,
+            "close_price": event.get("close_price"),
+            "limit_price": event.get("limit_price"),
+            "change_pct": event.get("change_pct"),
+            "first_time": serialize_time(event.get("first_time")),
+            "last_time": serialize_time(event.get("last_time")),
+            "open_count": event.get("open_count"),
+            "turnover_amount": event.get("turnover_amount"),
+            "amount_yuan": event.get("amount_yuan"),
         }
 
     def _build_sector_strength(self, round_id: str, round_quotes: dict[str, dict]) -> dict[str, dict]:

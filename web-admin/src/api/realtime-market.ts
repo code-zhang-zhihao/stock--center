@@ -3,6 +3,7 @@ import type {
   RealtimeMarketEvents,
   RealtimeMarketOverview,
   RealtimeMarketTimeline,
+  PostCloseMarketStructure,
   RealtimePoolList,
   RealtimeRuntimeStatus,
   RealtimeSectorList,
@@ -12,6 +13,7 @@ export const realtimeMarketApi = {
   marketOverview: () => requestData<RealtimeMarketOverview>({ method: 'GET', url: '/realtime/market-overview' }),
   marketTimeline: (limit = 180) => requestData<RealtimeMarketTimeline>({ method: 'GET', url: '/realtime/market-timeline', params: { limit } }),
   marketEvents: (limit = 80) => requestData<RealtimeMarketEvents>({ method: 'GET', url: '/realtime/market-events', params: { limit } }),
+  postCloseStructure: () => requestData<PostCloseMarketStructure>({ method: 'GET', url: '/realtime/post-close-structure' }),
   sectors: (sectorType: 'concept' | 'industry', limit = 100) => requestData<RealtimeSectorList>({
     method: 'GET',
     url: '/realtime/sectors',

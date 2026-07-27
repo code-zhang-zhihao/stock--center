@@ -39,6 +39,12 @@ async def market_events(limit: int = Query(default=80, ge=1, le=120)):
     return ApiResponse.ok(await realtime_market_service.market_events(limit=limit))
 
 
+@router.get("/post-close-structure")
+async def post_close_structure():
+    """Completed daily limit-event facts for the market overview page."""
+    return ApiResponse.ok(await realtime_market_service.post_close_structure())
+
+
 @router.get("/quotes")
 async def quotes(stock_codes: str | None = Query(default=None)):
     codes = [item.strip() for item in (stock_codes or "").split(",") if item.strip()]

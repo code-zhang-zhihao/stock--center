@@ -183,6 +183,47 @@ export interface RealtimeMarketEvents {
   items: RealtimeMarketEvent[];
 }
 
+export interface PostCloseLimitStock {
+  stock_code: string;
+  stock_name?: string | null;
+  board_count?: number | null;
+  close_price?: number | null;
+  limit_price?: number | null;
+  change_pct?: number | null;
+  first_time?: string | null;
+  last_time?: string | null;
+  open_count?: number | null;
+  turnover_amount?: number | null;
+  amount_yuan?: number | null;
+}
+
+export interface PostCloseLimitLadder {
+  board_count: number;
+  stock_count: number;
+  stocks: PostCloseLimitStock[];
+  truncated: boolean;
+}
+
+export interface PostCloseMarketStructure {
+  available: boolean;
+  reason?: string | null;
+  detail?: string | null;
+  trade_date: string | null;
+  daily_bar_coverage_pct?: number | null;
+  completion_capabilities?: string[];
+  summary: {
+    limit_up_count: number;
+    limit_down_count: number;
+    limit_break_count: number;
+    seal_rate_pct: number | null;
+    highest_board_count: number;
+    highest_board_stock_count: number;
+  } | null;
+  ladders: PostCloseLimitLadder[];
+  limit_breaks: PostCloseLimitStock[];
+  limit_breaks_truncated?: boolean;
+}
+
 export interface RealtimeRuntimeStatus {
   running: boolean;
   enabled: boolean;
