@@ -766,6 +766,18 @@ class DailyMarketCloseIngestService:
             ):
                 block_result["status"] = "deferred"
                 block_result["reason"] = "daily_info_not_published"
+            if (
+                label == "sector bars"
+                and block_result.get("status") == "success"
+                and int(block_result.get("rows") or 0) == 0
+            ):
+                # A THS universe normally contains hundreds of board bars.  An
+                # empty response is a delayed/failed provider publication, not
+                # a valid zero-row market fact.  Keep the run successful but
+                # expose it as deferred so downstream reports do not treat the
+                # Raw capture as a completion marker.
+                block_result["status"] = "deferred"
+                block_result["reason"] = "ths_daily_empty_or_not_published"
             if block_result.get("status") == "success":
                 self._apply_enrichment_value(result, target_by_label[label], block_result.get("value"))
             elif block_result.get("status") == "deferred":
@@ -1443,6 +1455,9 @@ class DailyMarketCloseIngestService:
         mapping = self.tushare_market_adapter.map_ths_daily(records, trade_date=trade_date, sector_map=sector_map)
         self._log_mapping_summary(mapping)
         rows = mapping.rows
+        empty_response = bool(raw_codes) and not rows
+        if empty_response:
+            result.warnings.append("ths_daily 未返回任何板块当日行情，Raw 记录标记为 failed，等待缺口修复")
         await self._capture_raw_summary(
             "daily_market_close_sector_bars",
             trade_date,
@@ -1457,6 +1472,9 @@ class DailyMarketCloseIngestService:
             },
             len(rows),
             normalized_table="t_sector_bar",
+            status="failed" if empty_response else "captured",
+            error_code="ths_daily_empty_or_not_published" if empty_response else None,
+            error_message="ths_daily 未返回任何目标板块的当日行情" if empty_response else None,
         )
         upserted = await self.repository.upsert_sector_bar_rows(rows)
         self._log_upsert_summary(mapping, upserted, "t_sector_bar")
@@ -1776,6 +1794,9 @@ class DailyMarketCloseIngestService:
         *,
         normalized_table: str | None = None,
         provider_code: str = "tushare",
+        status: str = "captured",
+        error_code: str | None = None,
+        error_message: str | None = None,
     ) -> None:
         stored_payload = self._compact_raw_payload(payload, row_count=row_count)
         await self.repository.insert_raw(
@@ -1793,7 +1814,9 @@ class DailyMarketCloseIngestService:
                 },
                 "normalized_table": normalized_table or ("t_daily_bar" if capability.endswith("daily") else "t_stock_daily_basic"),
                 "normalized_pk": trade_date.isoformat(),
-                "status": "captured",
+                "status": status,
+                "error_code": error_code,
+                "error_message": error_message,
             }
         )
 

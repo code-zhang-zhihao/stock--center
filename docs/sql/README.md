@@ -69,6 +69,7 @@
 63. `63-realtime-runtime-stabilization.sql`：创建股票池一对一实时策略表，seed 系统池实时优先级/Quote/分钟档位，禁用动态全市场池作为目标，并将 TickFlow 实时限频安全比例设为 90%。
 64. `64-daily-close-late-facts-enrichment.sql`：将已执行旧四级流水线的涨跌停/炸板、停复牌和板块日线从 18:00 核心任务迁到 21:30 增强任务，只更新调度描述、默认 payload 和 metadata。
 65. `65-market-daily-sentiment.sql`：创建版本化 `t_market_sentiment_daily`，并 seed 22:15 的 `calculate_market_daily_sentiment` 每日任务；评分只读取 canonical 日线、涨跌停事件和交易日历，数据不足时记录 `pending`，不调用外部 Provider 或 LLM。
+66. `66-market-daily-review-facts.sql`：创建 `t_market_sector_heat_daily/t_market_limit_up_evidence_daily`，扩展同一 22:15 任务为每日市场报告事实；概念热度直接聚合成分股事实，不依赖可能延迟的 `ths_daily`，龙虎榜与公告只保存关联证据，绝不写成涨停因果结论。脚本会把历史 `ths_daily` 空响应的错误 `captured` Raw 标记改为合法的 `failed`，并保留专用错误码。
 
 ## 产品化初始化规划
 
@@ -106,6 +107,8 @@ docs/sql/db-init.sql
 `64-daily-close-late-facts-enrichment.sql` 适用于已经执行过旧版 `58` 的数据库。它只把 `daily_close_core_ingest.default_payload` 中的 `sync_stock_limit_status/sync_sector_bars` 改为 `false`，并把同两个开关在 `daily_close_enrichment_ingest.default_payload` 中改为 `true`；不会删除已入库事件、板块行情或历史运行记录。执行后 reload Scheduler。新环境执行已更新的 `58` 后也可以安全执行 `64`，结果一致。
 
 `65-market-daily-sentiment.sql` 需要在 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 之后执行，以便自动挂载“每日”标签；即使标签表不存在，建表和任务 seed 仍会完成。它只新增 Derived 表 `t_market_sentiment_daily` 和一个每日任务，不改写 `t_daily_bar/t_limit_event_daily` 等 canonical 事实，也不删除历史数据。任务在 22:15 读取已完成事实；日线 active universe 覆盖率低于 95% 或 `limit_list_d` 的 Raw 完成标记缺失时，写入 `pending` 而不是生成分数。部署代码、执行本 SQL 后需 reload Scheduler；如需先建立历史阶段基线，可在调度中心手动运行 `calculate_market_daily_sentiment` 并同时传入 `start_date`、`end_date` 和固定 `calculation_version=v1`。
+
+`66-market-daily-review-facts.sql` 必须在 `65` 之后执行，并在部署后端后 reload Scheduler。它新增两张 Derived 表并把既有 `calculate_market_daily_sentiment` 的展示名称更新为“生成每日市场报告事实”，不会新增第二个定时任务。任务默认在生成情绪后继续生成概念热度、热点龙头和涨停关联证据；若只需大范围回填历史情绪基线，可传 `include_report_facts=false`。概念热度只读取 `t_daily_bar/t_stock_fund_flow_daily/t_limit_event_daily/t_sector_component`，因此不受 `ths_daily` 晚发布影响；当前公告没有每日全市场同步完成标记，报告只能显示已入库公告并明确标注完整性未知。脚本会把 `t_sector_bar` 的历史零行 `ths_daily` Raw 记录从 `captured` 修正为 `failed`，保留原始审计行、`ths_daily_empty_or_not_published` 错误码与错误说明。
 
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 

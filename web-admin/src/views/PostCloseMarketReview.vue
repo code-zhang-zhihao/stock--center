@@ -52,6 +52,24 @@
           <n-alert v-else type="info" :show-icon="true">{{ sentimentUnavailableLabel }}</n-alert>
         </section>
 
+        <section class="surface theme-surface">
+          <div class="panel-heading">
+            <div><span class="panel-kicker">概念主线</span><h2>收盘热点与板块龙头</h2></div>
+            <span class="muted">由成分股日线、资金流与涨停直接聚合</span>
+          </div>
+          <div v-if="dailyReview?.sectors?.length" class="theme-grid">
+            <article v-for="sector in dailyReview.sectors" :key="sector.sector_code" class="theme-card">
+              <div class="theme-title"><span>#{{ sector.heat_rank }}</span><strong>{{ sector.sector_name }}</strong><b>{{ formatScore(sector.heat_score) }}</b></div>
+              <div class="theme-metrics"><span>均涨 <i :class="changeClass(sector.metrics.average_change_pct)">{{ formatPercent(sector.metrics.average_change_pct) }}</i></span><span>上涨 {{ formatInteger(sector.metrics.rising_stock_count) }}/{{ formatInteger(sector.metrics.priced_component_count) }}</span><span>涨停 {{ formatInteger(sector.metrics.limit_up_stock_count) }}</span></div>
+              <div v-if="sector.leaders.length" class="theme-leaders">
+                <span v-for="leader in sector.leaders" :key="leader.stock_code" :class="{ limit: leader.is_limit_up }">{{ leader.stock_name }} <i :class="changeClass(leader.change_pct)">{{ formatPercent(leader.change_pct) }}</i></span>
+              </div>
+            </article>
+          </div>
+          <n-alert v-else type="info" :show-icon="true">{{ dailyReviewUnavailableLabel }}</n-alert>
+          <p class="panel-note">热度是同日概念间的相对排序，不是策略评分；它刻意不依赖可能晚发布的 `ths_daily` 板块日 K。</p>
+        </section>
+
         <section class="review-grid">
           <article class="surface ladder-surface">
             <div class="panel-heading">
@@ -89,9 +107,24 @@
               <span class="panel-kicker">数据边界</span>
               <h2>这是一份事实底稿</h2>
               <p>连板只来自连续交易日的 `limit_up` 记录；炸板只来自 `limit_break`。没有完成 Raw 标记时，系统不会以零值补齐。</p>
-              <p>情绪分和阶段由可审计规则生成；热点原因、新闻证据、买卖建议与 LLM 分析尚未生成，避免将主观判断伪装成数据事实。</p>
+              <p>情绪分、概念热度和龙头由可审计规则生成；涨停关联会展示概念归属、龙虎榜和已沉淀公告，但它们不是“涨停原因”的因果断言。新闻归因、买卖建议与 LLM 分析尚未生成。</p>
             </article>
           </aside>
+        </section>
+
+        <section class="surface evidence-surface">
+          <div class="panel-heading">
+            <div><span class="panel-kicker">涨停关联证据</span><h2>概念归属、龙虎榜与已沉淀公告</h2></div>
+            <span class="muted">{{ dailyReview?.coverage?.limit_up_evidence_count || 0 }}/{{ dailyReview?.coverage?.limit_up_evidence_expected_count || 0 }} 只已生成快照</span>
+          </div>
+          <div v-if="dailyReview?.limit_up_evidence?.length" class="evidence-list">
+            <article v-for="item in dailyReview.limit_up_evidence" :key="item.stock_code" class="evidence-card">
+              <div class="evidence-stock"><strong>{{ item.stock_name || item.stock_code }}</strong><span>{{ item.stock_code }} · {{ item.board_count || 1 }} 板 · <i class="up">{{ formatPercent(numberValue(item.market_snapshot.change_pct)) }}</i></span></div>
+              <div class="evidence-context"><span v-for="sector in item.sector_context" :key="sector.sector_code">概念 #{{ sector.heat_rank }} {{ sector.sector_name }}</span><small v-if="!item.sector_context.length">未关联至当日有效热点概念</small></div>
+              <div class="evidence-source"><span v-if="item.evidence.lhb?.records?.length">龙虎榜：{{ item.evidence.lhb.records.map((record) => record.reason).join('；') }}</span><span v-else>龙虎榜：{{ item.evidence.lhb?.complete ? '当日无已沉淀记录' : '未完成/未发布' }}</span><span v-if="item.evidence.announcements?.records?.length">公告：{{ item.evidence.announcements.records.map((record) => record.title).join('；') }}</span><span v-else>公告：仅查已沉淀记录，当前无可用条目</span></div>
+            </article>
+          </div>
+          <n-alert v-else type="info" :show-icon="true">{{ dailyReviewUnavailableLabel }}</n-alert>
         </section>
       </template>
       <n-empty v-else description="等待最近交易日的涨跌停事件事实" />
@@ -105,13 +138,14 @@ import { NAlert, NButton, NEmpty, NSpin, NTag, useMessage } from 'naive-ui';
 import { RefreshCw } from 'lucide-vue-next';
 import { marketInsightApi } from '@/api/market-insight';
 import { realtimeMarketApi } from '@/api/realtime-market';
-import type { MarketDailySentiment } from '@/types/market-insight';
+import type { MarketDailyReview, MarketDailySentiment } from '@/types/market-insight';
 import type { PostCloseMarketStructure } from '@/types/realtime-market';
 
 const message = useMessage();
 const loading = ref(false);
 const structure = ref<PostCloseMarketStructure | null>(null);
 const sentiment = ref<MarketDailySentiment | null>(null);
+const dailyReview = ref<MarketDailyReview | null>(null);
 let refreshTimer: number | null = null;
 
 const summary = computed(() => structure.value?.summary || null);
@@ -129,13 +163,20 @@ const sentimentUnavailableLabel = computed(() => {
     ? '每日情绪任务尚未运行。可在调度中心执行“计算每日市场情绪事实”，历史首次使用时请按日期范围回填。'
     : '等待每日市场情绪事实完成。';
 });
+const dailyReviewUnavailableLabel = computed(() => {
+  if (dailyReview.value?.reason === 'market_sentiment_pending') return '市场情绪事实尚未完成，热点与涨停证据保持待生成。';
+  if (dailyReview.value?.reason === 'sector_heat_not_calculated') return '每日市场报告任务尚未生成概念热度；可在调度中心执行“生成每日市场报告事实”。';
+  if (dailyReview.value?.reason === 'limit_up_evidence_incomplete') return '涨停关联证据尚未全部沉淀，请等待任务完成。';
+  return '等待每日市场报告事实完成。';
+});
 
 async function loadReview(silent = false) {
   if (!silent) loading.value = true;
   try {
-    const [structureResult, sentimentResult] = await Promise.allSettled([
+    const [structureResult, sentimentResult, reviewResult] = await Promise.allSettled([
       realtimeMarketApi.postCloseStructure(),
       marketInsightApi.dailySentiment(),
+      marketInsightApi.dailyReview(),
     ]);
     if (structureResult.status === 'fulfilled') {
       structure.value = structureResult.value;
@@ -146,6 +187,11 @@ async function loadReview(silent = false) {
       sentiment.value = sentimentResult.value;
     } else if (!silent) {
       message.warning(sentimentResult.reason instanceof Error ? sentimentResult.reason.message : '读取每日情绪事实失败');
+    }
+    if (reviewResult.status === 'fulfilled') {
+      dailyReview.value = reviewResult.value;
+    } else if (!silent) {
+      message.warning(reviewResult.reason instanceof Error ? reviewResult.reason.message : '读取每日市场报告事实失败');
     }
   } finally {
     if (!silent) loading.value = false;
@@ -158,6 +204,7 @@ function formatScore(value: number | null | undefined) { return typeof value ===
 function formatRatio(value: number | null | undefined) { return typeof value === 'number' ? `${value.toFixed(2)} 倍` : '-'; }
 function formatWeight(value: number | null | undefined) { return typeof value === 'number' ? `${(value * 100).toFixed(0)}%` : '-'; }
 function formatRaw(value: number | null | undefined) { return typeof value === 'number' ? value.toFixed(Math.abs(value) < 10 ? 2 : 0) : '-'; }
+function numberValue(value: unknown) { return typeof value === 'number' ? value : null; }
 function changeClass(value: number | null | undefined) { return typeof value === 'number' ? (value > 0 ? 'up' : value < 0 ? 'down' : '') : ''; }
 function formatAmount(value: number | null | undefined) {
   if (typeof value !== 'number') return '-';
@@ -179,7 +226,8 @@ onBeforeUnmount(() => {
 .post-close-review-page { padding: 22px 24px 32px; color: #17212b; }.topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 16px; }.eyebrow, .panel-kicker { color: #9a6700; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }.topbar h1 { margin: 4px 0 0; font-size: 26px; line-height: 1.2; }.topbar p { max-width: 820px; margin: 8px 0 0; color: #667085; line-height: 1.55; }.header-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }.round-meta { display: grid; gap: 2px; text-align: right; font-size: 12px; color: #667085; }.round-meta strong { color: #344054; font-variant-numeric: tabular-nums; }.page-alert { margin-bottom: 14px; }
 .review-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }.summary-card, .surface { border: 1px solid #dce5e9; background: #fff; box-shadow: 0 1px 2px rgba(16,24,40,.03); }.summary-card { min-height: 112px; padding: 14px; display: grid; align-content: start; gap: 6px; border-radius: 8px; }.summary-card.primary { border-color: #f5c77a; background: linear-gradient(135deg, #fff8e8, #fff 70%); }.summary-card span, .summary-card small { color: #667085; font-size: 12px; }.summary-card strong { color: #1d2939; font-size: 20px; font-variant-numeric: tabular-nums; }.summary-card i { font-style: normal; }.up { color: #d92d20; }.down { color: #07845f; }
 .sentiment-surface { margin-top: 14px; }.sentiment-layout { display: grid; grid-template-columns: 140px minmax(160px, .8fr) minmax(260px, 1.3fr); gap: 12px; align-items: stretch; }.sentiment-score { display: grid; align-content: center; justify-items: center; min-height: 118px; border-radius: 8px; color: #fff; background: linear-gradient(145deg, #172554, #1d4ed8); }.sentiment-score strong { font-size: 38px; line-height: 1; font-variant-numeric: tabular-nums; }.sentiment-score span, .stage-card span, .stage-card small, .sentiment-facts span, .component-card span, .component-card small { font-size: 12px; }.sentiment-score span { margin-top: 7px; color: #bfdbfe; }.stage-card, .sentiment-facts { display: grid; align-content: center; gap: 6px; padding: 15px; border: 1px solid #dbe7f2; border-radius: 8px; background: #f8fbff; }.stage-card span, .stage-card small, .sentiment-facts span, .component-card span, .component-card small { color: #667085; }.stage-card strong { color: #1d4ed8; font-size: 22px; }.sentiment-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.sentiment-facts span { display: grid; gap: 4px; }.sentiment-facts b { color: #17212b; font-size: 15px; font-variant-numeric: tabular-nums; }.sentiment-facts b.up { color: #d92d20; }.sentiment-facts b.down { color: #07845f; }.component-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }.component-card { min-height: 88px; padding: 10px; display: grid; align-content: start; gap: 5px; border: 1px solid #e3eaf0; border-radius: 7px; background: #fff; }.component-card strong { font-size: 19px; color: #1d2939; font-variant-numeric: tabular-nums; }.component-card.unavailable { opacity: .65; background: #f8fafc; }
+.theme-surface, .evidence-surface { margin-top: 14px; }.theme-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }.theme-card { display: grid; gap: 8px; min-height: 118px; padding: 11px; border: 1px solid #e4e9ef; border-radius: 8px; background: linear-gradient(145deg, #fff, #f8fbff); }.theme-title { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; }.theme-title > span { color: #667085; font-size: 12px; }.theme-title strong { overflow: hidden; color: #1d2939; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }.theme-title b { color: #b54708; font-size: 17px; font-variant-numeric: tabular-nums; }.theme-metrics { display: flex; flex-wrap: wrap; gap: 7px; color: #667085; font-size: 11px; }.theme-metrics i, .theme-leaders i, .evidence-stock i { font-style: normal; }.theme-leaders { display: flex; flex-wrap: wrap; gap: 5px; }.theme-leaders span { max-width: 100%; overflow: hidden; padding: 3px 5px; color: #475467; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; border-radius: 4px; background: #f2f4f7; }.theme-leaders span.limit { color: #b42318; background: #fef3f2; }.evidence-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; max-height: 720px; overflow: auto; }.evidence-card { display: grid; gap: 8px; padding: 11px; border: 1px solid #e4e9ef; border-left: 3px solid #f79009; border-radius: 7px; }.evidence-stock { display: grid; gap: 2px; }.evidence-stock strong { color: #1d2939; font-size: 14px; }.evidence-stock span, .evidence-context, .evidence-source { color: #667085; font-size: 11px; line-height: 1.5; }.evidence-context { display: flex; flex-wrap: wrap; gap: 5px; }.evidence-context > span { padding: 2px 5px; color: #175cd3; border-radius: 4px; background: #eff8ff; }.evidence-source { display: grid; gap: 3px; }.evidence-source span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .review-grid { display: grid; grid-template-columns: minmax(0, 1.32fr) minmax(340px, .68fr); gap: 14px; margin-top: 14px; }.surface { border-radius: 8px; padding: 15px; }.panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }.panel-heading h2 { margin: 3px 0 0; font-size: 17px; }.compact-heading { margin-bottom: 8px; }.muted { color: #667085; font-size: 12px; line-height: 1.5; }.ladder-list { display: grid; max-height: 680px; overflow: auto; padding-right: 4px; }.ladder-row { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 10px; padding: 10px 0; border-top: 1px solid #edf1f3; }.ladder-count { display: grid; align-content: start; gap: 2px; }.ladder-count strong { color: #d92d20; font-size: 15px; }.ladder-count span, .ladder-stocks small, .ladder-stocks em { color: #667085; font-size: 11px; font-style: normal; }.ladder-stocks { display: flex; flex-wrap: wrap; align-items: stretch; gap: 7px; }.ladder-stocks > span { display: grid; gap: 2px; min-width: 100px; padding: 7px 8px; border-left: 3px solid #f79009; background: #fff8ed; }.ladder-stocks b { max-width: 120px; overflow: hidden; color: #344054; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.ladder-stocks em { align-self: center; }.side-stack { display: grid; align-content: start; gap: 14px; }.break-list { display: grid; max-height: 450px; overflow: auto; }.break-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; min-height: 48px; align-items: center; border-bottom: 1px solid #edf1f3; }.break-row:last-child { border-bottom: 0; }.break-row > div { display: grid; gap: 2px; min-width: 0; }.break-row > div:last-child { text-align: right; }.break-row strong, .break-row span { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }.break-row small { color: #667085; font-size: 11px; }.method-surface { background: #fffcf5; border-color: #f3dfae; }.method-surface h2 { margin: 4px 0 8px; font-size: 17px; }.method-surface p { margin: 8px 0 0; color: #667085; font-size: 12px; line-height: 1.65; }
-@media (max-width: 1280px) { .review-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }.sentiment-layout { grid-template-columns: 130px 1fr; }.sentiment-facts { grid-column: 1 / -1; }.component-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.review-grid { grid-template-columns: 1fr; } }
-@media (max-width: 760px) { .post-close-review-page { padding: 14px; }.topbar { flex-direction: column; }.header-actions { justify-content: flex-start; }.round-meta { text-align: left; }.review-summary { grid-template-columns: 1fr 1fr; }.ladder-row { grid-template-columns: 54px minmax(0, 1fr); }.ladder-stocks > span { min-width: 92px; } }
+@media (max-width: 1280px) { .review-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }.sentiment-layout { grid-template-columns: 130px 1fr; }.sentiment-facts { grid-column: 1 / -1; }.component-grid, .theme-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.review-grid { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .post-close-review-page { padding: 14px; }.topbar { flex-direction: column; }.header-actions { justify-content: flex-start; }.round-meta { text-align: left; }.review-summary, .theme-grid, .evidence-list { grid-template-columns: 1fr; }.ladder-row { grid-template-columns: 54px minmax(0, 1fr); }.ladder-stocks > span { min-width: 92px; } }
 </style>

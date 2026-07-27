@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from app.db.session import get_sessionmaker
+from app.modules.market_insight.report_service import MarketDailyReviewService
 from app.modules.market_insight.repository import MarketInsightRepository
 from app.modules.market_insight.service import MARKET_SENTIMENT_CALCULATION_VERSION, MarketSentimentService
 from app.modules.scheduler_center.handlers import JobExecutionContext, job_handler_registry
@@ -40,24 +41,47 @@ class CalculateMarketDailySentimentHandler:
             "required": False,
             "description": "算法版本；修改版本会保留旧版本行，不覆盖既有日报或回测口径。",
         },
+        "include_report_facts": {
+            "label": "生成热点与涨停证据",
+            "type": "boolean",
+            "default": True,
+            "required": False,
+            "description": "默认同时沉淀概念热度、板块龙头和涨停关联证据；大范围历史情绪回填可关闭以缩短执行时间。",
+        },
     }
-    default_payload = {"calculation_version": MARKET_SENTIMENT_CALCULATION_VERSION}
+    default_payload = {
+        "calculation_version": MARKET_SENTIMENT_CALCULATION_VERSION,
+        "include_report_facts": True,
+    }
     force_async = True
 
     async def run(self, context: JobExecutionContext) -> JobResult:
         payload = {**self.default_payload, **context.payload}
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
-            result = await MarketSentimentService(MarketInsightRepository(session)).calculate(
+            repository = MarketInsightRepository(session)
+            result = await MarketSentimentService(repository).calculate(
                 trade_date=_parse_date(payload.get("trade_date")),
                 start_date=_parse_date(payload.get("start_date")),
                 end_date=_parse_date(payload.get("end_date")),
                 calculation_version=str(payload.get("calculation_version") or MARKET_SENTIMENT_CALCULATION_VERSION),
             )
+            review_summary = None
+            if bool(payload.get("include_report_facts", True)):
+                review_summary = (
+                    await MarketDailyReviewService(repository).calculate(
+                        trade_dates=result.requested_trade_dates,
+                        sentiment_rows=result.results,
+                        calculation_version=result.calculation_version,
+                    )
+                ).summary()
+        summary = result.summary()
+        if review_summary is not None:
+            summary["daily_review"] = review_summary
         return JobResult(
             status="success" if result.ready_count else "skipped",
-            affected_rows=result.upserted_rows,
-            summary=result.summary(),
+            affected_rows=result.upserted_rows + int((review_summary or {}).get("sector_heat_rows") or 0) + int((review_summary or {}).get("limit_up_evidence_rows") or 0),
+            summary=summary,
         )
 
 

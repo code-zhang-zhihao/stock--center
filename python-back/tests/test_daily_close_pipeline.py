@@ -235,6 +235,60 @@ def test_sector_daily_uses_three_batches_plus_one_missing_retry() -> None:
     assert calls[-1]["capability"] == "daily_market_close_sector_bars_retry_missing"
 
 
+def test_empty_sector_bar_response_is_audited_as_failed_not_captured() -> None:
+    trade_date = date(2026, 7, 27)
+    captures: list[dict] = []
+
+    class Repository:
+        async def tushare_ths_sector_map(self):
+            return {
+                "885001.TI": {
+                    "sector_code": "ths_concept_885001.TI",
+                    "sector_name": "测试概念",
+                    "sector_type": "concept",
+                }
+            }
+
+        async def upsert_sector_bar_rows(self, rows):
+            return len(rows)
+
+    class Adapter:
+        def map_ths_daily(self, records, *, trade_date, sector_map):
+            return SimpleNamespace(
+                provider_code="tushare",
+                api_name="ths_daily",
+                capability_code="sector_daily",
+                request_range={"trade_date": trade_date.isoformat()},
+                raw_count=len(records),
+                mapped_count=0,
+                missing_count=0,
+                unit_conversions={},
+                warnings=[],
+                rows=[],
+            )
+
+    service = object.__new__(DailyMarketCloseIngestService)
+    service.repository = Repository()
+    service.tushare_market_adapter = Adapter()
+
+    async def response(*_args, **_kwargs):
+        return SimpleNamespace(records=[])
+
+    async def capture(*_args, **kwargs):
+        captures.append(kwargs)
+
+    service._tushare_response = response
+    service._capture_raw_summary = capture
+    result = DailyMarketCloseIngestResult(trade_date=trade_date)
+
+    written = asyncio.run(service._sync_sector_bars(trade_date, result))
+
+    assert written == 0
+    assert captures[0]["status"] == "failed"
+    assert captures[0]["error_code"] == "ths_daily_empty_or_not_published"
+    assert any("Raw 记录标记为 failed" in warning for warning in result.warnings)
+
+
 def test_core_index_daily_prefers_tickflow_current_day_bars_without_tushare() -> None:
     trade_date = date(2026, 7, 23)
     calls: list[dict] = []

@@ -2,12 +2,23 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import Date, and_, cast, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.market_data.models import DailyBar, LimitEventDaily, ProviderRawRecord, Stock, TradeCalendar
-from app.modules.market_insight.models import MarketSentimentDaily
+from app.modules.market_data.models import (
+    Announcement,
+    DailyBar,
+    LhbEvent,
+    LimitEventDaily,
+    ProviderRawRecord,
+    SectorBasic,
+    SectorComponent,
+    Stock,
+    StockFundFlowDaily,
+    TradeCalendar,
+)
+from app.modules.market_insight.models import MarketLimitUpEvidenceDaily, MarketSectorHeatDaily, MarketSentimentDaily
 
 
 def _active_stock_filters() -> tuple:
@@ -250,6 +261,394 @@ class MarketInsightRepository:
             statement = statement.where(MarketSentimentDaily.trade_date == trade_date)
         statement = statement.order_by(MarketSentimentDaily.trade_date.desc()).limit(1)
         return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def concept_metrics(self, trade_dates: list[date]) -> dict[date, list[dict]]:
+        """Aggregate concept strength directly from canonical component facts.
+
+        ``ths_daily`` is deliberately not an input here.  Its publication can
+        lag the individual-stock daily facts, whereas a post-close concept
+        review needs to remain reproducible from the settled stock universe.
+        """
+        if not trade_dates:
+            return {}
+        rows = await self.session.execute(
+            select(
+                DailyBar.trade_date.label("trade_date"),
+                SectorBasic.sector_code.label("sector_code"),
+                SectorBasic.sector_name.label("sector_name"),
+                func.count(func.distinct(DailyBar.stock_code)).label("priced_component_count"),
+                func.count(func.distinct(DailyBar.stock_code)).filter(DailyBar.change_pct > 0).label("rising_stock_count"),
+                func.count(func.distinct(DailyBar.stock_code)).filter(DailyBar.change_pct < 0).label("falling_stock_count"),
+                func.avg(DailyBar.change_pct).label("average_change_pct"),
+                func.percentile_cont(0.5).within_group(DailyBar.change_pct.asc()).label("median_change_pct"),
+                func.count(func.distinct(LimitEventDaily.stock_code)).label("limit_up_stock_count"),
+                func.count(func.distinct(StockFundFlowDaily.stock_code)).label("fund_flow_stock_count"),
+                func.sum(StockFundFlowDaily.main_net_inflow).label("main_net_inflow"),
+            )
+            .select_from(DailyBar)
+            .join(Stock, Stock.stock_code == DailyBar.stock_code)
+            .join(
+                SectorComponent,
+                and_(
+                    SectorComponent.stock_code == DailyBar.stock_code,
+                    or_(SectorComponent.start_date.is_(None), SectorComponent.start_date <= DailyBar.trade_date),
+                    or_(SectorComponent.end_date.is_(None), SectorComponent.end_date >= DailyBar.trade_date),
+                ),
+            )
+            .join(SectorBasic, SectorBasic.sector_code == SectorComponent.sector_code)
+            .outerjoin(
+                StockFundFlowDaily,
+                and_(
+                    StockFundFlowDaily.stock_code == DailyBar.stock_code,
+                    StockFundFlowDaily.trade_date == DailyBar.trade_date,
+                ),
+            )
+            .outerjoin(
+                LimitEventDaily,
+                and_(
+                    LimitEventDaily.stock_code == DailyBar.stock_code,
+                    LimitEventDaily.trade_date == DailyBar.trade_date,
+                    LimitEventDaily.event_type == "limit_up",
+                ),
+            )
+            .where(
+                DailyBar.trade_date.in_(trade_dates),
+                SectorBasic.sector_type == "concept",
+                SectorBasic.source.like("tushare:%"),
+                *_active_stock_filters(),
+            )
+            .group_by(DailyBar.trade_date, SectorBasic.sector_code, SectorBasic.sector_name)
+        )
+        result: dict[date, list[dict]] = {}
+        for row in rows:
+            result.setdefault(row.trade_date, []).append(
+                {
+                    "sector_code": str(row.sector_code),
+                    "sector_name": str(row.sector_name),
+                    "priced_component_count": int(row.priced_component_count or 0),
+                    "rising_stock_count": int(row.rising_stock_count or 0),
+                    "falling_stock_count": int(row.falling_stock_count or 0),
+                    "average_change_pct": _float_or_none(row.average_change_pct),
+                    "median_change_pct": _float_or_none(row.median_change_pct),
+                    "limit_up_stock_count": int(row.limit_up_stock_count or 0),
+                    "fund_flow_stock_count": int(row.fund_flow_stock_count or 0),
+                    "main_net_inflow": _float_or_none(row.main_net_inflow),
+                }
+            )
+        return result
+
+    async def concept_leader_candidates(self, *, trade_dates: list[date], sector_codes: list[str]) -> dict[tuple[date, str], list[dict]]:
+        if not trade_dates or not sector_codes:
+            return {}
+        rows = await self.session.execute(
+            select(
+                DailyBar.trade_date.label("trade_date"),
+                SectorComponent.sector_code.label("sector_code"),
+                Stock.stock_code.label("stock_code"),
+                Stock.stock_name.label("stock_name"),
+                DailyBar.change_pct.label("change_pct"),
+                DailyBar.close_price.label("close_price"),
+                DailyBar.amount_yuan.label("amount_yuan"),
+                StockFundFlowDaily.main_net_inflow.label("main_net_inflow"),
+                LimitEventDaily.stock_code.label("limit_up_stock_code"),
+            )
+            .select_from(DailyBar)
+            .join(Stock, Stock.stock_code == DailyBar.stock_code)
+            .join(
+                SectorComponent,
+                and_(
+                    SectorComponent.stock_code == DailyBar.stock_code,
+                    or_(SectorComponent.start_date.is_(None), SectorComponent.start_date <= DailyBar.trade_date),
+                    or_(SectorComponent.end_date.is_(None), SectorComponent.end_date >= DailyBar.trade_date),
+                ),
+            )
+            .outerjoin(
+                StockFundFlowDaily,
+                and_(
+                    StockFundFlowDaily.stock_code == DailyBar.stock_code,
+                    StockFundFlowDaily.trade_date == DailyBar.trade_date,
+                ),
+            )
+            .outerjoin(
+                LimitEventDaily,
+                and_(
+                    LimitEventDaily.stock_code == DailyBar.stock_code,
+                    LimitEventDaily.trade_date == DailyBar.trade_date,
+                    LimitEventDaily.event_type == "limit_up",
+                ),
+            )
+            .where(
+                DailyBar.trade_date.in_(trade_dates),
+                SectorComponent.sector_code.in_(sector_codes),
+                *_active_stock_filters(),
+            )
+            .distinct()
+        )
+        result: dict[tuple[date, str], list[dict]] = {}
+        for row in rows:
+            result.setdefault((row.trade_date, str(row.sector_code)), []).append(
+                {
+                    "stock_code": str(row.stock_code),
+                    "stock_name": str(row.stock_name),
+                    "change_pct": _float_or_none(row.change_pct),
+                    "close_price": _float_or_none(row.close_price),
+                    "amount_yuan": _float_or_none(row.amount_yuan),
+                    "main_net_inflow": _float_or_none(row.main_net_inflow),
+                    "is_limit_up": row.limit_up_stock_code is not None,
+                }
+            )
+        return result
+
+    async def limit_up_market_rows(self, trade_dates: list[date]) -> dict[tuple[date, str], dict]:
+        if not trade_dates:
+            return {}
+        rows = await self.session.execute(
+            select(
+                LimitEventDaily.trade_date.label("trade_date"),
+                Stock.stock_code.label("stock_code"),
+                Stock.stock_name.label("stock_name"),
+                DailyBar.close_price.label("close_price"),
+                DailyBar.change_pct.label("change_pct"),
+                DailyBar.amount_yuan.label("amount_yuan"),
+                StockFundFlowDaily.main_net_inflow.label("main_net_inflow"),
+                LimitEventDaily.limit_price.label("limit_price"),
+                LimitEventDaily.open_count.label("open_count"),
+            )
+            .select_from(LimitEventDaily)
+            .join(Stock, Stock.stock_code == LimitEventDaily.stock_code)
+            .outerjoin(
+                DailyBar,
+                and_(DailyBar.stock_code == LimitEventDaily.stock_code, DailyBar.trade_date == LimitEventDaily.trade_date),
+            )
+            .outerjoin(
+                StockFundFlowDaily,
+                and_(StockFundFlowDaily.stock_code == LimitEventDaily.stock_code, StockFundFlowDaily.trade_date == LimitEventDaily.trade_date),
+            )
+            .where(
+                LimitEventDaily.trade_date.in_(trade_dates),
+                LimitEventDaily.event_type == "limit_up",
+                *_active_stock_filters(),
+            )
+        )
+        return {
+            (row.trade_date, str(row.stock_code)): {
+                "stock_code": str(row.stock_code),
+                "stock_name": str(row.stock_name),
+                "close_price": _float_or_none(row.close_price),
+                "change_pct": _float_or_none(row.change_pct),
+                "amount_yuan": _float_or_none(row.amount_yuan),
+                "main_net_inflow": _float_or_none(row.main_net_inflow),
+                "limit_price": _float_or_none(row.limit_price),
+                "open_count": int(row.open_count or 0),
+            }
+            for row in rows
+        }
+
+    async def lhb_rows_for_limit_ups(self, *, trade_dates: list[date], stock_codes: list[str]) -> dict[tuple[date, str], list[dict]]:
+        if not trade_dates or not stock_codes:
+            return {}
+        rows = await self.session.execute(
+            select(
+                LhbEvent.trade_date,
+                LhbEvent.stock_code,
+                LhbEvent.reason,
+                LhbEvent.net_buy_amount,
+                LhbEvent.turnover_amount,
+            ).where(LhbEvent.trade_date.in_(trade_dates), LhbEvent.stock_code.in_(stock_codes))
+        )
+        result: dict[tuple[date, str], list[dict]] = {}
+        for row in rows:
+            result.setdefault((row.trade_date, str(row.stock_code)), []).append(
+                {
+                    "reason": str(row.reason),
+                    "net_buy_amount": _float_or_none(row.net_buy_amount),
+                    "turnover_amount": _float_or_none(row.turnover_amount),
+                }
+            )
+        return result
+
+    async def announcements_for_limit_ups(self, *, stock_codes: list[str], start_date: date, end_date: date) -> dict[str, list[dict]]:
+        if not stock_codes:
+            return {}
+        rows = await self.session.execute(
+            select(
+                Announcement.stock_code,
+                Announcement.title,
+                Announcement.category,
+                Announcement.published_at,
+                Announcement.url,
+            )
+            .where(
+                Announcement.stock_code.in_(stock_codes),
+                cast(Announcement.published_at, Date).between(start_date, end_date),
+            )
+            .order_by(Announcement.stock_code, Announcement.published_at.desc())
+        )
+        result: dict[str, list[dict]] = {}
+        for row in rows:
+            entries = result.setdefault(str(row.stock_code), [])
+            if len(entries) < 3:
+                entries.append(
+                    {
+                        "title": str(row.title),
+                        "category": row.category,
+                        "published_at": row.published_at,
+                        "url": row.url,
+                    }
+                )
+        return result
+
+    async def concept_memberships_for_stocks(self, stock_codes: list[str]) -> dict[str, list[dict]]:
+        if not stock_codes:
+            return {}
+        rows = await self.session.execute(
+            select(
+                SectorComponent.stock_code,
+                SectorBasic.sector_code,
+                SectorBasic.sector_name,
+                SectorComponent.start_date,
+                SectorComponent.end_date,
+            )
+            .join(SectorBasic, SectorBasic.sector_code == SectorComponent.sector_code)
+            .where(
+                SectorComponent.stock_code.in_(stock_codes),
+                SectorBasic.sector_type == "concept",
+                SectorBasic.source.like("tushare:%"),
+            )
+            .distinct()
+        )
+        result: dict[str, list[dict]] = {}
+        for row in rows:
+            result.setdefault(str(row.stock_code), []).append(
+                {
+                    "sector_code": str(row.sector_code),
+                    "sector_name": str(row.sector_name),
+                    "start_date": row.start_date,
+                    "end_date": row.end_date,
+                }
+            )
+        return result
+
+    async def raw_capabilities_by_date(self, *, trade_dates: list[date], normalized_table: str) -> dict[date, set[str]]:
+        if not trade_dates:
+            return {}
+        rows = await self.session.execute(
+            select(ProviderRawRecord.normalized_pk, ProviderRawRecord.capability).where(
+                ProviderRawRecord.status == "captured",
+                ProviderRawRecord.normalized_table == normalized_table,
+                ProviderRawRecord.normalized_pk.in_([item.isoformat() for item in trade_dates]),
+            )
+        )
+        result: dict[date, set[str]] = {}
+        for date_key, capability in rows:
+            try:
+                result.setdefault(date.fromisoformat(str(date_key)), set()).add(str(capability))
+            except ValueError:
+                continue
+        return result
+
+    async def upsert_sector_heat_rows(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        for offset in range(0, len(rows), 500):
+            statement = insert(MarketSectorHeatDaily).values(rows[offset : offset + 500])
+            await self.session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[
+                        MarketSectorHeatDaily.trade_date,
+                        MarketSectorHeatDaily.sector_code,
+                        MarketSectorHeatDaily.calculation_version,
+                    ],
+                    set_={
+                        "sector_name": statement.excluded.sector_name,
+                        "status": statement.excluded.status,
+                        "heat_score": statement.excluded.heat_score,
+                        "heat_rank": statement.excluded.heat_rank,
+                        "metrics": statement.excluded.metrics,
+                        "components": statement.excluded.components,
+                        "leaders": statement.excluded.leaders,
+                        "coverage": statement.excluded.coverage,
+                        "source_facts": statement.excluded.source_facts,
+                        "calculated_at": func.now(),
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+        return len(rows)
+
+    async def upsert_limit_up_evidence_rows(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        for offset in range(0, len(rows), 500):
+            statement = insert(MarketLimitUpEvidenceDaily).values(rows[offset : offset + 500])
+            await self.session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[
+                        MarketLimitUpEvidenceDaily.trade_date,
+                        MarketLimitUpEvidenceDaily.stock_code,
+                        MarketLimitUpEvidenceDaily.calculation_version,
+                    ],
+                    set_={
+                        "stock_name": statement.excluded.stock_name,
+                        "status": statement.excluded.status,
+                        "board_count": statement.excluded.board_count,
+                        "market_snapshot": statement.excluded.market_snapshot,
+                        "sector_context": statement.excluded.sector_context,
+                        "evidence": statement.excluded.evidence,
+                        "coverage": statement.excluded.coverage,
+                        "source_facts": statement.excluded.source_facts,
+                        "calculated_at": func.now(),
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+        return len(rows)
+
+    async def list_sector_heats(self, *, trade_date: date, calculation_version: str, limit: int) -> list[MarketSectorHeatDaily]:
+        rows = await self.session.execute(
+            select(MarketSectorHeatDaily)
+            .where(
+                MarketSectorHeatDaily.trade_date == trade_date,
+                MarketSectorHeatDaily.calculation_version == calculation_version,
+                MarketSectorHeatDaily.status == "ready",
+            )
+            .order_by(MarketSectorHeatDaily.heat_rank.asc().nulls_last(), MarketSectorHeatDaily.sector_name)
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
+
+    async def list_limit_up_evidence(self, *, trade_date: date, calculation_version: str, limit: int) -> list[MarketLimitUpEvidenceDaily]:
+        rows = await self.session.execute(
+            select(MarketLimitUpEvidenceDaily)
+            .where(
+                MarketLimitUpEvidenceDaily.trade_date == trade_date,
+                MarketLimitUpEvidenceDaily.calculation_version == calculation_version,
+                MarketLimitUpEvidenceDaily.status == "ready",
+            )
+            .order_by(MarketLimitUpEvidenceDaily.board_count.desc().nulls_last(), MarketLimitUpEvidenceDaily.stock_code)
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
+
+    async def review_row_counts(self, *, trade_date: date, calculation_version: str) -> dict[str, int]:
+        sector_count = await self.session.execute(
+            select(func.count()).select_from(MarketSectorHeatDaily).where(
+                MarketSectorHeatDaily.trade_date == trade_date,
+                MarketSectorHeatDaily.calculation_version == calculation_version,
+                MarketSectorHeatDaily.status == "ready",
+            )
+        )
+        evidence_count = await self.session.execute(
+            select(func.count()).select_from(MarketLimitUpEvidenceDaily).where(
+                MarketLimitUpEvidenceDaily.trade_date == trade_date,
+                MarketLimitUpEvidenceDaily.calculation_version == calculation_version,
+                MarketLimitUpEvidenceDaily.status == "ready",
+            )
+        )
+        return {
+            "sector_heat_count": int(sector_count.scalar_one() or 0),
+            "limit_up_evidence_count": int(evidence_count.scalar_one() or 0),
+        }
 
     async def commit(self) -> None:
         await self.session.commit()
