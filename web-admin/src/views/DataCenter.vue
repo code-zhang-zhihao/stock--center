@@ -47,7 +47,17 @@
         <div><span>最新 Quote 轮次</span><strong>{{ formatDateTime(realtimeHealth?.last_quote_round.finished_at) }}</strong></div>
         <div><span>Quote 覆盖</span><strong>{{ formatNumber(realtimeHealth?.last_quote_round.received_count) }} / {{ formatNumber(realtimeHealth?.last_quote_round.expected_count) }}</strong></div>
         <div><span>分钟更新 / 空分时</span><strong>{{ formatNumber(realtimeHealth?.last_minute_round.updated_count) }} / {{ formatNumber(realtimeHealth?.last_minute_round.no_intraday_data_count) }}</strong></div>
-        <div><span>轮次耗时</span><strong>{{ formatNumber(realtimeHealth?.last_quote_round.duration_ms) }}ms</strong></div>
+        <div><span>全市场覆盖 / 耗时</span><strong>{{ formatNumber(realtimeHealth?.market.received_count) }} / {{ formatNumber(realtimeHealth?.market.expected_count) }} · {{ formatNumber(realtimeHealth?.market.duration_ms) }}ms</strong></div>
+        <div><span>决策池 / 温观察</span><strong>{{ formatNumber(realtimeHealth?.decision_target_count) }} / {{ formatNumber(realtimeHealth?.warm_target_count) }}</strong></div>
+        <div><span>五档覆盖 / 缓存</span><strong>{{ formatNumber(realtimeHealth?.depth.received_count) }} / {{ formatNumber(realtimeHealth?.depth_cache_count) }}</strong></div>
+        <div><span>外部拉取租约</span><strong>{{ realtimeHealth?.leader_active ? '本实例持有' : '共享缓存读取' }}</strong></div>
+      </div>
+      <div v-if="Object.keys(realtimeHealth?.rate_budgets || {}).length" class="rate-budget-grid">
+        <div v-for="(budget, key) in realtimeHealth?.rate_budgets || {}" :key="key">
+          <strong>{{ rateBudgetLabel(key) }}</strong>
+          <span>已用 {{ budget.used_requests_in_window }} / 安全 {{ budget.safe_budget_per_minute }}（购买 {{ budget.purchased_limit_per_minute }}）</span>
+          <small>剩余 {{ budget.remaining_requests_in_window }}<template v-if="budget.cooldown_remaining_seconds"> · 冷却 {{ budget.cooldown_remaining_seconds }}s</template></small>
+        </div>
       </div>
       <n-alert v-if="realtimeHealth?.error" class="realtime-error" type="warning">{{ realtimeHealth.error }}</n-alert>
     </section>
@@ -184,6 +194,10 @@ const realtimeLabel = computed(() => {
   if (!realtimeHealth.value?.enabled) return '未启用';
   return realtimeHealth.value.market_session ? '盘中运行' : '等待交易时段';
 });
+
+function rateBudgetLabel(key: string) {
+  return ({ quote_universe: '全市场 Quote', quote_symbols: '候选 Quote', depth_batch: '五档深度' } as Record<string, string>)[key] || key;
+}
 
 const categoryOptions = [
   { label: '全部', value: 'all' },
@@ -435,6 +449,10 @@ onMounted(() => {
 .realtime-grid div { min-width: 0; border: 1px solid #e4e9ee; background: #f8fafb; padding: 9px; display: grid; gap: 4px; }
 .realtime-grid span { color: #667085; font-size: 12px; }
 .realtime-grid strong { color: #1f2933; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rate-budget-grid { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; margin-top: 10px; }
+.rate-budget-grid > div { border: 1px solid #dce6ed; background: #f8fbfd; padding: 9px; display: grid; gap: 3px; }
+.rate-budget-grid strong { color: #344054; font-size: 13px; }
+.rate-budget-grid span, .rate-budget-grid small { color: #667085; font-size: 12px; }
 .realtime-error { margin-top: 10px; }
 .panel-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
 .panel-toolbar :deep(.n-input) { width: 260px; }
@@ -468,6 +486,7 @@ onMounted(() => {
   .data-center-page { padding: 14px; }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .realtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rate-budget-grid { grid-template-columns: 1fr; }
   .panel-toolbar { align-items: stretch; flex-direction: column; }
   .panel-toolbar :deep(.n-input) { width: 100%; }
 }

@@ -64,6 +64,7 @@
 58. `58-daily-close-four-stage-pipeline.sql`：将每日收盘流水线升级为 15:30 分钟线/分钟因子、18:00 核心事实、21:30 增强事实、次日 08:00 缺口修复四级任务；分钟因子保留落库并按 200 股票分片集合计算。
 59. `59-scheduler-job-tags-and-retire-obsolete-jobs.sql`：新增调度标签及任务-标签关联表，seed 历史/每日/主数据/策略标签，并删除三个无效或已替换的任务定义。
 60. `60-tickflow-realtime-quote.sql`：新增 `market_data/tickflow` 加密 API Key 配置，并将实时 Quote 路由设为 TickFlow；MooTDX 实时分钟线配置与缓存链路保持不变。
+61. `61-realtime-research-foundation.sql`：第一期实时研究底座。增加 ST 主数据标识、TickFlow 标的池目录/成员有效期、REST Quote/五档深度额度配置，并将实时默认值收口为 60 秒全市场、10 秒候选 Quote/深度、6 路 MooTDX 分钟线。
 
 ## 产品化初始化规划
 

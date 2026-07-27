@@ -29,6 +29,7 @@ from app.modules.market_data.tushare_runtime import TushareProviderFactory
 from app.modules.market_data.tushare_mappers import TushareCanonicalMapper
 from app.modules.market_data.tushare.contracts import TushareApiRequest
 from app.modules.config_center.repository import ConfigCenterRepository
+from app.modules.realtime_market.tickflow_runtime import TickflowProviderFactory, TickflowQuoteProvider
 
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class StockBasicSyncRequest(BaseModel):
     mark_delisted: bool = True
     min_expected_count: int = Field(default=3000, ge=1, le=10000)
     provider_timeout_seconds: int = Field(default=120, ge=5, le=600)
+    sync_tickflow_universes: bool = True
 
 
 class StockBasicSyncResult(BaseModel):
@@ -96,6 +98,8 @@ class StockBasicSyncResult(BaseModel):
     detail_enriched_count: int
     delisted_marked_count: int
     fallback_used: bool
+    tickflow_universe_count: int = 0
+    tickflow_universe_member_count: int = 0
     errors: list[str] = Field(default_factory=list)
 
 
@@ -768,6 +772,18 @@ class MarketDataSyncService:
             delisted_marked_count = await self.repository.update_stock_statuses(stock_codes=sorted(delisted_codes), status="delisted")
             await self.repository.commit()
 
+        tickflow_universe_count = 0
+        tickflow_universe_member_count = 0
+        if payload.sync_tickflow_universes:
+            try:
+                tickflow_universe_count, tickflow_universe_member_count = await self._sync_tickflow_universes()
+            except Exception as exc:
+                # Master data remains successful if optional TickFlow catalogue
+                # permissions/key are not yet configured.  Runtime enablement
+                # performs a strict capability probe separately.
+                errors.append(self._error_text("tickflow_universe", exc))
+                logger.warning("tickflow universe catalogue sync skipped: %s", exc)
+
         return StockBasicSyncResult(
             source=source,
             fetched_count=len(rows),
@@ -775,8 +791,68 @@ class MarketDataSyncService:
             detail_enriched_count=detail_enriched_count,
             delisted_marked_count=delisted_marked_count,
             fallback_used=fallback_used,
+            tickflow_universe_count=tickflow_universe_count,
+            tickflow_universe_member_count=tickflow_universe_member_count,
             errors=errors,
         )
+
+    async def _sync_tickflow_universes(self) -> tuple[int, int]:
+        """Synchronize provider catalogue after stock master, preserving member history.
+
+        Only universes whose catalogue hash changed fetch membership.  The
+        TickFlow batch API is used in 50-universe chunks, avoiding a slow
+        serial query for SW1/SW2/SW3 catalogue entries.
+        """
+        provider: TickflowQuoteProvider | None = None
+        try:
+            factory = TickflowProviderFactory(ConfigCenterRepository(self.repository.session))
+            provider = TickflowQuoteProvider(await factory.resolve_credentials())
+            catalogue = await provider.universe_catalog()
+            existing_hashes = await self.repository.market_universe_hashes(provider_code="tickflow")
+            changed_ids: list[str] = []
+            persisted: dict[str, int] = {}
+            for item in catalogue:
+                identity = {
+                    "id": item["universe_id"],
+                    "name": item["universe_name"],
+                    "count": item["source_symbol_count"],
+                    "category": item.get("category"),
+                    "taxonomy_level": item.get("taxonomy_level"),
+                }
+                catalog_hash = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                universe = await self.repository.upsert_market_universe(
+                    {
+                        "provider_code": "tickflow",
+                        "universe_id": item["universe_id"],
+                        "universe_name": item["universe_name"],
+                        "description": item.get("description"),
+                        "region": item.get("region"),
+                        "category": item.get("category"),
+                        "taxonomy_level": item.get("taxonomy_level"),
+                        "logical_group_key": item.get("logical_group_key"),
+                        "source_symbol_count": item["source_symbol_count"],
+                        "catalog_hash": catalog_hash,
+                        "is_enabled": True,
+                    }
+                )
+                persisted[item["universe_id"]] = universe.id
+                if existing_hashes.get(item["universe_id"]) != catalog_hash:
+                    changed_ids.append(item["universe_id"])
+
+            member_count = 0
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            for offset in range(0, len(changed_ids), 50):
+                group = changed_ids[offset : offset + 50]
+                payload = await provider.universe_members_batch(group)
+                for universe_id in group:
+                    member_count += await self.repository.replace_market_universe_members(
+                        persisted[universe_id], payload.get(universe_id, []), as_of=today
+                    )
+            await self.repository.commit()
+            return len(catalogue), member_count
+        finally:
+            if provider is not None:
+                provider.close()
 
     async def sync_index_catalog(self, payload: IndexCatalogSyncRequest) -> IndexCatalogSyncResult:
         errors: list[str] = []
@@ -1289,14 +1365,16 @@ class MarketDataSyncService:
         existing_status = getattr(existing, "status", None)
         if existing_status in {"excluded", "delisted", "suspended"} and not incoming_source.startswith("tushare:"):
             incoming_status = existing_status
+        stock_name = row.get("stock_name") or getattr(existing, "stock_name", None) or str(row["stock_code"])
         return {
             "stock_code": normalize_symbol(str(row["stock_code"])),
-            "stock_name": row.get("stock_name") or getattr(existing, "stock_name", None) or str(row["stock_code"]),
+            "stock_name": stock_name,
             "market": row.get("market") or getattr(existing, "market", None) or "CN",
             "exchange": row.get("exchange") or getattr(existing, "exchange", None),
             "list_date": row.get("list_date") or getattr(existing, "list_date", None),
             "delist_date": row.get("delist_date") or getattr(existing, "delist_date", None),
             "status": incoming_status,
+            "is_st": MarketDataSyncService._is_st_stock_name(stock_name),
             "industry": row.get("industry") or getattr(existing, "industry", None),
             "area": row.get("area") or getattr(existing, "area", None),
             "metadata_json": metadata,
@@ -1406,6 +1484,16 @@ class MarketDataSyncService:
             or name.endswith("(退)")
             or name.endswith("（退）")
         )
+
+    @staticmethod
+    def _is_st_stock_name(value: object) -> bool:
+        """Use the exchange display name as the authoritative ST marker.
+
+        It is recalculated on every weekly stock-basic merge so an ST removal
+        naturally clears the flag without any manual corrective SQL.
+        """
+        name = str(value or "").strip().lstrip("* ").upper()
+        return name.startswith("ST")
 
     async def _capture_sync_raw(
         self,

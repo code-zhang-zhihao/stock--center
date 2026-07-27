@@ -86,6 +86,81 @@ class RedisClient:
         if client is None:
             self._memory_set(key, value, ttl_seconds=ttl_seconds)
             return True
+
+    async def set_many_json(self, items: list[tuple[str, dict | list, int]]) -> bool:
+        """Atomically write a coherent realtime cache snapshot when Redis is available.
+
+        A pipeline avoids one remote RTT per market/sector/pool cache key.  The
+        in-memory fallback mirrors the final values so local development keeps
+        the same read semantics.
+        """
+        if not items:
+            return True
+        client = await self._get_client()
+        if client is None:
+            for key, value, ttl_seconds in items:
+                self._memory_set(key, value, ttl_seconds=ttl_seconds)
+            return True
+        try:
+            pipeline = client.pipeline(transaction=True)
+            for key, value, ttl_seconds in items:
+                pipeline.set(key, json.dumps(value, ensure_ascii=False), ex=max(1, ttl_seconds))
+            await pipeline.execute()
+            return True
+        except Exception as exc:
+            logger.warning("redis set_many_json failed: count=%s error=%s", len(items), exc)
+            for key, value, ttl_seconds in items:
+                self._memory_set(key, value, ttl_seconds=ttl_seconds)
+            return True
+
+    async def acquire_lease(self, key: str, owner: str, *, ttl_seconds: int) -> bool:
+        """Acquire or renew a short exclusive lease without exposing Redis details."""
+        client = await self._get_client()
+        if client is None:
+            current = self._memory_get(key)
+            if isinstance(current, dict) and current.get("owner") not in {None, owner}:
+                return False
+            self._memory_set(key, {"owner": owner}, ttl_seconds=ttl_seconds)
+            return True
+        try:
+            acquired = await client.set(key, owner, nx=True, ex=max(1, ttl_seconds))
+            if acquired:
+                return True
+            current = await client.get(key)
+            if isinstance(current, bytes):
+                current = current.decode("utf-8")
+            if current != owner:
+                return False
+            # Renew only our own lease.  The compare-and-expire Lua script
+            # prevents a late owner from extending a new leader's lease.
+            renewed = await client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+                1,
+                key,
+                owner,
+                max(1, ttl_seconds),
+            )
+            return bool(renewed)
+        except Exception as exc:
+            logger.warning("redis acquire_lease failed: key=%s error=%s", key, exc)
+            return False
+
+    async def release_lease(self, key: str, owner: str) -> None:
+        client = await self._get_client()
+        if client is None:
+            current = self._memory_get(key)
+            if isinstance(current, dict) and current.get("owner") == owner:
+                self._memory_cache.pop(key, None)
+            return
+        try:
+            await client.eval(
+                "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+                1,
+                key,
+                owner,
+            )
+        except Exception as exc:
+            logger.warning("redis release_lease failed: key=%s error=%s", key, exc)
         try:
             await client.set(key, json.dumps(value, ensure_ascii=False), ex=max(1, ttl_seconds))
             return True

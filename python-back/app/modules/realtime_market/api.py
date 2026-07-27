@@ -35,6 +35,17 @@ async def quotes(stock_codes: str | None = Query(default=None)):
     return ApiResponse.ok(await realtime_market_service.quotes(codes or None))
 
 
+@router.get("/decision-targets")
+async def decision_targets():
+    return ApiResponse.ok(await realtime_market_service.decision_targets())
+
+
+@router.get("/depth")
+async def depth(stock_codes: str | None = Query(default=None)):
+    codes = [item.strip() for item in (stock_codes or "").split(",") if item.strip()]
+    return ApiResponse.ok(await realtime_market_service.depth(codes or None))
+
+
 @router.get("/pools/{pool_code}")
 async def pool(pool_code: str):
     payload = await realtime_market_service.pool(pool_code)

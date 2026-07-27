@@ -117,6 +117,19 @@
             </div>
           </section>
 
+          <section v-if="realtime?.depth" class="panel">
+            <div class="panel-title">
+              <h2>五档盘口</h2>
+              <span>缓存快照</span>
+            </div>
+            <dl class="info-grid">
+              <dt>买一</dt><dd>{{ formatNumber(realtime.depth.bids?.[0]?.price ?? null) }} / {{ formatNumber(realtime.depth.bids?.[0]?.volume ?? null) }}</dd>
+              <dt>卖一</dt><dd>{{ formatNumber(realtime.depth.asks?.[0]?.price ?? null) }} / {{ formatNumber(realtime.depth.asks?.[0]?.volume ?? null) }}</dd>
+              <dt>五档委比</dt><dd>{{ formatNumber(realtime.depth.features?.bid_ask_imbalance_5 ?? null) }}</dd>
+              <dt>买卖价差</dt><dd>{{ formatNumber(realtime.depth.features?.best_spread ?? null) }}</dd>
+            </dl>
+          </section>
+
           <section class="panel">
             <div class="panel-title">
               <h2>所属板块</h2>
@@ -345,8 +358,7 @@ const chartContext = computed(() => {
   const realtimeData = realtime.value;
   if (!realtimeData) return '正在加载实时行情';
   if (!realtimeData.meta.market_session) return '非交易时段 · 展示最后一次缓存，不作为当前实时行情';
-  if (realtimeData.meta.cache_status === 'on_demand') return `盘中按需直连 MooTDX · ${realtimeData.quote ? formatQuoteTime(realtimeData.quote.quote_time) : '分时数据已刷新'}`;
-  if (!realtimeData.meta.runtime_enabled) return '实时运行时未启用 · 当前可手动按需直连 MooTDX';
+  if (!realtimeData.meta.runtime_enabled) return '实时运行时未启用 · 页面只读取缓存，不会绕过额度直连数据源';
   if (realtimeData.quote) return `盘中缓存 · ${formatQuoteTime(realtimeData.quote.quote_time)}`;
   return '盘中缓存暂不可用 · 等待下一轮刷新';
 });

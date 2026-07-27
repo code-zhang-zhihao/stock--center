@@ -96,23 +96,84 @@ class TickflowQuoteProvider:
         rows = await asyncio.to_thread(self._quote_sync, symbols, True)
         return rows, rows
 
+    async def universe_quotes(self, universe_id: str = "CN_Equity_A") -> tuple[list[dict], list[dict]]:
+        """Fetch a provider universe in one request; never synthesize it locally."""
+        rows = await asyncio.to_thread(self._universe_quote_sync, universe_id)
+        return rows, rows
+
+    async def depth_batch(self, stock_codes: list[str]) -> list[dict]:
+        """Fetch visible five-level order books through TickFlow's batch endpoint."""
+        symbols = [tickflow_symbol(code) for code in stock_codes if normalize_symbol(code)]
+        if not symbols:
+            return []
+        return await asyncio.to_thread(self._depth_batch_sync, symbols)
+
+    async def universe_catalog(self) -> list[dict]:
+        return await asyncio.to_thread(self._universe_catalog_sync)
+
+    async def universe_members(self, universe_id: str) -> list[str]:
+        return await asyncio.to_thread(self._universe_members_sync, universe_id)
+
+    async def universe_members_batch(self, universe_ids: list[str]) -> dict[str, list[str]]:
+        return await asyncio.to_thread(self._universe_members_batch_sync, universe_ids)
+
     async def probe(self, *, symbol: str = "600519.SH") -> TickflowProbeResult:
+        """Verify every capability the realtime runtime needs before enabling it.
+
+        A successful single quote is deliberately insufficient: an old key can
+        answer it while lacking all-market quote or five-level depth access.
+        """
         started = perf_counter()
+        details: dict[str, Any] = {"symbol": symbol, "capabilities": {}}
         try:
             single_rows = await asyncio.to_thread(self._quote_sync, [symbol], False)
-            batch_rows = await asyncio.to_thread(self._quote_sync, [symbol], True)
+            details["capabilities"]["quote_single"] = {"available": bool(single_rows), "row_count": len(single_rows)}
         except Exception as exc:
-            return TickflowProbeResult(False, str(exc), {"symbol": symbol})
+            details["capabilities"]["quote_single"] = {"available": False, "error": str(exc)}
+            return TickflowProbeResult(False, str(exc), details)
         if not single_rows:
-            return TickflowProbeResult(False, "TickFlow returned no quote data", {"symbol": symbol})
+            return TickflowProbeResult(False, "TickFlow returned no quote data", details)
+
+        try:
+            probe_symbols = await asyncio.to_thread(self._probe_symbols_sync)
+        except Exception as exc:
+            details["capabilities"]["universe_catalog"] = {"available": False, "error": str(exc)}
+            return TickflowProbeResult(False, str(exc), details)
+
+        operations: list[tuple[str, Callable[[], Any], int]] = [
+            ("quote_symbol_batch_50", lambda: self._quote_sync(probe_symbols[:50], True), 50),
+            ("quote_universe", lambda: self._universe_quote_sync("CN_Equity_A"), 1),
+            ("depth_batch_200", lambda: self._depth_batch_sync(probe_symbols[:200]), 200),
+        ]
+        errors: list[str] = []
+        for capability, operation, expected in operations:
+            stage_started = perf_counter()
+            try:
+                result = await asyncio.to_thread(operation)
+                row_count = len(result) if hasattr(result, "__len__") else 0
+                details["capabilities"][capability] = {
+                    "available": bool(result),
+                    "expected_symbols": expected,
+                    "row_count": row_count,
+                    "latency_ms": int((perf_counter() - stage_started) * 1000),
+                }
+                if not result:
+                    errors.append(f"{capability}: no data returned")
+            except Exception as exc:
+                details["capabilities"][capability] = {
+                    "available": False,
+                    "expected_symbols": expected,
+                    "error": str(exc),
+                    "latency_ms": int((perf_counter() - stage_started) * 1000),
+                }
+                errors.append(f"{capability}: {exc}")
+
         latest = single_rows[0]
         return TickflowProbeResult(
-            True,
-            None,
+            not errors,
+            "; ".join(errors) if errors else None,
             {
-                "symbol": symbol,
-                "quote_by_symbol": True,
-                "quote_batch": bool(batch_rows),
+                **details,
                 "row_count": len(single_rows),
                 "quote_time": latest.get("quote_time").isoformat() if isinstance(latest.get("quote_time"), datetime) else None,
                 "latency_ms": int((perf_counter() - started) * 1000),
@@ -163,6 +224,157 @@ class TickflowQuoteProvider:
                 rows.append(row)
         return rows
 
+    def _universe_quote_sync(self, universe_id: str) -> list[dict]:
+        client = self._get_client()
+        try:
+            response = client.quotes.get(universes=[universe_id], as_dataframe=False)
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow universe quote request failed: {exc}") from exc
+        if not isinstance(response, list):
+            raise TickflowRuntimeError("TickFlow universe quote response is not a list")
+        return [row for item in response if isinstance(item, dict) if (row := self._normalize_quote(item)) is not None]
+
+    def _depth_batch_sync(self, symbols: list[str]) -> list[dict]:
+        client = self._get_client()
+        try:
+            response = client.depth.batch(symbols, batch_size=min(200, len(symbols)), max_workers=1, show_progress=False)
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow depth batch request failed: {exc}") from exc
+        if not isinstance(response, dict):
+            raise TickflowRuntimeError("TickFlow depth batch response is not a mapping")
+        rows: list[dict] = []
+        for source_symbol, item in response.items():
+            normalized = self._normalize_depth(source_symbol, item)
+            if normalized is not None:
+                rows.append(normalized)
+        return rows
+
+    def _probe_symbols_sync(self) -> list[str]:
+        client = self._get_client()
+        try:
+            detail = client.universes.get("CN_Equity_A")
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow universe catalogue request failed: {exc}") from exc
+        payload = _object_to_mapping(detail)
+        raw_symbols = payload.get("symbols") or payload.get("members") or []
+        symbols: list[str] = []
+        for raw in raw_symbols:
+            if isinstance(raw, str):
+                value = raw
+            else:
+                item = _object_to_mapping(raw)
+                value = str(item.get("symbol") or item.get("code") or "")
+            if value:
+                symbols.append(value)
+            if len(symbols) >= 200:
+                break
+        if len(symbols) < 200:
+            raise TickflowRuntimeError(f"TickFlow CN_Equity_A catalogue returned only {len(symbols)} symbols; 200 are required for depth probe")
+        return symbols
+
+    def _universe_catalog_sync(self) -> list[dict]:
+        client = self._get_client()
+        try:
+            response = client.universes.list()
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow universe list request failed: {exc}") from exc
+        if not isinstance(response, list):
+            raise TickflowRuntimeError("TickFlow universe catalogue response is not a list")
+        rows: list[dict] = []
+        for raw in response:
+            item = _object_to_mapping(raw)
+            universe_id = str(item.get("id") or item.get("universe_id") or "").strip()
+            if not universe_id:
+                continue
+            name = str(item.get("name") or item.get("display_name") or universe_id).strip()
+            level = _taxonomy_level(universe_id, name)
+            rows.append(
+                {
+                    "universe_id": universe_id,
+                    "universe_name": name,
+                    "description": item.get("description"),
+                    "region": item.get("region"),
+                    "category": item.get("category") or item.get("type"),
+                    "taxonomy_level": level,
+                    "logical_group_key": f"{level}:{name}" if level else None,
+                    "source_symbol_count": safe_int(item.get("symbol_count") or item.get("count")) or 0,
+                    "raw": json_safe(item),
+                }
+            )
+        return rows
+
+    def _universe_members_sync(self, universe_id: str) -> list[str]:
+        client = self._get_client()
+        try:
+            detail = client.universes.get(universe_id)
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow universe member request failed ({universe_id}): {exc}") from exc
+        payload = _object_to_mapping(detail)
+        raw_symbols = payload.get("symbols") or payload.get("members") or []
+        result: list[str] = []
+        for raw in raw_symbols:
+            if isinstance(raw, str):
+                symbol = raw
+            else:
+                item = _object_to_mapping(raw)
+                symbol = str(item.get("symbol") or item.get("code") or "")
+            code = normalize_symbol(symbol)
+            if code:
+                result.append(code)
+        return sorted(set(result))
+
+    def _universe_members_batch_sync(self, universe_ids: list[str]) -> dict[str, list[str]]:
+        client = self._get_client()
+        if not universe_ids:
+            return {}
+        try:
+            response = client.universes.batch(universe_ids)
+        except Exception as exc:
+            raise TickflowRuntimeError(f"TickFlow universe member batch request failed: {exc}") from exc
+        if not isinstance(response, dict):
+            raise TickflowRuntimeError("TickFlow universe member batch response is not a mapping")
+        result: dict[str, list[str]] = {}
+        for universe_id, detail in response.items():
+            payload = _object_to_mapping(detail)
+            members: list[str] = []
+            for raw in payload.get("symbols") or payload.get("members") or []:
+                if isinstance(raw, str):
+                    symbol = raw
+                else:
+                    item = _object_to_mapping(raw)
+                    symbol = str(item.get("symbol") or item.get("code") or "")
+                code = normalize_symbol(symbol)
+                if code:
+                    members.append(code)
+            result[str(universe_id)] = sorted(set(members))
+        return result
+
+    def _get_client(self) -> Any:
+        client = self._client
+        if client is None:
+            client = self._client_factory(self.credentials)
+            self._client = client
+        return client
+
+    @staticmethod
+    def _normalize_depth(source_symbol: str, value: Any) -> dict | None:
+        item = _object_to_mapping(value)
+        symbol = str(item.get("symbol") or source_symbol or "")
+        stock_code = normalize_symbol(symbol)
+        if not stock_code:
+            return None
+        bids = _depth_levels(item.get("bids") or item.get("bid"))
+        asks = _depth_levels(item.get("asks") or item.get("ask"))
+        return {
+            "stock_code": stock_code,
+            "source": "tickflow",
+            "source_symbol": symbol,
+            "depth_time": _as_utc_datetime(item.get("timestamp") or item.get("datetime") or item.get("time")),
+            "bids": bids,
+            "asks": asks,
+            "metadata_json": {"source": "tickflow:depth", "raw": json_safe(item)},
+        }
+
     @staticmethod
     def _normalize_quote(item: dict) -> dict | None:
         symbol = str(item.get("symbol") or "")
@@ -202,6 +414,44 @@ class TickflowQuoteProvider:
         }
 
 
+def _object_to_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        return dumped if isinstance(dumped, dict) else {}
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        dumped = to_dict()
+        return dumped if isinstance(dumped, dict) else {}
+    return vars(value) if hasattr(value, "__dict__") else {}
+
+
+def _depth_levels(value: Any) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    levels: list[dict] = []
+    for index, raw in enumerate(value[:5], start=1):
+        item = _object_to_mapping(raw)
+        if not item and isinstance(raw, (list, tuple)):
+            item = {"price": raw[0] if raw else None, "volume": raw[1] if len(raw) > 1 else None}
+        price = safe_float(item.get("price"))
+        volume = safe_int(item.get("volume") or item.get("size") or item.get("quantity"))
+        if price is None and volume is None:
+            continue
+        levels.append({"level": index, "price": price, "volume": volume})
+    return levels
+
+
+def _taxonomy_level(universe_id: str, universe_name: str) -> str | None:
+    marker = f"{universe_id} {universe_name}".upper().replace("_", " ")
+    for level in ("SW1", "SW2", "SW3"):
+        if level in marker:
+            return level.lower()
+    return None
+
+
 class TickflowProviderFactory:
     """Loads one active TickFlow credential from Config Center v2."""
 
@@ -215,6 +465,24 @@ class TickflowProviderFactory:
     async def resolve_credentials(self) -> TickflowCredentials:
         config, options, values = await self._load_candidates()
         value = values[0]
+        return self._credentials_for(config, options, value)
+
+    async def resolve_realtime_credentials(self) -> TickflowCredentials:
+        """Resolve only a Key that passed the complete realtime capability probe."""
+        config, options, values = await self._load_candidates()
+        for value in values:
+            probe = (value.metadata_json or {}).get("tickflow_realtime_probe")
+            if isinstance(probe, dict) and probe.get("available") is True:
+                return self._credentials_for(config, options, value)
+        details = []
+        for value in values:
+            probe = (value.metadata_json or {}).get("tickflow_realtime_probe")
+            if isinstance(probe, dict):
+                details.append(str(probe.get("error") or "未完成实时权限测试"))
+        suffix = f"；最近测试：{details[0]}" if details else "；请先在数据源配置中测试全市场 Quote、50 标的 Quote 和 200 标的五档深度"
+        raise TickflowRuntimeError("No TickFlow API key has passed the realtime capability probe" + suffix)
+
+    def _credentials_for(self, config: SystemConfig, options: dict, value: ConfigValue) -> TickflowCredentials:
         endpoint = self._endpoint_url(value, options)
         return TickflowCredentials(
             system_config_id=config.id,
@@ -294,12 +562,23 @@ class TickflowProviderFactory:
     ) -> None:
         if not result.available:
             error_text = str(result.error or "")
-            if any(token in error_text.lower() for token in ("401", "403", "unauthorized", "forbidden", "invalid api key")):
+            # A capability 403 means this Key is genuine but missing a paid
+            # entitlement.  Do not disable it as an invalid credential; the
+            # settings UI must keep it visible for upgrade/retest.
+            if any(token in error_text.lower() for token in ("401", "unauthorized", "invalid api key", "invalid_api_key")):
                 await self.repository.mark_value_invalid(value.id)
             else:
                 await self.repository.mark_value_failure(value.id)
         else:
             await self.repository.mark_value_used(value.id)
+        metadata = dict(value.metadata_json or {})
+        metadata["tickflow_realtime_probe"] = {
+            "available": result.available,
+            "error": result.error,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "capabilities": json_safe(result.details.get("capabilities", {})),
+        }
+        await self.repository.update_value(value.id, {"metadata_json": metadata})
         await self.repository.record_call(
             {
                 "trace_id": uuid4().hex,
@@ -309,7 +588,10 @@ class TickflowProviderFactory:
                 "capability": "tickflow_quote_connectivity_test",
                 "call_type": "test_value",
                 "status": "success" if result.available else "failed",
-                "request_summary": {"symbol": "600519.SH"},
+                "request_summary": {
+                    "symbol": "600519.SH",
+                    "required_capabilities": ["quote_universe", "quote_symbol_batch_50", "depth_batch_200"],
+                },
                 "response_summary": {"fingerprint": value.fingerprint, **json_safe(result.details)},
                 "error_code": None if result.available else "tickflow_quote_connectivity_failed",
                 "error_message": result.error,

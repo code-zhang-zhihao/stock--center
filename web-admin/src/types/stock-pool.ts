@@ -59,3 +59,34 @@ export interface StockPoolMemberDetail {
   concepts: StockPoolSector[];
   industries: StockPoolSector[];
 }
+
+export interface StockProfile {
+  stock_code: string;
+  stock_name: string;
+  market: string;
+  exchange: string | null;
+  status: string;
+  is_st: boolean;
+  tushare_industry: string | null;
+  eligible_for_emotion_and_strategy: boolean;
+  concepts: StockPoolSector[];
+  tushare_industries: StockPoolSector[];
+  sw_industries: Array<{ universe_id: string; universe_name: string; taxonomy_level: 'sw1' | 'sw2' | 'sw3' | string; logical_group_key: string | null }>;
+  stock_pools: Array<{ pool_code: string; pool_name: string; pool_type: string; is_system: boolean }>;
+}
+
+export interface StockPoolCatalogItem {
+  catalog_type: 'system' | 'strategy' | 'user' | 'topic' | 'industry' | string;
+  item_code: string;
+  item_name: string;
+  member_count: number;
+  source: string;
+  updated_at: string | null;
+  is_enabled: boolean;
+  realtime?: {
+    change_pct?: number | null;
+    average_change_pct?: number | null;
+    heat_score?: number | null;
+    coverage_pct?: number | null;
+  } | null;
+}

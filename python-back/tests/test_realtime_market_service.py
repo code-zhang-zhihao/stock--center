@@ -140,6 +140,22 @@ def test_empty_quote_batch_is_a_degraded_input_not_a_successful_round(monkeypatc
     asyncio.run(run())
 
 
+def test_decision_target_pool_preserves_overflow_in_warm_watch_list():
+    service = RealtimeMarketService()
+    candidate_codes = [f"6{code:05d}" for code in range(1, 251)]
+    service._active_codes = candidate_codes
+    service._stock_names = {code: code for code in candidate_codes}
+    service._pools = {"candidate": {"stock_codes": candidate_codes}}
+    service._quotes = {code: {"stock_code": code, "change_pct": index / 100, "amount_yuan": 1_000_000} for index, code in enumerate(candidate_codes)}
+
+    hot, warm = service._build_decision_targets(RealtimeSettings(decision_target_limit=200))
+
+    assert len(hot) == 200
+    assert len(warm) == 50
+    assert {item["stock_code"] for item in hot}.isdisjoint({item["stock_code"] for item in warm})
+    assert all(item["reason"] == "pool:candidate" for item in [*hot, *warm])
+
+
 def test_mootdx_quote_retries_next_server_when_first_response_is_empty():
     provider = MootdxProvider()
     attempts: list[str] = []

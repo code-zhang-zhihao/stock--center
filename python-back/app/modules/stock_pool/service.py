@@ -124,6 +124,15 @@ class StockPoolService:
             raise StockPoolError("stock_pool_member_not_found", f"股票池成员不存在: {pool_code}/{stock_code}")
         return detail
 
+    async def stock_profile(self, *, stock_code: str) -> dict:
+        detail = await self.repository.stock_profile(stock_code)
+        if detail is None:
+            raise StockPoolError("stock_not_found", f"股票不存在: {stock_code}")
+        return detail
+
+    async def list_catalog(self, *, scope: str | None = None) -> list[dict]:
+        return await self.repository.list_catalog(scope=scope)
+
     async def _require_pool(self, pool_code: str) -> StockPool:
         pool = await self.repository.get_pool(pool_code)
         if pool is None:

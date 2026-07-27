@@ -6,6 +6,7 @@ from app.db.session import get_session
 from app.modules.stock_pool.repository import StockPoolRepository
 from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolUpdate
 from app.modules.stock_pool.service import StockPoolError, StockPoolService
+from app.modules.realtime_market.service import realtime_market_service
 
 
 router = APIRouter()
@@ -21,6 +22,27 @@ async def list_stock_pools(session: AsyncSession = Depends(get_session)):
         return ApiResponse.ok(await service(session).list_pools())
     except Exception as exc:
         return ApiResponse.fail(code="stock_pools_query_failed", message=str(exc))
+
+
+@router.get("/profiles/{stock_code}")
+async def stock_profile(stock_code: str, session: AsyncSession = Depends(get_session)):
+    return await _run(lambda: service(session).stock_profile(stock_code=stock_code))
+
+
+@router.get("/catalog")
+async def stock_pool_catalog(
+    scope: str | None = Query(default=None, pattern="^(system|strategy|user|topic|industry)$"),
+    session: AsyncSession = Depends(get_session),
+):
+    async def run():
+        items = await service(session).list_catalog(scope=scope)
+        sector_runtime = {item.get("sector_code"): item for item in (await realtime_market_service.sectors(limit=5000)).get("items", [])}
+        pool_runtime = {pool_code: await realtime_market_service.pool(pool_code) for pool_code in [item["item_code"] for item in items if item["source"] == "stock_pool"]}
+        for item in items:
+            item["realtime"] = sector_runtime.get(item["item_code"]) if item["catalog_type"] in {"topic", "industry"} else pool_runtime.get(item["item_code"])
+        return items
+
+    return await _run(run)
 
 
 @router.post("")

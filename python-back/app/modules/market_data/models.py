@@ -1,6 +1,6 @@
 from datetime import date, datetime, time
 
-from sqlalchemy import BigInteger, Date, DateTime, String, Text, Time, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Index, String, Text, Time, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,11 +45,55 @@ class Stock(Base):
     list_date: Mapped[date | None] = mapped_column(Date)
     delist_date: Mapped[date | None] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="active")
+    is_st: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     industry: Mapped[str | None] = mapped_column(String(120))
     area: Mapped[str | None] = mapped_column(String(120))
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
     updated_at = updated_at_column()
+
+
+class MarketUniverse(Base):
+    """Provider-owned symbol universe catalogue.
+
+    The raw provider universe is retained independently from canonical Tushare
+    sectors.  TickFlow's SW1/SW2/SW3 rows are later grouped by the runtime for
+    display and realtime industry aggregation.
+    """
+
+    __tablename__ = "t_market_universe"
+    __table_args__ = (UniqueConstraint("provider_code", "universe_id", name="uq_t_market_universe_provider_id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    provider_code: Mapped[str] = mapped_column(String(40), nullable=False)
+    universe_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    universe_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    region: Mapped[str | None] = mapped_column(String(20))
+    category: Mapped[str | None] = mapped_column(String(40))
+    taxonomy_level: Mapped[str | None] = mapped_column(String(20))
+    logical_group_key: Mapped[str | None] = mapped_column(String(260))
+    source_symbol_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    catalog_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    first_seen_at = created_at_column()
+    last_synced_at = updated_at_column()
+
+
+class MarketUniverseMember(Base):
+    __tablename__ = "t_market_universe_member"
+    __table_args__ = (
+        UniqueConstraint("universe_row_id", "stock_code", "valid_from", name="uq_t_market_universe_member_effective_from"),
+        Index("uq_t_market_universe_member_active", "universe_row_id", "stock_code", unique=True, postgresql_where=text("valid_to IS NULL")),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    universe_row_id: Mapped[int] = mapped_column(ForeignKey("t_market_universe.id", ondelete="CASCADE"), nullable=False)
+    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    valid_from: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_to: Mapped[date | None] = mapped_column(Date)
+    first_seen_at = created_at_column()
+    last_seen_at = updated_at_column()
 
 
 class TradeCalendar(Base):

@@ -107,6 +107,20 @@
       </section>
     </div>
 
+    <section class="catalog-panel">
+      <div class="catalog-heading">
+        <div>
+          <strong>题材、行业与池目录</strong>
+          <p>题材使用 Tushare 概念，行业使用 TickFlow 申万层级；两者不等同于股票池。</p>
+        </div>
+        <n-space>
+          <n-select v-model:value="catalogScope" size="small" :options="catalogScopeOptions" style="width: 150px" />
+          <n-button secondary size="small" :loading="loadingCatalog" @click="loadCatalog">刷新目录</n-button>
+        </n-space>
+      </div>
+      <n-data-table :columns="catalogColumns" :data="catalogItems" :loading="loadingCatalog" :pagination="{ pageSize: 12 }" size="small" />
+    </section>
+
     <n-modal
       v-model:show="poolModalOpen"
       preset="card"
@@ -254,6 +268,7 @@ import {
   NInput,
   NModal,
   NPagination,
+  NSelect,
   NSpace,
   NSpin,
   NSwitch,
@@ -263,7 +278,7 @@ import {
   type DataTableColumns,
 } from 'naive-ui';
 import { stockPoolApi } from '@/api/stock-pool';
-import type { StockPool, StockPoolCandidate, StockPoolMember, StockPoolMemberDetail, StockPoolMemberPage } from '@/types/stock-pool';
+import type { StockPool, StockPoolCandidate, StockPoolCatalogItem, StockPoolMember, StockPoolMemberDetail, StockPoolMemberPage } from '@/types/stock-pool';
 import { formatTime } from '@/utils/json';
 
 const router = useRouter();
@@ -291,6 +306,9 @@ const candidateResults = ref<StockPoolCandidate[]>([]);
 const selectedCandidates = ref<StockPoolCandidate[]>([]);
 const loadingCandidates = ref(false);
 const memberDetail = ref<StockPoolMemberDetail | null>(null);
+const catalogScope = ref<'system' | 'strategy' | 'user' | 'topic' | 'industry'>('system');
+const catalogItems = ref<StockPoolCatalogItem[]>([]);
+const loadingCatalog = ref(false);
 const tableMaxHeight = ref(440);
 let candidateSearchTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -322,6 +340,22 @@ const memberColumns = computed<DataTableColumns<StockPoolMember>>(() => [
     }),
   },
 ]);
+const catalogScopeOptions = [
+  { label: '系统股票池', value: 'system' },
+  { label: '策略股票池', value: 'strategy' },
+  { label: '用户股票池', value: 'user' },
+  { label: '题材', value: 'topic' },
+  { label: '申万行业', value: 'industry' },
+];
+const catalogColumns = computed<DataTableColumns<StockPoolCatalogItem>>(() => [
+  { title: '类别', key: 'catalog_type', width: 100, render: (row) => ({ system: '系统池', strategy: '策略池', user: '用户池', topic: '题材', industry: '行业' }[row.catalog_type] || row.catalog_type) },
+  { title: '名称', key: 'item_name', minWidth: 180 },
+  { title: '成员数', key: 'member_count', width: 90 },
+  { title: '实时涨跌', key: 'realtime_change', width: 110, render: (row) => formatRealtimeChange(row) },
+  { title: '热度 / 覆盖', key: 'realtime_heat', width: 120, render: (row) => row.realtime?.heat_score == null ? '-' : `${row.realtime.heat_score} / ${row.realtime.coverage_pct ?? '-'}%` },
+  { title: '来源', key: 'source', width: 130, render: (row) => h('span', { class: 'mono' }, row.source) },
+  { title: '更新时间', key: 'updated_at', width: 170, render: (row) => formatTime(row.updated_at) },
+]);
 
 function memberRowKey(row: StockPoolMember) {
   return row.stock_code;
@@ -345,6 +379,22 @@ async function loadPools() {
   } finally {
     loadingPools.value = false;
   }
+}
+
+async function loadCatalog() {
+  loadingCatalog.value = true;
+  try {
+    catalogItems.value = await stockPoolApi.catalog(catalogScope.value);
+  } catch (error) {
+    message.error(errorMessage(error, '加载题材、行业与池目录失败'));
+  } finally {
+    loadingCatalog.value = false;
+  }
+}
+
+function formatRealtimeChange(row: StockPoolCatalogItem) {
+  const value = row.realtime?.change_pct ?? row.realtime?.average_change_pct;
+  return value == null ? '-' : `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
 async function loadMembers() {
@@ -576,10 +626,15 @@ watch(candidateKeyword, () => {
   candidateSearchTimer = setTimeout(() => void searchCandidates(), 250);
 });
 
+watch(catalogScope, () => {
+  void loadCatalog();
+});
+
 onMounted(() => {
   updateTableHeight();
   window.addEventListener('resize', updateTableHeight);
   void loadPools();
+  void loadCatalog();
 });
 onBeforeUnmount(() => {
   window.removeEventListener('resize', updateTableHeight);
@@ -593,6 +648,10 @@ onBeforeUnmount(() => {
 .topbar h1 { margin: 0; font-size: 24px; }
 .topbar p { margin: 6px 0 0; color: #667085; }
 .pool-workspace { height: max(560px, calc(100vh - 148px)); display: grid; grid-template-columns: minmax(288px, 320px) minmax(0, 1fr); overflow: hidden; border: 1px solid #d8e0e5; background: #fff; }
+.catalog-panel { margin-top: 16px; border: 1px solid #d8e0e5; background: #fff; padding: 14px; }
+.catalog-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
+.catalog-heading strong { color: #344054; }
+.catalog-heading p { margin: 4px 0 0; color: #667085; font-size: 12px; }
 .pool-list-panel, .members-panel { height: 100%; min-width: 0; padding: 16px; box-sizing: border-box; }
 .pool-list-panel { min-height: 0; display: flex; flex-direction: column; gap: 10px; border-right: 1px solid #d8e0e5; }
 .panel-heading { display: flex; justify-content: space-between; color: #344054; font-size: 13px; font-weight: 700; }
@@ -649,6 +708,7 @@ onBeforeUnmount(() => {
   .topbar h1 { font-size: 22px; }
   .topbar p { max-width: 260px; font-size: 13px; line-height: 1.5; }
   .pool-workspace { height: auto; min-height: 0; grid-template-columns: 1fr; overflow: visible; }
+  .catalog-heading { align-items: stretch; flex-direction: column; }
   .pool-list-panel { height: 314px; border-right: 0; border-bottom: 1px solid #d8e0e5; }
   .members-panel { min-height: 580px; }
   .members-content { height: 580px; }

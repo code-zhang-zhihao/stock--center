@@ -136,6 +136,26 @@ export interface RealtimeRoundMeta {
   error_samples: string[];
 }
 
+export interface RealtimeBlockMeta extends RealtimeRoundMeta {
+  block: 'market' | 'decision_quote' | 'depth' | 'minute' | string;
+  request_count: number;
+  coverage_pct: number | null;
+  cache_freshness_seconds: number | null;
+  rate_limited_count: number;
+  network_error_count: number;
+  degraded_reason: string | null;
+}
+
+export interface RealtimeRateBudget {
+  purchased_limit_per_minute: number;
+  safety_ratio: number;
+  safe_budget_per_minute: number;
+  used_requests_in_window: number;
+  remaining_requests_in_window: number;
+  cooldown_remaining_seconds: number;
+  rate_limited_count: number;
+}
+
 export interface RealtimeMinuteMeta {
   selected_count: number;
   registered_count: number;
@@ -160,6 +180,15 @@ export interface RealtimeHealth {
   reference_loaded_at: string | null;
   last_quote_round: RealtimeRoundMeta;
   last_minute_round: RealtimeMinuteMeta;
+  market: RealtimeBlockMeta;
+  decision_quote: RealtimeBlockMeta;
+  depth: RealtimeBlockMeta;
+  minute: RealtimeBlockMeta;
+  rate_budgets: Record<string, RealtimeRateBudget>;
+  leader_active: boolean;
+  depth_cache_count: number;
+  decision_target_count: number;
+  warm_target_count: number;
   error: string | null;
 }
 

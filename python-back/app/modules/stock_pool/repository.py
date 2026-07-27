@@ -4,7 +4,7 @@ from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.market_data.models import SectorBasic, SectorComponent, Stock
+from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock
 from app.modules.stock_pool.models import StockPool, StockPoolMember
 
 
@@ -236,6 +236,138 @@ class StockPoolRepository:
             "concepts": [dict(row) for row in sector_rows if row["sector_type"] == "concept"],
             "industries": [dict(row) for row in sector_rows if row["sector_type"] == "industry"],
         }
+
+    async def stock_profile(self, stock_code: str) -> dict | None:
+        """Unified membership profile; categories remain intentionally separate."""
+        stock = (await self.session.execute(select(Stock).where(Stock.stock_code == stock_code))).scalar_one_or_none()
+        if stock is None:
+            return None
+        tushare_rows = (
+            await self.session.execute(
+                select(SectorBasic.sector_code, SectorBasic.sector_name, SectorBasic.sector_type, SectorBasic.source)
+                .join(SectorComponent, SectorComponent.sector_code == SectorBasic.sector_code)
+                .where(
+                    SectorComponent.stock_code == stock_code,
+                    SectorComponent.end_date.is_(None),
+                    SectorBasic.source.like("tushare:%"),
+                    SectorComponent.source.like("tushare:%"),
+                    SectorBasic.sector_type.in_(["concept", "industry"]),
+                )
+                .order_by(SectorBasic.sector_type, SectorBasic.sector_name)
+            )
+        ).mappings().all()
+        tickflow_rows = (
+            await self.session.execute(
+                select(
+                    MarketUniverse.universe_id,
+                    MarketUniverse.universe_name,
+                    MarketUniverse.taxonomy_level,
+                    MarketUniverse.logical_group_key,
+                )
+                .join(MarketUniverseMember, MarketUniverseMember.universe_row_id == MarketUniverse.id)
+                .where(
+                    MarketUniverse.provider_code == "tickflow",
+                    MarketUniverseMember.stock_code == stock_code,
+                    MarketUniverseMember.valid_to.is_(None),
+                    MarketUniverse.taxonomy_level.in_(["sw1", "sw2", "sw3"]),
+                )
+                .order_by(MarketUniverse.taxonomy_level, MarketUniverse.universe_name, MarketUniverse.universe_id)
+            )
+        ).mappings().all()
+        pool_rows = (
+            await self.session.execute(
+                select(StockPool.pool_code, StockPool.pool_name, StockPool.pool_type, StockPool.is_system)
+                .join(StockPoolMember, StockPoolMember.pool_id == StockPool.id)
+                .where(StockPoolMember.stock_code == stock_code, StockPool.is_enabled.is_(True))
+                .order_by(StockPool.sort_order, StockPool.pool_code)
+            )
+        ).mappings().all()
+        return {
+            "stock_code": stock.stock_code,
+            "stock_name": stock.stock_name,
+            "market": stock.market,
+            "exchange": stock.exchange,
+            "status": stock.status,
+            "is_st": stock.is_st,
+            "tushare_industry": stock.industry,
+            "eligible_for_emotion_and_strategy": stock.status == "active" and not stock.is_st and stock.exchange in {"SH", "SZ", "SSE", "SZSE"},
+            "concepts": [dict(row) for row in tushare_rows if row["sector_type"] == "concept"],
+            "tushare_industries": [dict(row) for row in tushare_rows if row["sector_type"] == "industry"],
+            "sw_industries": [dict(row) for row in tickflow_rows],
+            "stock_pools": [dict(row) for row in pool_rows],
+        }
+
+    async def list_catalog(self, *, scope: str | None = None) -> list[dict]:
+        """List monitor pools, concepts and industries through one typed catalogue."""
+        items: list[dict] = []
+        if scope in {None, "system", "strategy", "user"}:
+            for row in await self.list_pools():
+                pool = row["pool"]
+                category = "system" if pool.is_system else ("strategy" if pool.pool_type == "strategy" else "user")
+                if scope not in {None, category}:
+                    continue
+                items.append(
+                    {
+                        "catalog_type": category,
+                        "item_code": pool.pool_code,
+                        "item_name": pool.pool_name,
+                        "member_count": row["member_count"],
+                        "source": "stock_pool",
+                        "updated_at": pool.updated_at,
+                        "is_enabled": pool.is_enabled,
+                    }
+                )
+        if scope in {None, "topic"}:
+            rows = await self.session.execute(
+                select(SectorBasic.sector_code, SectorBasic.sector_name, func.count(SectorComponent.id), SectorBasic.source, SectorBasic.updated_at)
+                .outerjoin(SectorComponent, and_(SectorComponent.sector_code == SectorBasic.sector_code, SectorComponent.end_date.is_(None)))
+                .where(SectorBasic.sector_type == "concept", SectorBasic.source.like("tushare:%"))
+                .group_by(SectorBasic.id)
+                .order_by(SectorBasic.sector_name)
+            )
+            items.extend(
+                {
+                    "catalog_type": "topic",
+                    "item_code": code,
+                    "item_name": name,
+                    "member_count": int(count),
+                    "source": source,
+                    "updated_at": updated_at,
+                    "is_enabled": True,
+                }
+                for code, name, count, source, updated_at in rows.all()
+            )
+        if scope in {None, "industry"}:
+            rows = await self.session.execute(
+                select(
+                    MarketUniverse.logical_group_key,
+                    MarketUniverse.universe_name,
+                    MarketUniverse.taxonomy_level,
+                    func.count(MarketUniverseMember.id),
+                    func.max(MarketUniverse.last_synced_at),
+                )
+                .join(MarketUniverseMember, MarketUniverseMember.universe_row_id == MarketUniverse.id)
+                .where(
+                    MarketUniverse.provider_code == "tickflow",
+                    MarketUniverse.taxonomy_level.in_(["sw1", "sw2", "sw3"]),
+                    MarketUniverseMember.valid_to.is_(None),
+                )
+                .group_by(MarketUniverse.logical_group_key, MarketUniverse.universe_name, MarketUniverse.taxonomy_level)
+                .order_by(MarketUniverse.taxonomy_level, MarketUniverse.universe_name)
+            )
+            items.extend(
+                {
+                    "catalog_type": "industry",
+                    "item_code": f"tickflow:{logical_group_key or f'{level}:{name}'}",
+                    "item_name": name,
+                    "member_count": int(count),
+                    "source": f"tickflow:{level}",
+                    "updated_at": updated_at,
+                    "is_enabled": True,
+                }
+                for logical_group_key, name, level, count, updated_at in rows.all()
+            )
+        return items
 
     async def commit(self) -> None:
         await self.session.commit()

@@ -253,6 +253,12 @@ export interface StockAnalysisRealtime {
     bar_count?: number;
     features?: Record<string, unknown>;
   };
+  depth?: {
+    bids?: Array<{ level: number; price: number | null; volume: number | null }>;
+    asks?: Array<{ level: number; price: number | null; volume: number | null }>;
+    features?: Record<string, number | null>;
+  } | null;
+  depth_history?: Array<Record<string, unknown>>;
   meta: {
     query_mode: string;
     resolved_source: string | null;
@@ -261,7 +267,7 @@ export interface StockAnalysisRealtime {
     persisted: boolean;
     runtime_enabled?: boolean;
     market_session?: boolean;
-    cache_status?: 'hit' | 'on_demand' | 'cooldown' | 'unavailable' | string;
+    cache_status?: 'hit' | 'miss' | 'cooldown' | 'unavailable' | string;
     errors: string[];
   };
 }

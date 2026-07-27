@@ -240,6 +240,13 @@ class SyncStockBasicHandler:
             "required": False,
             "description": "单次外部 provider 请求超时时间，AkShare 超时后可 fallback 到 MooTDX。",
         },
+        "sync_tickflow_universes": {
+            "label": "同步 TickFlow 标的池",
+            "type": "boolean",
+            "default": True,
+            "required": False,
+            "description": "主数据完成后同步 TickFlow 标的池目录；仅目录变更时批量更新成员历史。",
+        },
     }
     default_payload = {
         "source": "tushare",
@@ -251,6 +258,7 @@ class SyncStockBasicHandler:
         "mark_delisted": True,
         "min_expected_count": 3000,
         "provider_timeout_seconds": 120,
+        "sync_tickflow_universes": True,
     }
     force_async = True
 

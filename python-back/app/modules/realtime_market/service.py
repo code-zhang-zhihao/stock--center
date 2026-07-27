@@ -13,7 +13,8 @@ from app.db.session import get_sessionmaker
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.market_data.providers import MootdxProvider, normalize_symbol
 from app.modules.realtime_market.repository import RealtimeMarketRepository
-from app.modules.realtime_market.schemas import RealtimeMinuteMeta, RealtimeRoundMeta, RealtimeSettings, RealtimeStatus
+from app.modules.realtime_market.rate_limit import RealtimeRateBudget
+from app.modules.realtime_market.schemas import RealtimeBlockMeta, RealtimeMinuteMeta, RealtimeRoundMeta, RealtimeSettings, RealtimeStatus
 from app.modules.realtime_market.tickflow_runtime import (
     TickflowCredentials,
     TickflowProviderFactory,
@@ -52,6 +53,24 @@ class RealtimeMarketService:
         self._trade_day_cache: dict[date, bool] = {}
         self._last_quote_round = RealtimeRoundMeta()
         self._last_minute_round = RealtimeMinuteMeta()
+        self._blocks: dict[str, RealtimeBlockMeta] = {
+            "market": RealtimeBlockMeta(block="market"),
+            "decision_quote": RealtimeBlockMeta(block="decision_quote"),
+            "depth": RealtimeBlockMeta(block="depth"),
+            "minute": RealtimeBlockMeta(block="minute"),
+        }
+        self._depth_by_stock: dict[str, dict] = {}
+        self._depth_history_by_stock: dict[str, list[dict]] = {}
+        self._decision_targets: list[dict] = []
+        self._warm_targets: list[dict] = []
+        self._last_market_refresh_clock = 0.0
+        self._last_decision_refresh_clock = 0.0
+        self._last_warm_refresh_clock = 0.0
+        self._last_depth_refresh_clock = 0.0
+        self._rate_budgets: dict[str, RealtimeRateBudget] = {}
+        self._rate_signature: tuple[object, ...] | None = None
+        self._leader_owner = f"{uuid.uuid4().hex}:{id(self)}"
+        self._leader_active = False
         self._error: str | None = None
         self._quote_providers: list[TickflowQuoteProvider | MootdxProvider] = []
         self._minute_providers: list[MootdxProvider] = []
@@ -81,6 +100,8 @@ class RealtimeMarketService:
         self._close_providers([*self._quote_providers, *self._minute_providers])
         self._quote_providers = []
         self._minute_providers = []
+        await redis_client.release_lease(await redis_client.key("realtime", "leader"), self._leader_owner)
+        self._leader_active = False
         logger.info("realtime market runtime stopped")
 
     async def status(self) -> dict:
@@ -91,6 +112,7 @@ class RealtimeMarketService:
             backend = "redis" if await redis_client.ping() else "memory_fallback"
         now = datetime.now(tz=SHANGHAI)
         stale_count = sum(1 for quote in self._quotes.values() if self._is_stale(quote, settings, now))
+        rate_budgets = {name: await budget.snapshot() for name, budget in self._rate_budgets.items()}
         return RealtimeStatus(
             running=self._running,
             enabled=settings.enabled,
@@ -107,6 +129,15 @@ class RealtimeMarketService:
             reference_loaded_at=self._reference_loaded_at,
             last_quote_round=self._last_quote_round,
             last_minute_round=self._last_minute_round,
+            market=self._blocks["market"],
+            decision_quote=self._blocks["decision_quote"],
+            depth=self._blocks["depth"],
+            minute=self._blocks["minute"],
+            rate_budgets=rate_budgets,
+            leader_active=self._leader_active,
+            depth_cache_count=len(self._depth_by_stock),
+            decision_target_count=len(self._decision_targets),
+            warm_target_count=len(self._warm_targets),
             error=self._error,
         ).model_dump(mode="json")
 
@@ -139,9 +170,6 @@ class RealtimeMarketService:
         now = datetime.now(tz=SHANGHAI)
         market_session = await self._is_open_market_session(now)
         await self._hydrate_stock_cache(code)
-        fetch_mode = "cache"
-        if market_session and self._stock_needs_on_demand_fetch(code):
-            fetch_mode = await self._fetch_stock_on_demand(code, settings)
         quote = self._quotes.get(code)
         meta = self._minute_meta_by_stock.get(code, {})
         errors = self._stock_cache_errors(code, settings)
@@ -152,8 +180,10 @@ class RealtimeMarketService:
             "quote": {**quote, "stale": self._is_stale(quote, settings, now)} if quote else None,
             "minute_bars": self._minutes.get(code, []),
             "minute_meta": meta,
+            "depth": self._depth_by_stock.get(code),
+            "depth_history": self._depth_history_by_stock.get(code, []),
             "meta": {
-                "query_mode": "realtime_on_demand" if fetch_mode == "on_demand" else "realtime_cache",
+                "query_mode": "realtime_cache",
                 "resolved_source": quote.get("source") if quote else (meta.get("source") if meta else None),
                 "attempted_engines": list(dict.fromkeys([settings.quote_provider, "mootdx"])),
                 "quote_source": quote.get("source") if quote else None,
@@ -163,7 +193,7 @@ class RealtimeMarketService:
                 "cache": "realtime_market",
                 "runtime_enabled": settings.enabled,
                 "market_session": market_session,
-                "cache_status": "hit" if fetch_mode == "cache" and (quote or code in self._minutes) else fetch_mode,
+                "cache_status": "hit" if (quote or code in self._minutes) else "miss",
                 "errors": errors,
             },
         }
@@ -188,6 +218,15 @@ class RealtimeMarketService:
                     self._minutes[code] = items
                 if isinstance(meta, dict):
                     self._minute_meta_by_stock[code] = meta
+        if code not in self._depth_by_stock:
+            cached_depth = await redis_client.get_json(await redis_client.key("realtime", "depth", code))
+            if isinstance(cached_depth, dict):
+                current = cached_depth.get("current")
+                history = cached_depth.get("history")
+                if isinstance(current, dict):
+                    self._depth_by_stock[code] = current
+                if isinstance(history, list):
+                    self._depth_history_by_stock[code] = history
 
     def _stock_needs_on_demand_fetch(self, code: str) -> bool:
         # A recorded no-data/provider-error result is a cache entry too. Retrying
@@ -306,6 +345,26 @@ class RealtimeMarketService:
     async def pool(self, pool_code: str) -> dict | None:
         return self._pool_summaries.get(pool_code)
 
+    async def decision_targets(self) -> dict:
+        return {
+            "as_of": self._blocks["decision_quote"].finished_at,
+            "hot": self._decision_targets,
+            "warm": self._warm_targets,
+            "hot_limit": self._settings.decision_target_limit,
+        }
+
+    async def depth(self, stock_codes: list[str] | None = None) -> dict:
+        codes = [normalize_symbol(code) for code in stock_codes] if stock_codes else list(self._depth_by_stock)
+        return {
+            "as_of": self._blocks["depth"].finished_at,
+            "round_id": self._blocks["depth"].round_id,
+            "items": [
+                {"stock_code": code, "current": self._depth_by_stock.get(code), "history": self._depth_history_by_stock.get(code, [])}
+                for code in codes
+                if code in self._depth_by_stock
+            ],
+        }
+
     async def sectors(self, *, sector_type: str | None = None, limit: int = 50) -> dict:
         items = list(self._sector_strength.values())
         if sector_type:
@@ -327,12 +386,15 @@ class RealtimeMarketService:
     async def _run_loop(self) -> None:
         while self._running:
             try:
-                settings = await self._load_settings(force=True)
+                settings = await self._load_settings()
                 now = datetime.now(tz=SHANGHAI)
                 if settings.enabled and await self._is_open_market_session(now):
-                    started = clock.monotonic()
                     await self._refresh_round(settings)
-                    await asyncio.sleep(max(1, settings.full_market_interval_seconds - (clock.monotonic() - started)))
+                    # Each block has its own cadence (60s market, 10s decision
+                    # Quote/depth, 60s warm, 60s minute).  A short scheduler
+                    # tick prevents a full-market refresh from delaying a
+                    # candidate's next 10-second snapshot.
+                    await asyncio.sleep(1)
                 else:
                     await asyncio.sleep(10)
             except asyncio.CancelledError:
@@ -347,66 +409,36 @@ class RealtimeMarketService:
             now = datetime.now(tz=SHANGHAI)
             if not force and not await self._is_open_market_session(now):
                 return
+            if not await self._acquire_leader(settings):
+                await self._hydrate_shared_caches()
+                return
             await self._ensure_reference(settings)
             if not self._active_codes:
                 self._error = "未加载到沪深 active 股票范围"
                 return
-            quote_started = clock.monotonic()
-            round_id = uuid.uuid4().hex[:16]
-            quotes, batch_errors, quote_transport_failed = await self._fetch_quotes(settings)
-            expected_count = len(self._active_codes)
-            received_codes = {item["stock_code"] for item in quotes}
-            failure_ratio = len(batch_errors) / max(1, math.ceil(expected_count / settings.quote_batch_size))
-            degraded = quote_transport_failed or failure_ratio > settings.round_failure_threshold
-            if quotes and not degraded:
-                for quote in quotes:
-                    self._quotes[quote["stock_code"]] = quote
-                self._market_overview = self._build_market_overview(round_id)
-                self._sector_strength = self._build_sector_strength(round_id)
-                self._pool_summaries = self._build_pool_summaries(round_id)
-                await self._persist_quote_caches(settings)
-                await self._publish("market_overview", self._market_overview)
-                await self._publish("sectors", {"as_of": self._market_overview.get("as_of"), "round_id": round_id, "items": list(self._sector_strength.values())})
-                for pool_code, summary in self._pool_summaries.items():
-                    await self._publish(f"pool:{pool_code}", summary)
-                for code in list(self._page_targets):
-                    await self._publish(f"stock:{code}", await self.stock(code))
-            self._last_quote_round = RealtimeRoundMeta(
-                round_id=round_id,
-                started_at=now.astimezone(ZoneInfo("UTC")),
-                finished_at=datetime.now(tz=ZoneInfo("UTC")),
-                provider=settings.quote_provider,
-                expected_count=expected_count,
-                received_count=len(received_codes),
-                missing_count=max(0, expected_count - len(received_codes)),
-                failed_batch_count=len(batch_errors),
-                duration_ms=int((clock.monotonic() - quote_started) * 1000),
-                degraded=degraded,
-                error_samples=batch_errors[:5],
-            )
-            if degraded:
-                self._error = "全市场 quote 失败批次比例超过阈值，已保留上一轮缓存"
-                logger.warning("realtime quote round degraded: round_id=%s expected=%s received=%s errors=%s", round_id, expected_count, len(received_codes), len(batch_errors))
-                # Minute-line guarantees are independent from the full-market quote feed.
-                # Holding/focus/page targets still need their refresh when quote_batch is degraded.
-                if self._is_continuous_market_session(now) and (force or clock.monotonic() - self._last_minute_refresh_clock >= settings.minute_refresh_interval_seconds):
-                    await self._refresh_minutes(settings, round_id)
-                    self._last_minute_refresh_clock = clock.monotonic()
-                return
-            self._error = None
+            now_clock = clock.monotonic()
+            if force or now_clock - self._last_market_refresh_clock >= settings.full_market_interval_seconds:
+                await self._refresh_market_quotes(settings)
+                self._last_market_refresh_clock = clock.monotonic()
+            decision_due = force or now_clock - self._last_decision_refresh_clock >= settings.decision_quote_interval_seconds
+            warm_due = force or now_clock - self._last_warm_refresh_clock >= settings.warm_quote_interval_seconds
+            if decision_due:
+                # When both clocks are due, one hot+warm pass avoids querying
+                # the 200 hot symbols twice in the same second.
+                await self._refresh_decision_quotes(settings, include_warm=warm_due)
+                self._last_decision_refresh_clock = clock.monotonic()
+                if warm_due:
+                    self._last_warm_refresh_clock = clock.monotonic()
+            elif warm_due:
+                await self._refresh_decision_quotes(settings, include_warm=True)
+                self._last_warm_refresh_clock = clock.monotonic()
+            depth_interval = settings.auction_depth_refresh_interval_seconds if self._is_opening_depth_session(now) else settings.depth_refresh_interval_seconds
+            if force or now_clock - self._last_depth_refresh_clock >= depth_interval:
+                await self._refresh_depth(settings)
+                self._last_depth_refresh_clock = clock.monotonic()
             if self._is_continuous_market_session(now) and (force or clock.monotonic() - self._last_minute_refresh_clock >= settings.minute_refresh_interval_seconds):
-                await self._refresh_minutes(settings, round_id)
+                await self._refresh_minutes(settings, uuid.uuid4().hex[:16])
                 self._last_minute_refresh_clock = clock.monotonic()
-            logger.info(
-                "realtime market round completed: round_id=%s quote=%s/%s minute=%s/%s quote_ms=%s minute_ms=%s",
-                round_id,
-                len(received_codes),
-                expected_count,
-                self._last_minute_round.updated_count,
-                self._last_minute_round.selected_count,
-                self._last_quote_round.duration_ms,
-                self._last_minute_round.duration_ms,
-            )
 
     async def _ensure_reference(self, settings: RealtimeSettings) -> None:
         if self._reference_loaded_at and clock.monotonic() - self._reference_loaded_clock < settings.reference_refresh_seconds:
@@ -416,16 +448,286 @@ class RealtimeMarketService:
             repository = RealtimeMarketRepository(session)
             active_codes, stock_names = await repository.active_stock_reference()
             sector_info, sector_members, stock_sectors = await repository.sector_reference()
+            industry_info, industry_members, stock_industries = await repository.industry_universe_reference()
             pools = await repository.pool_reference(active_codes)
         self._active_codes = active_codes
         self._stock_names = stock_names
-        self._sector_info = sector_info
-        self._sector_members = sector_members
-        self._stock_sectors = stock_sectors
+        self._sector_info = {**sector_info, **industry_info}
+        self._sector_members = {**sector_members, **industry_members}
+        self._stock_sectors = {**stock_sectors}
+        for stock_code, codes in stock_industries.items():
+            self._stock_sectors.setdefault(stock_code, []).extend(codes)
         self._pools = pools
         self._reference_loaded_at = datetime.now(tz=ZoneInfo("UTC"))
         self._reference_loaded_clock = clock.monotonic()
-        logger.info("realtime reference loaded: active=%s sectors=%s pools=%s", len(active_codes), len(sector_info), len(pools))
+        logger.info("realtime reference loaded: active=%s concepts=%s tickflow_industries=%s pools=%s", len(active_codes), len(sector_info), len(industry_info), len(pools))
+
+    async def _acquire_leader(self, settings: RealtimeSettings) -> bool:
+        self._leader_active = await redis_client.acquire_lease(
+            await redis_client.key("realtime", "leader"), self._leader_owner, ttl_seconds=settings.leader_lease_seconds
+        )
+        return self._leader_active
+
+    async def _hydrate_shared_caches(self) -> None:
+        """A follower serves the current Redis snapshot but never spends provider quota."""
+        if not self._market_overview.get("as_of"):
+            overview = await redis_client.get_json(await redis_client.key("realtime", "market-overview"))
+            if isinstance(overview, dict):
+                self._market_overview = overview
+        if not self._sector_strength:
+            sectors = await redis_client.get_json(await redis_client.key("realtime", "sectors"))
+            if isinstance(sectors, list):
+                self._sector_strength = {str(item.get("sector_code")): item for item in sectors if isinstance(item, dict) and item.get("sector_code")}
+        if not self._pool_summaries:
+            pools = await redis_client.get_json(await redis_client.key("realtime", "pools"))
+            if isinstance(pools, dict):
+                self._pool_summaries = pools
+
+    async def _refresh_market_quotes(self, settings: RealtimeSettings) -> None:
+        started = clock.monotonic()
+        round_id = uuid.uuid4().hex[:16]
+        errors: list[str] = []
+        rows: list[dict] = []
+        request_count = 0
+        try:
+            await self._ensure_provider_pools(settings)
+            if settings.quote_provider != "tickflow" or not self._quote_providers:
+                raise RuntimeError("第一期全市场 Quote 仅支持已验证的 TickFlow 标的池接口")
+            await self._rate_budgets["quote_universe"].acquire()
+            request_count = 1
+            result, _ = await self._quote_providers[0].universe_quotes("CN_Equity_A")
+            active_set = set(self._active_codes)
+            rows = [self._normalize_quote(item) for item in result if normalize_symbol(str(item.get("stock_code") or "")) in active_set]
+            if not rows:
+                errors.append("quote_universe: no eligible A-share quote data")
+        except Exception as exc:
+            errors.append(f"quote_universe: {type(exc).__name__}: {exc}")
+            await self._record_rate_limit_if_needed("quote_universe", exc)
+
+        received_codes = {item["stock_code"] for item in rows}
+        degraded = bool(errors) or len(received_codes) < max(1, int(len(self._active_codes) * 0.95))
+        if rows and not degraded:
+            self._quotes.update({item["stock_code"]: item for item in rows})
+            self._market_overview = self._build_market_overview(round_id)
+            self._sector_strength = self._build_sector_strength(round_id)
+            self._pool_summaries = self._build_pool_summaries(round_id)
+            await self._persist_quote_caches(settings)
+            await self._publish("market_overview", self._market_overview)
+            await self._publish("sectors", {"as_of": self._market_overview.get("as_of"), "round_id": round_id, "items": list(self._sector_strength.values())})
+            for pool_code, summary in self._pool_summaries.items():
+                await self._publish(f"pool:{pool_code}", summary)
+
+        meta = self._block_meta(
+            "market", round_id, started, settings.quote_provider, len(self._active_codes), len(received_codes), len(errors), errors,
+            request_count=request_count, degraded=degraded,
+            degraded_reason="coverage_below_95_pct_or_provider_error" if degraded else None,
+        )
+        self._blocks["market"] = meta
+        self._last_quote_round = RealtimeRoundMeta(**meta.model_dump(exclude={"block", "request_count", "coverage_pct", "cache_freshness_seconds", "rate_limited_count", "network_error_count", "degraded_reason"}))
+        if degraded:
+            self._error = "全市场 TickFlow 标的池 Quote 不完整，已保留上一轮缓存"
+        else:
+            self._error = None
+
+    def _build_decision_targets(self, settings: RealtimeSettings) -> tuple[list[dict], list[dict]]:
+        now = clock.monotonic()
+        self._page_targets = {code: expires_at for code, expires_at in self._page_targets.items() if expires_at > now}
+        active_set = set(self._active_codes)
+        ranked: list[tuple[str, str, int, float]] = []
+        priority_pools = (("holding", 0), ("focus", 1), ("candidate", 2), ("strategy", 3), ("breakout_retake", 3))
+        for pool_code, priority in priority_pools:
+            for code in self._pools.get(pool_code, {}).get("stock_codes", []):
+                if code in active_set:
+                    quote = self._quotes.get(code, {})
+                    signal_score = abs(float(quote.get("change_pct") or 0)) + min(20.0, math.log10(max(1.0, float(quote.get("amount_yuan") or 0))) - 5.0)
+                    ranked.append((code, f"pool:{pool_code}", priority, signal_score))
+        for code in self._page_targets:
+            if code in active_set:
+                ranked.append((code, "page_watch", 4, 0.0))
+        strong = sorted(
+            (item for item in self._quotes.values() if item.get("stock_code") in active_set),
+            key=lambda item: (abs(float(item.get("change_pct") or 0)), float(item.get("amount_yuan") or 0)),
+            reverse=True,
+        )[:settings.strong_candidate_limit]
+        ranked.extend((item["stock_code"], "strong", 5, abs(float(item.get("change_pct") or 0))) for item in strong)
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for code, reason, priority, signal_score in sorted(ranked, key=lambda item: (item[2], -item[3], item[0])):
+            if code in seen:
+                continue
+            seen.add(code)
+            deduped.append(
+                {
+                    "stock_code": code,
+                    "stock_name": self._stock_names.get(code),
+                    "reason": reason,
+                    "priority": priority,
+                    "signal_score": round(signal_score, 4),
+                    "promotion_reason": "priority_pool" if priority <= 1 else "latest_quote_strength",
+                }
+            )
+        return deduped[:settings.decision_target_limit], deduped[settings.decision_target_limit:]
+
+    async def _refresh_decision_quotes(self, settings: RealtimeSettings, *, include_warm: bool) -> None:
+        started = clock.monotonic()
+        round_id = uuid.uuid4().hex[:16]
+        hot, warm = self._build_decision_targets(settings)
+        self._decision_targets, self._warm_targets = hot, warm
+        targets = hot + (warm if include_warm else [])
+        rows, errors, request_count = await self._fetch_quote_codes([item["stock_code"] for item in targets], settings)
+        if rows:
+            previous = {item["stock_code"]: self._quotes.get(item["stock_code"]) for item in rows}
+            self._quotes.update({item["stock_code"]: item for item in rows})
+            hot_codes = {item["stock_code"] for item in hot}
+            changed = [
+                (await redis_client.key("realtime", "quote", item["stock_code"]), item, settings.cache_ttl_seconds)
+                for item in rows
+                if item["stock_code"] in hot_codes and self._quote_changed(previous.get(item["stock_code"]), item)
+            ]
+            await redis_client.set_many_json(changed)
+            for code in hot_codes.intersection({item["stock_code"] for item in rows}):
+                await self._publish(f"stock:{code}", await self.stock(code))
+        expected = len(targets)
+        meta = self._block_meta(
+            "decision_quote", round_id, started, settings.quote_provider, expected, len({item["stock_code"] for item in rows}), len(errors), errors,
+            request_count=request_count, degraded=bool(errors), degraded_reason="batch_request_error" if errors else None,
+        )
+        self._blocks["decision_quote"] = meta
+
+    async def _fetch_quote_codes(self, codes: list[str], settings: RealtimeSettings) -> tuple[list[dict], list[str], int]:
+        await self._ensure_provider_pools(settings)
+        rows: list[dict] = []
+        errors: list[str] = []
+        requests = 0
+        provider = self._quote_providers[0] if self._quote_providers else None
+        if provider is None:
+            return rows, ["quote_batch: provider unavailable"], requests
+        for offset in range(0, len(codes), settings.quote_batch_size):
+            batch = codes[offset : offset + settings.quote_batch_size]
+            if not batch:
+                continue
+            try:
+                await self._rate_budgets["quote_symbols"].acquire()
+                requests += 1
+                result, _ = await provider.quote_batch(batch)
+                normalized = [self._normalize_quote(item) for item in result if item.get("stock_code")]
+                if not normalized:
+                    errors.append(f"quote_batch[{batch[0]}..{batch[-1]}]: no_quote_data")
+                else:
+                    rows.extend(normalized)
+            except Exception as exc:
+                errors.append(f"quote_batch[{batch[0]}..{batch[-1]}]: {type(exc).__name__}: {exc}")
+                await self._record_rate_limit_if_needed("quote_symbols", exc)
+        return rows, errors, requests
+
+    async def _refresh_depth(self, settings: RealtimeSettings) -> None:
+        started = clock.monotonic()
+        round_id = uuid.uuid4().hex[:16]
+        codes = [item["stock_code"] for item in self._decision_targets[:settings.decision_target_limit]]
+        rows: list[dict] = []
+        errors: list[str] = []
+        requests = 0
+        if codes:
+            try:
+                await self._ensure_provider_pools(settings)
+                provider = self._quote_providers[0] if self._quote_providers else None
+                if not isinstance(provider, TickflowQuoteProvider):
+                    raise RuntimeError("five-level depth requires TickFlow provider")
+                await self._rate_budgets["depth_batch"].acquire()
+                requests = 1
+                rows = await provider.depth_batch(codes)
+            except Exception as exc:
+                errors.append(f"depth_batch: {type(exc).__name__}: {exc}")
+                await self._record_rate_limit_if_needed("depth_batch", exc)
+        changed: list[tuple[str, dict, int]] = []
+        for row in rows:
+            code = row["stock_code"]
+            snapshot = {**row, "features": self._depth_features(row)}
+            history = [snapshot, *self._depth_history_by_stock.get(code, [])][:3]
+            self._depth_by_stock[code] = snapshot
+            self._depth_history_by_stock[code] = history
+            changed.append((await redis_client.key("realtime", "depth", code), {"current": snapshot, "history": history}, settings.depth_cache_ttl_seconds))
+        await redis_client.set_many_json(changed)
+        self._blocks["depth"] = self._block_meta(
+            "depth", round_id, started, "tickflow", len(codes), len({row["stock_code"] for row in rows}), len(errors), errors,
+            request_count=requests, degraded=bool(errors), degraded_reason="depth_batch_error" if errors else None,
+        )
+
+    def _block_meta(
+        self,
+        block: str,
+        round_id: str,
+        started: float,
+        provider: str,
+        expected_count: int,
+        received_count: int,
+        failed_count: int,
+        errors: list[str],
+        *,
+        request_count: int,
+        degraded: bool,
+        degraded_reason: str | None,
+    ) -> RealtimeBlockMeta:
+        finished = datetime.now(tz=ZoneInfo("UTC"))
+        return RealtimeBlockMeta(
+            block=block,  # type: ignore[arg-type]
+            round_id=round_id,
+            started_at=finished - timedelta(milliseconds=int((clock.monotonic() - started) * 1000)),
+            finished_at=finished,
+            provider=provider,
+            expected_count=expected_count,
+            received_count=received_count,
+            missing_count=max(0, expected_count - received_count),
+            failed_batch_count=failed_count,
+            duration_ms=int((clock.monotonic() - started) * 1000),
+            degraded=degraded,
+            error_samples=errors[:5],
+            request_count=request_count,
+            coverage_pct=round(received_count / max(1, expected_count) * 100, 2) if expected_count else None,
+            cache_freshness_seconds=0,
+            rate_limited_count=sum(1 for error in errors if "429" in error or "rate" in error.lower()),
+            network_error_count=sum(1 for error in errors if "429" not in error),
+            degraded_reason=degraded_reason,
+        )
+
+    @staticmethod
+    def _depth_features(snapshot: dict) -> dict:
+        bids = snapshot.get("bids") if isinstance(snapshot.get("bids"), list) else []
+        asks = snapshot.get("asks") if isinstance(snapshot.get("asks"), list) else []
+        bid_volume = sum(float(item.get("volume") or 0) for item in bids)
+        ask_volume = sum(float(item.get("volume") or 0) for item in asks)
+        bid1 = bids[0] if bids else {}
+        ask1 = asks[0] if asks else {}
+        bid_price = float(bid1.get("price")) if bid1.get("price") is not None else None
+        ask_price = float(ask1.get("price")) if ask1.get("price") is not None else None
+        return {
+            "bid_volume_5": bid_volume,
+            "ask_volume_5": ask_volume,
+            "bid_ask_imbalance_5": round((bid_volume - ask_volume) / (bid_volume + ask_volume), 6) if bid_volume + ask_volume > 0 else None,
+            "best_spread": round(ask_price - bid_price, 6) if ask_price is not None and bid_price is not None else None,
+            "best_spread_pct": round((ask_price - bid_price) / ((ask_price + bid_price) / 2) * 100, 6) if ask_price is not None and bid_price is not None and ask_price + bid_price else None,
+        }
+
+    @staticmethod
+    def _quote_changed(previous: dict | None, current: dict) -> bool:
+        if previous is None:
+            return True
+        keys = ("quote_time", "last_price", "change_pct", "volume_share", "amount_yuan")
+        return any(previous.get(key) != current.get(key) for key in keys)
+
+    async def _record_rate_limit_if_needed(self, budget_name: str, exc: Exception) -> None:
+        message = str(exc)
+        if "429" not in message and "rate limit" not in message.lower() and "too many" not in message.lower():
+            return
+        cooldown_seconds = 300.0
+        import re
+
+        match = re.search(r"(?:retry[- ]after|cooldown)[^0-9]*(\d+(?:\.\d+)?)", message, flags=re.IGNORECASE)
+        if match:
+            cooldown_seconds = float(match.group(1))
+        budget = self._rate_budgets.get(budget_name)
+        if budget is not None:
+            await budget.record_rate_limit(cooldown_seconds)
 
     async def _fetch_quotes(self, settings: RealtimeSettings) -> tuple[list[dict], list[str], bool]:
         await self._ensure_provider_pools(settings)
@@ -435,12 +737,9 @@ class RealtimeMarketService:
             queue.put_nowait(batch)
         rows: list[dict] = []
         errors: list[str] = []
-        transport_failed = asyncio.Event()
 
         async def worker(provider: TickflowQuoteProvider | MootdxProvider) -> None:
             while True:
-                if transport_failed.is_set():
-                    return
                 try:
                     batch = queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -454,10 +753,12 @@ class RealtimeMarketService:
                     rows.extend(normalized)
                 except Exception as exc:
                     errors.append(f"quote_batch[{batch[0]}..{batch[-1]}]: {type(exc).__name__}: {exc}")
-                    transport_failed.set()
 
         await asyncio.gather(*(worker(provider) for provider in self._quote_providers))
-        return rows, errors, transport_failed.is_set()
+        # A failed individual batch is isolated.  The caller decides whether
+        # aggregate coverage is good enough; it must not stop the remaining
+        # independent requests.
+        return rows, errors, False
 
     async def _refresh_minutes(self, settings: RealtimeSettings, round_id: str) -> None:
         started = clock.monotonic()
@@ -470,13 +771,31 @@ class RealtimeMarketService:
         updated = 0
         empty = 0
         errors: list[str] = []
-        transport_failed = asyncio.Event()
+        cache_queue: asyncio.Queue[tuple[str, dict, int] | None] = asyncio.Queue(maxsize=max(16, len(selected)))
+
+        async def cache_writer() -> None:
+            """Consume completed network fetches while other MooTDX workers continue."""
+            while True:
+                item = await cache_queue.get()
+                if item is None:
+                    return
+                batch = [item]
+                while len(batch) < 50:
+                    try:
+                        queued = cache_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if queued is None:
+                        await redis_client.set_many_json(batch)
+                        return
+                    batch.append(queued)
+                await redis_client.set_many_json(batch)
+
+        writer_task = asyncio.create_task(cache_writer(), name="realtime-minute-cache-writer")
 
         async def worker(provider: MootdxProvider) -> None:
             nonlocal updated, empty
             while True:
-                if transport_failed.is_set():
-                    return
                 try:
                     code = queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -499,14 +818,17 @@ class RealtimeMarketService:
                         "features": self._minute_features(clean_rows),
                     }
                     updated += 1
-                    await self._persist_minute_cache(code, clean_rows, self._minute_meta_by_stock[code])
+                    await cache_queue.put((await redis_client.key("realtime", "minutes", code), {"items": clean_rows, "meta": self._minute_meta_by_stock[code]}, self._minute_session_ttl()))
                     await self._publish(f"stock:{code}", await self.stock(code))
                 except Exception as exc:
                     errors.append(f"minute[{code}]: {type(exc).__name__}: {exc}")
                     self._minute_meta_by_stock[code] = {"status": "provider_error", "updated_at": datetime.now(tz=ZoneInfo("UTC")).isoformat(), "source": "mootdx"}
-                    transport_failed.set()
 
-        await asyncio.gather(*(worker(provider) for provider in self._minute_providers))
+        try:
+            await asyncio.gather(*(worker(provider) for provider in self._minute_providers))
+        finally:
+            await cache_queue.put(None)
+            await writer_task
         self._last_minute_round = RealtimeMinuteMeta(
             selected_count=len(selected),
             registered_count=len(registered),
@@ -515,6 +837,10 @@ class RealtimeMarketService:
             failed_count=len(errors),
             duration_ms=int((clock.monotonic() - started) * 1000),
             error_samples=errors[:5],
+        )
+        self._blocks["minute"] = self._block_meta(
+            "minute", round_id, started, "mootdx", len(selected), updated, len(errors), errors,
+            request_count=len(selected), degraded=bool(errors), degraded_reason="per_symbol_errors" if errors else None,
         )
 
     async def _is_open_market_session(self, now: datetime) -> bool:
@@ -604,6 +930,9 @@ class RealtimeMarketService:
             changes = [float(item["change_pct"]) for item in quotes]
             leader = max(quotes, key=lambda item: float(item.get("change_pct") or 0))
             info = self._sector_info[sector_code]
+            median_change = self._median(changes)
+            limit_up_count = sum(1 for item in quotes if self._is_limit_event(item, "up"))
+            limit_down_count = sum(1 for item in quotes if self._is_limit_event(item, "down"))
             result[sector_code] = {
                 **info,
                 "as_of": self._market_overview.get("as_of"),
@@ -612,10 +941,14 @@ class RealtimeMarketService:
                 "quote_count": len(quotes),
                 "coverage_pct": round(len(quotes) / max(1, len(members)) * 100, 2),
                 "change_pct": round(sum(changes) / len(changes), 4),
+                "median_change_pct": median_change,
                 "up_count": sum(1 for value in changes if value > 0),
                 "down_count": sum(1 for value in changes if value < 0),
                 "flat_count": sum(1 for value in changes if value == 0),
                 "amount_yuan": sum(float(item.get("amount_yuan") or 0) for item in quotes),
+                "limit_up_count": limit_up_count,
+                "limit_down_count": limit_down_count,
+                "heat_score": self._heat_score(changes, limit_up_count, limit_down_count, len(members), sum(float(item.get("amount_yuan") or 0) for item in quotes)),
                 "leader": {"stock_code": leader["stock_code"], "stock_name": leader.get("stock_name"), "change_pct": leader.get("change_pct"), "last_price": leader.get("last_price")},
             }
         return result
@@ -626,6 +959,8 @@ class RealtimeMarketService:
             codes = pool["stock_codes"]
             quotes = [self._quotes[code] for code in codes if code in self._quotes and self._quotes[code].get("change_pct") is not None]
             changes = [float(item["change_pct"]) for item in quotes]
+            limit_up_count = sum(1 for item in quotes if self._is_limit_event(item, "up"))
+            limit_down_count = sum(1 for item in quotes if self._is_limit_event(item, "down"))
             result[pool_code] = {
                 "pool_code": pool_code,
                 "pool_name": pool["pool_name"],
@@ -637,17 +972,25 @@ class RealtimeMarketService:
                 "up_count": sum(1 for value in changes if value > 0),
                 "down_count": sum(1 for value in changes if value < 0),
                 "average_change_pct": round(sum(changes) / len(changes), 4) if changes else None,
+                "median_change_pct": self._median(changes),
                 "amount_yuan": sum(float(item.get("amount_yuan") or 0) for item in quotes),
+                "limit_up_count": limit_up_count,
+                "limit_down_count": limit_down_count,
+                "heat_score": self._heat_score(changes, limit_up_count, limit_down_count, len(codes), sum(float(item.get("amount_yuan") or 0) for item in quotes)),
                 "leaders": self._rank_quotes(quotes, reverse=True, limit=5),
             }
         return result
 
     async def _persist_quote_caches(self, settings: RealtimeSettings) -> None:
         ttl = settings.cache_ttl_seconds
-        await redis_client.set_json(await redis_client.key("realtime", "quotes"), self._quotes, ttl_seconds=ttl)
-        await redis_client.set_json(await redis_client.key("realtime", "market-overview"), self._market_overview, ttl_seconds=ttl)
-        await redis_client.set_json(await redis_client.key("realtime", "sectors"), list(self._sector_strength.values()), ttl_seconds=ttl)
-        await redis_client.set_json(await redis_client.key("realtime", "pools"), self._pool_summaries, ttl_seconds=ttl)
+        await redis_client.set_many_json(
+            [
+                (await redis_client.key("realtime", "quotes"), self._quotes, ttl),
+                (await redis_client.key("realtime", "market-overview"), self._market_overview, ttl),
+                (await redis_client.key("realtime", "sectors"), list(self._sector_strength.values()), ttl),
+                (await redis_client.key("realtime", "pools"), self._pool_summaries, ttl),
+            ]
+        )
 
     async def _persist_minute_cache(self, code: str, rows: list[dict], meta: dict) -> None:
         ttl = self._minute_session_ttl()
@@ -674,7 +1017,7 @@ class RealtimeMarketService:
         if settings.quote_provider == "tickflow":
             sessionmaker = get_sessionmaker()
             async with sessionmaker() as session:
-                credentials = await TickflowProviderFactory(ConfigCenterRepository(session)).resolve_credentials()
+                credentials = await TickflowProviderFactory(ConfigCenterRepository(session)).resolve_realtime_credentials()
             identity = ("tickflow", credentials.fingerprint, credentials.endpoint_url, credentials.timeout_seconds)
             if identity != self._quote_provider_identity:
                 self._close_providers(self._quote_providers)
@@ -740,12 +1083,54 @@ class RealtimeMarketService:
                     self._settings = RealtimeSettings(enabled=False)
                 else:
                     options = {option.option_key: option.option_value for option in await repository.list_options(config.id, only_enabled=True)}
-                    self._settings = RealtimeSettings(enabled=bool(config.is_enabled) and self._as_bool(options.get("enabled", False)), **{key: value for key, value in options.items() if key != "enabled"})
+                    settings_fields = set(RealtimeSettings.model_fields)
+                    # Existing deployments may still have V1's 80-symbol value
+                    # before the owner-only migration is applied.  Enforce the
+                    # purchased TickFlow maximum in process instead of letting
+                    # a validation error disable the whole runtime config.
+                    option_values = {key: value for key, value in options.items() if key != "enabled" and key in settings_fields}
+                    try:
+                        option_values["quote_batch_size"] = min(50, int(option_values.get("quote_batch_size", 50)))
+                    except (TypeError, ValueError):
+                        option_values["quote_batch_size"] = 50
+                    self._settings = RealtimeSettings(
+                        enabled=bool(config.is_enabled) and self._as_bool(options.get("enabled", False)),
+                        **option_values,
+                    )
+                tickflow_config = await repository.find_config(category_code="market_data", config_code="tickflow")
+                tickflow_options = (
+                    {option.option_key: option.option_value for option in await repository.list_options(tickflow_config.id, only_enabled=True)}
+                    if tickflow_config is not None
+                    else {}
+                )
+                self._configure_rate_budgets(tickflow_options)
         except Exception as exc:
             self._error = f"realtime config load failed: {type(exc).__name__}: {exc}"
             logger.warning("realtime config load failed; preserving previous settings: %s", exc)
         self._settings_loaded_at = clock.monotonic()
         return self._settings
+
+    def _configure_rate_budgets(self, options: dict) -> None:
+        def number(name: str, default: float) -> float:
+            value = options.get(name, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        quote_symbol_limit = max(1, int(number("quote_symbol_requests_per_minute", 60)))
+        universe_limit = max(1, int(number("quote_universe_requests_per_minute", 20)))
+        depth_limit = max(1, int(number("depth_batch_requests_per_minute", 60)))
+        safety_ratio = min(1.0, max(0.1, number("realtime_safety_ratio", 0.8)))
+        signature = (quote_symbol_limit, universe_limit, depth_limit, safety_ratio)
+        if signature == self._rate_signature:
+            return
+        self._rate_signature = signature
+        self._rate_budgets = {
+            "quote_symbols": RealtimeRateBudget("quote_symbols", quote_symbol_limit, safety_ratio),
+            "quote_universe": RealtimeRateBudget("quote_universe", universe_limit, safety_ratio),
+            "depth_batch": RealtimeRateBudget("depth_batch", depth_limit, safety_ratio),
+        }
 
     def _normalize_quote(self, row: dict) -> dict:
         stock_code = normalize_symbol(str(row.get("stock_code") or ""))
@@ -823,6 +1208,38 @@ class RealtimeMarketService:
         ]
 
     @staticmethod
+    def _median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        midpoint = len(ordered) // 2
+        result = ordered[midpoint] if len(ordered) % 2 else (ordered[midpoint - 1] + ordered[midpoint]) / 2
+        return round(result, 4)
+
+    @staticmethod
+    def _is_limit_event(quote: dict, direction: str) -> bool:
+        metadata = quote.get("metadata") if isinstance(quote.get("metadata"), dict) else {}
+        ext = metadata.get("ext") if isinstance(metadata.get("ext"), dict) else {}
+        target = ext.get("limit_up") if direction == "up" else ext.get("limit_down")
+        price = quote.get("last_price")
+        try:
+            return target is not None and price is not None and abs(float(target) - float(price)) <= max(0.001, abs(float(target)) * 0.0002)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _heat_score(changes: list[float], limit_up: int, limit_down: int, member_count: int, amount: float) -> float:
+        if not changes:
+            return 0.0
+        up_ratio = sum(1 for value in changes if value > 0) / len(changes)
+        mean_change = sum(changes) / len(changes)
+        change_component = min(35.0, max(0.0, (mean_change + 3.0) / 6.0 * 35.0))
+        breadth_component = up_ratio * 30.0
+        limit_component = min(25.0, limit_up / max(1, member_count) * 250.0) - min(10.0, limit_down / max(1, member_count) * 100.0)
+        liquidity_component = min(10.0, math.log10(max(1.0, amount)) - 6.0)
+        return round(min(100.0, max(0.0, change_component + breadth_component + limit_component + liquidity_component)), 2)
+
+    @staticmethod
     def _is_market_session(now: datetime) -> bool:
         if now.weekday() >= 5:
             return False
@@ -837,6 +1254,11 @@ class RealtimeMarketService:
             return False
         current = now.timetz().replace(tzinfo=None)
         return time(9, 30) <= current <= time(11, 30) or time(13, 0) <= current <= time(15, 0)
+
+    @staticmethod
+    def _is_opening_depth_session(now: datetime) -> bool:
+        current = now.timetz().replace(tzinfo=None)
+        return now.weekday() < 5 and time(9, 20) <= current <= time(9, 25)
 
     @staticmethod
     def _as_bool(value: object) -> bool:

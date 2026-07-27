@@ -3,7 +3,7 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.market_data.models import SectorBasic, SectorComponent, Stock, TradeCalendar
+from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock, TradeCalendar
 from app.modules.stock_pool.models import StockPool, StockPoolMember
 
 
@@ -16,6 +16,7 @@ class RealtimeMarketRepository:
             select(Stock.stock_code, Stock.stock_name)
             .where(
                 Stock.status == "active",
+                Stock.is_st.is_(False),
                 Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
             )
             .order_by(Stock.stock_code)
@@ -39,6 +40,7 @@ class RealtimeMarketRepository:
                 SectorComponent.end_date.is_(None),
                 SectorBasic.sector_type.in_(("concept", "industry")),
                 Stock.status == "active",
+                Stock.is_st.is_(False),
                 Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
             )
             .order_by(SectorBasic.sector_code, SectorComponent.stock_code)
@@ -54,6 +56,58 @@ class RealtimeMarketRepository:
             sector_members.setdefault(sector_code, []).append(stock_code)
             stock_sectors.setdefault(stock_code, []).append(sector_code)
         return sector_info, sector_members, stock_sectors
+
+    async def industry_universe_reference(self) -> tuple[dict[str, dict], dict[str, list[str]], dict[str, list[str]]]:
+        """Return TickFlow SW groups without blending them into Tushare concepts.
+
+        The persisted provider universe remains traceable by raw universe ID;
+        display aggregation uses the explicit logical group key generated at
+        weekly catalogue sync time.
+        """
+        rows = await self.session.execute(
+            select(
+                MarketUniverse.universe_id,
+                MarketUniverse.universe_name,
+                MarketUniverse.taxonomy_level,
+                MarketUniverse.logical_group_key,
+                MarketUniverseMember.stock_code,
+            )
+            .join(MarketUniverseMember, MarketUniverseMember.universe_row_id == MarketUniverse.id)
+            .join(Stock, Stock.stock_code == MarketUniverseMember.stock_code)
+            .where(
+                MarketUniverse.provider_code == "tickflow",
+                MarketUniverse.is_enabled.is_(True),
+                MarketUniverseMember.valid_to.is_(None),
+                MarketUniverse.taxonomy_level.in_(("sw1", "sw2", "sw3")),
+                Stock.status == "active",
+                Stock.is_st.is_(False),
+                Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
+            )
+            .order_by(MarketUniverse.taxonomy_level, MarketUniverse.logical_group_key, MarketUniverseMember.stock_code)
+        )
+        info: dict[str, dict] = {}
+        members: dict[str, list[str]] = {}
+        stock_groups: dict[str, list[str]] = {}
+        for universe_id, universe_name, taxonomy_level, logical_group_key, stock_code in rows.all():
+            level = str(taxonomy_level or "industry")
+            group_key = str(logical_group_key or f"{level}:{universe_name}")
+            sector_code = f"tickflow:{group_key}"
+            group = info.setdefault(
+                sector_code,
+                {
+                    "sector_code": sector_code,
+                    "sector_name": universe_name,
+                    "sector_type": "industry",
+                    "taxonomy_kind": level,
+                    "source": "tickflow",
+                    "raw_universe_ids": [],
+                },
+            )
+            if universe_id not in group["raw_universe_ids"]:
+                group["raw_universe_ids"].append(universe_id)
+            members.setdefault(sector_code, []).append(stock_code)
+            stock_groups.setdefault(stock_code, []).append(sector_code)
+        return info, members, stock_groups
 
     async def is_open_trade_date(self, trade_date: date) -> bool:
         result = await self.session.execute(

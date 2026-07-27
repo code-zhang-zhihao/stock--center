@@ -14,6 +14,8 @@ from app.modules.market_data.models import (
     IndexBar,
     LhbEvent,
     LhbSeatDetail,
+    MarketUniverse,
+    MarketUniverseMember,
     LimitEventDaily,
     MarketDailyStat,
     MinuteBar,
@@ -76,6 +78,7 @@ class MarketDataRepository:
                 "list_date": insert_stmt.excluded.list_date,
                 "delist_date": insert_stmt.excluded.delist_date,
                 "status": insert_stmt.excluded.status,
+                "is_st": insert_stmt.excluded.is_st,
                 "industry": insert_stmt.excluded.industry,
                 "area": insert_stmt.excluded.area,
                 Stock.metadata_json: insert_stmt.excluded["metadata"],
@@ -521,6 +524,7 @@ class MarketDataRepository:
                             else_=Stock.delist_date,
                         ),
                         "status": insert_stmt.excluded.status,
+                        "is_st": insert_stmt.excluded.is_st,
                         "industry": case(
                             (insert_stmt.excluded.industry.is_not(None), insert_stmt.excluded.industry),
                             else_=Stock.industry,
@@ -532,6 +536,75 @@ class MarketDataRepository:
             )
             total += len(batch)
         return total
+
+    async def upsert_market_universe(self, row: dict) -> MarketUniverse:
+        insert_stmt = insert(MarketUniverse).values(**row)
+        stmt = (
+            insert_stmt.on_conflict_do_update(
+                index_elements=[MarketUniverse.provider_code, MarketUniverse.universe_id],
+                set_={
+                    "universe_name": insert_stmt.excluded.universe_name,
+                    "description": insert_stmt.excluded.description,
+                    "region": insert_stmt.excluded.region,
+                    "category": insert_stmt.excluded.category,
+                    "taxonomy_level": insert_stmt.excluded.taxonomy_level,
+                    "logical_group_key": insert_stmt.excluded.logical_group_key,
+                    "source_symbol_count": insert_stmt.excluded.source_symbol_count,
+                    "catalog_hash": insert_stmt.excluded.catalog_hash,
+                    "is_enabled": insert_stmt.excluded.is_enabled,
+                    "last_synced_at": datetime.now(timezone.utc),
+                },
+            )
+            .returning(MarketUniverse)
+        )
+        return (await self.session.execute(stmt)).scalar_one()
+
+    async def market_universe_hashes(self, *, provider_code: str) -> dict[str, str]:
+        rows = await self.session.execute(
+            select(MarketUniverse.universe_id, MarketUniverse.catalog_hash).where(MarketUniverse.provider_code == provider_code)
+        )
+        return {str(universe_id): str(catalog_hash or "") for universe_id, catalog_hash in rows.all()}
+
+    async def replace_market_universe_members(self, universe_row_id: int, stock_codes: list[str], *, as_of: date) -> int:
+        normalized_codes = sorted({str(code).strip() for code in stock_codes if str(code).strip()})
+        active_rows = await self.session.execute(
+            select(MarketUniverseMember.stock_code).where(
+                MarketUniverseMember.universe_row_id == universe_row_id,
+                MarketUniverseMember.valid_to.is_(None),
+            )
+        )
+        active_codes = set(active_rows.scalars().all())
+        incoming = set(normalized_codes)
+        removed = active_codes - incoming
+        if removed:
+            await self.session.execute(
+                update(MarketUniverseMember)
+                .where(
+                    MarketUniverseMember.universe_row_id == universe_row_id,
+                    MarketUniverseMember.stock_code.in_(removed),
+                    MarketUniverseMember.valid_to.is_(None),
+                )
+                .values(valid_to=as_of, last_seen_at=datetime.now(timezone.utc))
+            )
+        added = incoming - active_codes
+        if added:
+            rows = [
+                {
+                    "universe_row_id": universe_row_id,
+                    "stock_code": stock_code,
+                    "valid_from": as_of,
+                    "valid_to": None,
+                }
+                for stock_code in added
+            ]
+            insert_stmt = insert(MarketUniverseMember).values(rows)
+            await self.session.execute(
+                insert_stmt.on_conflict_do_update(
+                    index_elements=[MarketUniverseMember.universe_row_id, MarketUniverseMember.stock_code, MarketUniverseMember.valid_from],
+                    set_={"last_seen_at": datetime.now(timezone.utc)},
+                )
+            )
+        return len(incoming)
 
     async def update_stock_statuses(self, *, stock_codes: list[str], status: str) -> int:
         if not stock_codes:
