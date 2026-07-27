@@ -29,6 +29,16 @@ async def market_overview():
     return ApiResponse.ok(await realtime_market_service.market_overview())
 
 
+@router.get("/market-timeline")
+async def market_timeline(limit: int = Query(default=180, ge=1, le=260)):
+    return ApiResponse.ok(await realtime_market_service.market_timeline(limit=limit))
+
+
+@router.get("/market-events")
+async def market_events(limit: int = Query(default=80, ge=1, le=120)):
+    return ApiResponse.ok(await realtime_market_service.market_events(limit=limit))
+
+
 @router.get("/quotes")
 async def quotes(stock_codes: str | None = Query(default=None)):
     codes = [item.strip() for item in (stock_codes or "").split(",") if item.strip()]
@@ -52,6 +62,11 @@ async def pool(pool_code: str):
     if payload is None:
         return ApiResponse.fail(code="realtime_pool_not_found", message=f"实时股票池不存在或尚未加载: {pool_code}")
     return ApiResponse.ok(payload)
+
+
+@router.get("/pools")
+async def pools(limit: int = Query(default=200, ge=1, le=500)):
+    return ApiResponse.ok(await realtime_market_service.pools(limit=limit))
 
 
 @router.get("/sectors")

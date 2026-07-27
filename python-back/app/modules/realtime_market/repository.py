@@ -1,9 +1,9 @@
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock, TradeCalendar
+from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock, StockFactorDaily, TradeCalendar
 from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
 
 
@@ -24,6 +24,42 @@ class RealtimeMarketRepository:
         pairs = rows.all()
         return [row.stock_code for row in pairs], {row.stock_code: row.stock_name for row in pairs}
 
+    async def latest_daily_factor_reference(self) -> tuple[date | None, dict[str, dict]]:
+        """Return the latest completed daily MA reference for the active universe.
+
+        The realtime service compares a live Quote with the most recently
+        persisted daily factor values.  It does not calculate MA from an
+        incomplete intraday bar and does not promote this read-only reference
+        into a realtime fact table.
+        """
+        trade_date = (
+            await self.session.execute(
+                select(func.max(StockFactorDaily.trade_date)).where(StockFactorDaily.source == "system:daily_close")
+            )
+        ).scalar_one_or_none()
+        if trade_date is None:
+            return None, {}
+        rows = await self.session.execute(
+            select(
+                StockFactorDaily.stock_code,
+                StockFactorDaily.ma5,
+                StockFactorDaily.ma20,
+                StockFactorDaily.ma60,
+            )
+            .join(Stock, Stock.stock_code == StockFactorDaily.stock_code)
+            .where(
+                StockFactorDaily.trade_date == trade_date,
+                StockFactorDaily.source == "system:daily_close",
+                Stock.status == "active",
+                Stock.is_st.is_(False),
+                Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
+            )
+        )
+        return trade_date, {
+            stock_code: {"ma5": ma5, "ma20": ma20, "ma60": ma60}
+            for stock_code, ma5, ma20, ma60 in rows.all()
+        }
+
     async def sector_reference(self) -> tuple[dict[str, dict], dict[str, list[str]], dict[str, list[str]]]:
         rows = await self.session.execute(
             select(
@@ -38,7 +74,12 @@ class RealtimeMarketRepository:
                 SectorBasic.source.like("tushare:%"),
                 SectorComponent.source.like("tushare:%"),
                 SectorComponent.end_date.is_(None),
-                SectorBasic.sector_type.in_(("concept", "industry")),
+                # The intraday taxonomy deliberately keeps THS concepts as
+                # the topic layer.  Industry aggregation is supplied only by
+                # the separately persisted TickFlow SW1/SW2/SW3 universes
+                # below, so similarly named Tushare industries cannot blend
+                # into a concept/industry dashboard ranking.
+                SectorBasic.sector_type == "concept",
                 Stock.status == "active",
                 Stock.is_st.is_(False),
                 Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),

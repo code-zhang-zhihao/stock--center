@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from app.modules.realtime_market.schemas import RealtimeBlockMeta, RealtimeSettings
 from app.modules.realtime_market.service import RealtimeMarketService
@@ -145,6 +145,90 @@ def test_market_overview_uses_only_the_current_full_market_round():
     assert overview["items"]["median_change_pct"] == 1.0
     assert overview["items"]["total_amount_yuan"] == 30
     assert overview["items"]["limit_events"]["available"] is False
+
+
+def test_market_overview_combines_live_structure_with_completed_daily_ma_reference():
+    service = RealtimeMarketService()
+    service._active_codes = ["600001", "600002"]
+    service._daily_factor_trade_date = date(2026, 7, 24)
+    service._daily_factor_reference = {
+        "600001": {"ma5": 10.0, "ma20": 10.5, "ma60": 10.8},
+        "600002": {"ma5": 7.5, "ma20": 7.5, "ma60": 7.5},
+    }
+    current_round = {
+        "600001": {
+            "stock_code": "600001", "last_price": 11.0, "open_price": 10.0, "high_price": 11.0, "low_price": 9.0,
+            "change_pct": 2.0, "amount_yuan": 100.0, "volume_hand": 300.0,
+        },
+        "600002": {
+            "stock_code": "600002", "last_price": 7.0, "open_price": 8.0, "high_price": 8.0, "low_price": 7.0,
+            "change_pct": -2.0, "amount_yuan": 200.0, "volume_hand": 100.0,
+        },
+    }
+
+    overview = service._build_market_overview("round-current", current_round)
+
+    trend = overview["items"]["daily_factor_trend"]
+    assert trend["available"] is True
+    assert trend["reference_trade_date"] == "2026-07-24"
+    assert trend["ma5"] == {"above_count": 1, "comparable_count": 2, "above_pct": 50.0}
+    assert trend["above_all"] == {"above_count": 1, "comparable_count": 2, "above_pct": 50.0}
+    assert overview["items"]["intraday_structure"] == {
+        "open_comparable_count": 2,
+        "above_open_count": 1,
+        "below_open_count": 1,
+        "range_comparable_count": 2,
+        "at_high_count": 1,
+        "at_low_count": 1,
+    }
+    assert overview["items"]["top_amount"][0]["stock_code"] == "600002"
+    assert overview["items"]["top_volume"][0]["stock_code"] == "600001"
+
+
+def test_concept_strength_exposes_explainable_heat_and_intraday_rank_delta():
+    service = RealtimeMarketService()
+    codes = [f"60000{index}" for index in range(1, 7)]
+    sector_codes = [f"C{index}" for index in range(1, 7)]
+    service._active_codes = codes
+    service._sector_info = {
+        sector_code: {
+            "sector_code": sector_code,
+            "sector_name": f"概念{index}",
+            "sector_type": "concept",
+            "source": "tushare",
+        }
+        for index, sector_code in enumerate(sector_codes, start=1)
+    }
+    service._sector_members = {sector_code: [code] for sector_code, code in zip(sector_codes, codes)}
+
+    first_round = {
+        code: {"stock_code": code, "stock_name": code, "change_pct": float(3 - index), "amount_yuan": 10_000_000}
+        for index, code in enumerate(codes, start=1)
+    }
+    service._market_overview = service._build_market_overview("first", first_round)
+    service._sector_strength = service._build_sector_strength("first", first_round)
+    service._record_market_history("first")
+
+    first = service._sector_strength["C1"]
+    assert first["rank"] == 1
+    assert first["confidence"] == "high"
+    assert set(first["heat_breakdown"]) == {"change", "breadth", "limit", "liquidity"}
+    assert first["leader"]["stock_code"] == "600001"
+    assert first["laggard"]["stock_code"] == "600001"
+
+    second_round = {
+        code: {"stock_code": code, "stock_name": code, "change_pct": float(index - 4), "amount_yuan": 10_000_000}
+        for index, code in enumerate(codes, start=1)
+    }
+    service._market_overview = service._build_market_overview("second", second_round)
+    service._sector_strength = service._build_sector_strength("second", second_round)
+    service._record_market_history("second")
+
+    assert service._sector_strength["C6"]["rank"] == 1
+    assert service._sector_strength["C6"]["rank_change"] == 5
+    assert len(service._market_timeline) == 2
+    assert any(item["event_type"] == "concept_rank_up" for item in service._market_events)
+    assert all(item["round_id"] == "second" for item in service._market_events)
 
 
 def test_tickflow_rate_budgets_use_ninety_percent_of_purchased_limits():

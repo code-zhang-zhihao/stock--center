@@ -34,6 +34,9 @@ CORE_INDEX_SYMBOLS: tuple[dict[str, str], ...] = (
     {"index_code": "000016", "index_name": "上证50", "source_symbol": "000016.SH"},
 )
 ON_DEMAND_QUOTE_REQUEST_RESERVE = 5
+MARKET_TIMELINE_MAX_ITEMS = 260
+MARKET_EVENT_MAX_ITEMS = 120
+MARKET_EVENT_PER_ROUND_LIMIT = 20
 
 
 class RealtimeMarketService:
@@ -47,6 +50,8 @@ class RealtimeMarketService:
         self._reference_loaded_clock = 0.0
         self._active_codes: list[str] = []
         self._stock_names: dict[str, str] = {}
+        self._daily_factor_trade_date: date | None = None
+        self._daily_factor_reference: dict[str, dict] = {}
         self._sector_info: dict[str, dict] = {}
         self._sector_members: dict[str, list[str]] = {}
         self._stock_sectors: dict[str, list[str]] = {}
@@ -59,6 +64,16 @@ class RealtimeMarketService:
         self._market_overview: dict = {"as_of": None, "items": {}, "round_id": None}
         self._sector_strength: dict[str, dict] = {}
         self._pool_summaries: dict[str, dict] = {}
+        # These are deliberately short-lived intraday research artifacts.  A
+        # full market Quote round is already held in memory; retaining one
+        # compact point per minute makes the dashboard explain *changes*
+        # without writing every quote/depth snapshot to PostgreSQL.
+        self._market_history_trade_date: date | None = None
+        self._market_timeline: list[dict] = []
+        self._market_events: list[dict] = []
+        self._previous_sector_ranks: dict[str, int] = {}
+        self._previous_concept_leaders: dict[str, str] = {}
+        self._previous_market_breadth: str | None = None
         self._core_index_quotes: dict[str, dict] = {}
         self._page_targets: dict[str, float] = {}
         self._rotation_cursor = 0
@@ -192,7 +207,26 @@ class RealtimeMarketService:
         self._reference_loaded_clock = 0.0
 
     async def market_overview(self) -> dict:
+        await self._hydrate_shared_caches()
         return self._market_overview
+
+    async def market_timeline(self, *, limit: int = 180) -> dict:
+        await self._hydrate_market_history()
+        return {
+            "as_of": self._market_overview.get("as_of"),
+            "round_id": self._market_overview.get("round_id"),
+            "trade_date": self._market_history_trade_date.isoformat() if self._market_history_trade_date else None,
+            "items": self._market_timeline[-limit:],
+        }
+
+    async def market_events(self, *, limit: int = 80) -> dict:
+        await self._hydrate_market_history()
+        return {
+            "as_of": self._market_overview.get("as_of"),
+            "round_id": self._market_overview.get("round_id"),
+            "trade_date": self._market_history_trade_date.isoformat() if self._market_history_trade_date else None,
+            "items": self._market_events[-limit:],
+        }
 
     async def quotes(self, stock_codes: list[str] | None = None) -> dict:
         settings = await self._load_settings()
@@ -413,7 +447,25 @@ class RealtimeMarketService:
                 self._close_providers([quote_provider, minute_provider])
 
     async def pool(self, pool_code: str) -> dict | None:
+        await self._hydrate_shared_caches()
         return self._pool_summaries.get(pool_code)
+
+    async def pools(self, *, limit: int = 200) -> dict:
+        await self._hydrate_shared_caches()
+        items = list(self._pool_summaries.values())
+        items.sort(
+            key=lambda item: (
+                item.get("average_change_pct") is None,
+                -(item.get("heat_score") or 0),
+                -(item.get("coverage_pct") or 0),
+                str(item.get("pool_code") or ""),
+            )
+        )
+        return {
+            "as_of": self._market_overview.get("as_of"),
+            "round_id": self._market_overview.get("round_id"),
+            "items": items[:limit],
+        }
 
     async def decision_targets(self) -> dict:
         return {
@@ -436,10 +488,18 @@ class RealtimeMarketService:
         }
 
     async def sectors(self, *, sector_type: str | None = None, limit: int = 50) -> dict:
+        await self._hydrate_shared_caches()
         items = list(self._sector_strength.values())
         if sector_type:
             items = [item for item in items if item["sector_type"] == sector_type]
-        items.sort(key=lambda item: (item.get("change_pct") is None, -(item.get("change_pct") or 0), -(item.get("coverage_pct") or 0)))
+        items.sort(
+            key=lambda item: (
+                item.get("heat_score") is None,
+                -(item.get("heat_score") or 0),
+                -(item.get("coverage_pct") or 0),
+                str(item.get("sector_code") or ""),
+            )
+        )
         return {"as_of": self._market_overview.get("as_of"), "round_id": self._market_overview.get("round_id"), "items": items[:limit]}
 
     async def subscribe(self, topics: set[str]):
@@ -536,11 +596,14 @@ class RealtimeMarketService:
         async with sessionmaker() as session:
             repository = RealtimeMarketRepository(session)
             active_codes, stock_names = await repository.active_stock_reference()
+            factor_trade_date, daily_factor_reference = await repository.latest_daily_factor_reference()
             sector_info, sector_members, stock_sectors = await repository.sector_reference()
             industry_info, industry_members, stock_industries = await repository.industry_universe_reference()
             pools = await repository.pool_reference(active_codes)
         self._active_codes = active_codes
         self._stock_names = stock_names
+        self._daily_factor_trade_date = factor_trade_date
+        self._daily_factor_reference = daily_factor_reference
         self._sector_info = {**sector_info, **industry_info}
         self._sector_members = {**sector_members, **industry_members}
         self._stock_sectors = {**stock_sectors}
@@ -549,7 +612,10 @@ class RealtimeMarketService:
         self._pools = pools
         self._reference_loaded_at = datetime.now(tz=ZoneInfo("UTC"))
         self._reference_loaded_clock = clock.monotonic()
-        logger.info("realtime reference loaded: active=%s concepts=%s tickflow_industries=%s pools=%s", len(active_codes), len(sector_info), len(industry_info), len(pools))
+        logger.info(
+            "realtime reference loaded: active=%s daily_factor_date=%s daily_factors=%s concepts=%s tickflow_industries=%s pools=%s",
+            len(active_codes), factor_trade_date, len(daily_factor_reference), len(sector_info), len(industry_info), len(pools),
+        )
 
     async def _acquire_leader(self, settings: RealtimeSettings) -> bool:
         self._leader_active = await redis_client.acquire_lease(
@@ -571,6 +637,18 @@ class RealtimeMarketService:
             pools = await redis_client.get_json(await redis_client.key("realtime", "pools"))
             if isinstance(pools, dict):
                 self._pool_summaries = pools
+
+    async def _hydrate_market_history(self) -> None:
+        """Restore same-day dashboard history without issuing provider requests."""
+        today = datetime.now(tz=SHANGHAI).date()
+        if self._market_history_trade_date == today and (self._market_timeline or self._market_events):
+            return
+        timeline = await redis_client.get_json(await redis_client.key("realtime", "market-timeline", today.isoformat()))
+        events = await redis_client.get_json(await redis_client.key("realtime", "market-events", today.isoformat()))
+        if isinstance(timeline, list) or isinstance(events, list):
+            self._market_history_trade_date = today
+            self._market_timeline = [item for item in (timeline or []) if isinstance(item, dict)][-MARKET_TIMELINE_MAX_ITEMS:]
+            self._market_events = [item for item in (events or []) if isinstance(item, dict)][-MARKET_EVENT_MAX_ITEMS:]
 
     async def _refresh_market_quotes(self, settings: RealtimeSettings) -> None:
         started = clock.monotonic()
@@ -606,15 +684,21 @@ class RealtimeMarketService:
             # quote cache intentionally retains individual hot/page entries,
             # but it must never leak an older quote into the full-market,
             # topic, industry or pool statistics of this round.
+            await self._hydrate_market_history()
+            self._ensure_market_history_trade_date()
             round_quotes = {item["stock_code"]: item for item in rows}
             self._market_round_quotes = round_quotes
             self._quotes.update(round_quotes)
             self._market_overview = self._build_market_overview(round_id, round_quotes)
             self._sector_strength = self._build_sector_strength(round_id, round_quotes)
             self._pool_summaries = self._build_pool_summaries(round_id, round_quotes)
+            self._record_market_history(round_id)
             await self._persist_quote_caches(settings)
             await self._publish("market_overview", self._market_overview)
             await self._publish("sectors", {"as_of": self._market_overview.get("as_of"), "round_id": round_id, "items": list(self._sector_strength.values())})
+            await self._publish("pools", {"as_of": self._market_overview.get("as_of"), "round_id": round_id, "items": list(self._pool_summaries.values())})
+            await self._publish("market_timeline", await self.market_timeline(limit=MARKET_TIMELINE_MAX_ITEMS))
+            await self._publish("market_events", await self.market_events(limit=MARKET_EVENT_MAX_ITEMS))
             for pool_code, summary in self._pool_summaries.items():
                 await self._publish(f"pool:{pool_code}", summary)
 
@@ -688,7 +772,7 @@ class RealtimeMarketService:
                 continue
             try:
                 priority = int(policy.get("priority", 1000))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, KeyError):
                 priority = 1000
             for code in pool.get("stock_codes", []):
                 if code not in active_set:
@@ -1124,6 +1208,10 @@ class RealtimeMarketService:
         up = sum(1 for value in change_values if value > 0)
         down = sum(1 for value in change_values if value < 0)
         flat = len(change_values) - up - down
+        quoted_count = len(change_values)
+        up_ratio = round(up / max(1, quoted_count) * 100, 2)
+        down_ratio = round(down / max(1, quoted_count) * 100, 2)
+        breadth_state = "broadly_up" if up_ratio >= 65 else "broadly_down" if down_ratio >= 65 else "mixed"
         verified_limit_quotes = [
             item
             for item in values
@@ -1149,12 +1237,23 @@ class RealtimeMarketService:
                 "up_count": up,
                 "down_count": down,
                 "flat_count": flat,
+                "market_breadth": {
+                    "state": breadth_state,
+                    "up_ratio_pct": up_ratio,
+                    "down_ratio_pct": down_ratio,
+                    "flat_ratio_pct": round(flat / max(1, quoted_count) * 100, 2),
+                },
                 "average_change_pct": round(sum(change_values) / len(change_values), 4) if change_values else None,
                 "median_change_pct": self._median(change_values),
                 "total_amount_yuan": sum(float(item.get("amount_yuan") or 0) for item in values),
+                "daily_factor_trend": self._build_daily_factor_trend(values),
+                "intraday_structure": self._build_intraday_structure(values),
                 "change_distribution": {
                     "up_5_pct": sum(1 for value in change_values if value >= 5),
                     "up_3_pct": sum(1 for value in change_values if 3 <= value < 5),
+                    "up_0_to_3_pct": sum(1 for value in change_values if 0 < value < 3),
+                    "flat": flat,
+                    "down_0_to_3_pct": sum(1 for value in change_values if -3 < value < 0),
                     "down_3_pct": sum(1 for value in change_values if -5 < value <= -3),
                     "down_5_pct": sum(1 for value in change_values if value <= -5),
                 },
@@ -1171,7 +1270,131 @@ class RealtimeMarketService:
                 ],
                 "top_gainers": self._rank_quotes(values, reverse=True),
                 "top_losers": self._rank_quotes(values, reverse=False),
+                "top_amount": self._rank_quotes_by_metric(values, metric="amount_yuan"),
+                "top_volume": self._rank_quotes_by_metric(values, metric="volume_hand"),
             },
+        }
+
+    def _build_daily_factor_trend(self, values: list[dict]) -> dict:
+        """Compare current prices with the latest completed daily MA values.
+
+        MA is deliberately a daily-factor reference, not a new intraday MA.
+        That distinction keeps the dashboard useful during a session without
+        accidentally treating a partial current-day candle as a completed bar.
+        """
+        if self._daily_factor_trade_date is None or not self._daily_factor_reference:
+            return {
+                "available": False,
+                "reason": "daily_factor_reference_unavailable",
+                "reference_trade_date": None,
+                "quote_count": len(values),
+                "factor_quote_count": 0,
+                "ma5": None,
+                "ma20": None,
+                "ma60": None,
+                "above_all": None,
+            }
+
+        counts: dict[str, dict[str, int]] = {
+            "ma5": {"above_count": 0, "comparable_count": 0},
+            "ma20": {"above_count": 0, "comparable_count": 0},
+            "ma60": {"above_count": 0, "comparable_count": 0},
+        }
+        factor_quote_count = 0
+        above_all_count = 0
+        comparable_all_count = 0
+        for quote in values:
+            try:
+                price = float(quote["last_price"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            factor = self._daily_factor_reference.get(str(quote.get("stock_code") or ""))
+            if not factor:
+                continue
+            factor_quote_count += 1
+            all_comparable = True
+            all_above = True
+            for key, bucket in counts.items():
+                try:
+                    moving_average = float(factor[key])
+                except (TypeError, ValueError, KeyError):
+                    all_comparable = False
+                    continue
+                bucket["comparable_count"] += 1
+                if price >= moving_average:
+                    bucket["above_count"] += 1
+                else:
+                    all_above = False
+            if all_comparable:
+                comparable_all_count += 1
+                if all_above:
+                    above_all_count += 1
+
+        def result(bucket: dict[str, int]) -> dict:
+            comparable_count = bucket["comparable_count"]
+            return {
+                **bucket,
+                "above_pct": round(bucket["above_count"] / max(1, comparable_count) * 100, 2) if comparable_count else None,
+            }
+
+        return {
+            "available": any(bucket["comparable_count"] for bucket in counts.values()),
+            "reason": None,
+            "reference_trade_date": self._daily_factor_trade_date.isoformat(),
+            "quote_count": len(values),
+            "factor_quote_count": factor_quote_count,
+            "ma5": result(counts["ma5"]),
+            "ma20": result(counts["ma20"]),
+            "ma60": result(counts["ma60"]),
+            "above_all": {
+                "above_count": above_all_count,
+                "comparable_count": comparable_all_count,
+                "above_pct": round(above_all_count / max(1, comparable_all_count) * 100, 2) if comparable_all_count else None,
+            },
+        }
+
+    @staticmethod
+    def _build_intraday_structure(values: list[dict]) -> dict:
+        above_open_count = 0
+        below_open_count = 0
+        open_comparable_count = 0
+        at_high_count = 0
+        at_low_count = 0
+        range_comparable_count = 0
+        for quote in values:
+            try:
+                price = float(quote["last_price"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            try:
+                open_price = float(quote["open_price"])
+                if open_price > 0:
+                    open_comparable_count += 1
+                    if price > open_price:
+                        above_open_count += 1
+                    elif price < open_price:
+                        below_open_count += 1
+            except (TypeError, ValueError, KeyError):
+                pass
+            try:
+                high_price = float(quote["high_price"])
+                low_price = float(quote["low_price"])
+                if high_price > 0 and low_price > 0:
+                    range_comparable_count += 1
+                    tolerance = max(0.001, abs(price) * 0.0002)
+                    if abs(price - high_price) <= tolerance:
+                        at_high_count += 1
+                    if abs(price - low_price) <= tolerance:
+                        at_low_count += 1
+            except (TypeError, ValueError, KeyError):
+                pass
+        return {
+            "open_comparable_count": open_comparable_count,
+            "above_open_count": above_open_count,
+            "below_open_count": below_open_count,
+            "range_comparable_count": range_comparable_count,
+            "at_high_count": at_high_count,
+            "at_low_count": at_low_count,
         }
 
     def _build_sector_strength(self, round_id: str, round_quotes: dict[str, dict]) -> dict[str, dict]:
@@ -1182,30 +1405,45 @@ class RealtimeMarketService:
                 continue
             changes = [float(item["change_pct"]) for item in quotes]
             leader = max(quotes, key=lambda item: float(item.get("change_pct") or 0))
+            laggard = min(quotes, key=lambda item: float(item.get("change_pct") or 0))
             info = self._sector_info[sector_code]
             median_change = self._median(changes)
             verified_limit_quotes = [item for item in quotes if self._has_verified_limit_prices(item)]
             limit_up_count = sum(1 for item in verified_limit_quotes if self._is_limit_event(item, "up")) if verified_limit_quotes else None
             limit_down_count = sum(1 for item in verified_limit_quotes if self._is_limit_event(item, "down")) if verified_limit_quotes else None
+            amount = sum(float(item.get("amount_yuan") or 0) for item in quotes)
+            heat_breakdown = self._heat_breakdown(changes, limit_up_count or 0, limit_down_count or 0, len(members), amount)
+            coverage_pct = round(len(quotes) / max(1, len(members)) * 100, 2)
             result[sector_code] = {
                 **info,
                 "as_of": self._market_overview.get("as_of"),
                 "round_id": round_id,
                 "member_count": len(members),
                 "quote_count": len(quotes),
-                "coverage_pct": round(len(quotes) / max(1, len(members)) * 100, 2),
+                "coverage_pct": coverage_pct,
+                "confidence": self._coverage_confidence(coverage_pct),
                 "change_pct": round(sum(changes) / len(changes), 4),
                 "median_change_pct": median_change,
                 "up_count": sum(1 for value in changes if value > 0),
                 "down_count": sum(1 for value in changes if value < 0),
                 "flat_count": sum(1 for value in changes if value == 0),
-                "amount_yuan": sum(float(item.get("amount_yuan") or 0) for item in quotes),
+                "amount_yuan": amount,
                 "limit_events_available": bool(verified_limit_quotes),
                 "limit_up_count": limit_up_count,
                 "limit_down_count": limit_down_count,
-                "heat_score": self._heat_score(changes, limit_up_count or 0, limit_down_count or 0, len(members), sum(float(item.get("amount_yuan") or 0) for item in quotes)),
+                "heat_breakdown": heat_breakdown,
+                "heat_score": self._heat_score(changes, limit_up_count or 0, limit_down_count or 0, len(members), amount),
                 "leader": {"stock_code": leader["stock_code"], "stock_name": leader.get("stock_name"), "change_pct": leader.get("change_pct"), "last_price": leader.get("last_price")},
+                "laggard": {
+                    "stock_code": laggard["stock_code"],
+                    "stock_name": laggard.get("stock_name"),
+                    "change_pct": laggard.get("change_pct"),
+                    "last_price": laggard.get("last_price"),
+                },
+                "leaders": self._rank_quotes(quotes, reverse=True, limit=5),
+                "laggards": self._rank_quotes(quotes, reverse=False, limit=5),
             }
+        self._apply_sector_ranks(result)
         return result
 
     def _build_pool_summaries(self, round_id: str, round_quotes: dict[str, dict]) -> dict[str, dict]:
@@ -1238,13 +1476,181 @@ class RealtimeMarketService:
             }
         return result
 
+    def _apply_sector_ranks(self, sectors: dict[str, dict]) -> None:
+        """Attach a comparable heat rank within each independent taxonomy.
+
+        Concepts and SW industries intentionally remain separate.  The rank
+        delta is a purely intraday comparison with the preceding accepted
+        full-market Quote round, not an EOD momentum or emotion signal.
+        """
+        next_ranks: dict[str, int] = {}
+        grouped: dict[str, list[dict]] = {}
+        for item in sectors.values():
+            grouped.setdefault(str(item.get("sector_type") or "unknown"), []).append(item)
+        for sector_type, items in grouped.items():
+            items.sort(
+                key=lambda item: (
+                    -(item.get("heat_score") or 0),
+                    -(item.get("coverage_pct") or 0),
+                    str(item.get("sector_code") or ""),
+                )
+            )
+            for position, item in enumerate(items, start=1):
+                key = f"{sector_type}:{item['sector_code']}"
+                previous_rank = self._previous_sector_ranks.get(key)
+                item["rank"] = position
+                item["previous_rank"] = previous_rank
+                item["rank_change"] = previous_rank - position if previous_rank is not None else None
+                next_ranks[key] = position
+        self._previous_sector_ranks = next_ranks
+
+    def _record_market_history(self, round_id: str) -> None:
+        """Append one compact intraday dashboard point and meaningful changes.
+
+        This function is called only after a >=95% full-market round is
+        accepted.  A failed/degraded provider call therefore cannot create a
+        fabricated trend or anomaly event.
+        """
+        trade_date = datetime.now(tz=SHANGHAI).date()
+        if self._market_history_trade_date != trade_date:
+            # The normal refresh path clears previous ranks *before* it builds
+            # the current sector snapshot.  Keep the just-built rank map here
+            # as a defensive fallback for direct/test callers.
+            self._market_history_trade_date = trade_date
+            self._market_timeline = []
+            self._market_events = []
+            self._previous_concept_leaders = {}
+            self._previous_market_breadth = None
+
+        overview_items = self._market_overview.get("items") if isinstance(self._market_overview.get("items"), dict) else {}
+        concepts = sorted(
+            (item for item in self._sector_strength.values() if item.get("sector_type") == "concept"),
+            key=lambda item: (item.get("rank") or 10_000, str(item.get("sector_code") or "")),
+        )
+        top_concepts = concepts[:10]
+        had_baseline = bool(self._market_timeline)
+        timeline_point = {
+            "as_of": self._market_overview.get("as_of"),
+            "round_id": round_id,
+            "up_count": overview_items.get("up_count"),
+            "down_count": overview_items.get("down_count"),
+            "flat_count": overview_items.get("flat_count"),
+            "average_change_pct": overview_items.get("average_change_pct"),
+            "median_change_pct": overview_items.get("median_change_pct"),
+            "total_amount_yuan": overview_items.get("total_amount_yuan"),
+            "breadth_state": (overview_items.get("market_breadth") or {}).get("state"),
+            "top_concepts": [
+                {
+                    "sector_code": item.get("sector_code"),
+                    "sector_name": item.get("sector_name"),
+                    "rank": item.get("rank"),
+                    "heat_score": item.get("heat_score"),
+                    "change_pct": item.get("change_pct"),
+                    "leader": item.get("leader"),
+                }
+                for item in top_concepts[:3]
+            ],
+        }
+        self._market_timeline.append(timeline_point)
+        self._market_timeline = self._market_timeline[-MARKET_TIMELINE_MAX_ITEMS:]
+
+        if had_baseline:
+            events = self._build_market_events(round_id, top_concepts, overview_items)
+            self._market_events.extend(events[:MARKET_EVENT_PER_ROUND_LIMIT])
+            self._market_events = self._market_events[-MARKET_EVENT_MAX_ITEMS:]
+        self._previous_market_breadth = (overview_items.get("market_breadth") or {}).get("state")
+        self._previous_concept_leaders = {
+            str(item.get("sector_code")): str((item.get("leader") or {}).get("stock_code"))
+            for item in top_concepts[:5]
+            if (item.get("leader") or {}).get("stock_code")
+        }
+
+    def _ensure_market_history_trade_date(self) -> None:
+        trade_date = datetime.now(tz=SHANGHAI).date()
+        if self._market_history_trade_date == trade_date:
+            return
+        self._market_history_trade_date = trade_date
+        self._market_timeline = []
+        self._market_events = []
+        self._previous_sector_ranks = {}
+        self._previous_concept_leaders = {}
+        self._previous_market_breadth = None
+
+    def _build_market_events(self, round_id: str, top_concepts: list[dict], overview_items: dict) -> list[dict]:
+        as_of = self._market_overview.get("as_of")
+        events: list[dict] = []
+
+        breadth_state = (overview_items.get("market_breadth") or {}).get("state")
+        if breadth_state and breadth_state != self._previous_market_breadth:
+            labels = {"broadly_up": "全市场上涨占优", "broadly_down": "全市场下跌占优", "mixed": "全市场涨跌回到均衡"}
+            events.append(
+                {
+                    "event_type": "market_breadth_changed",
+                    "severity": "positive" if breadth_state == "broadly_up" else "negative" if breadth_state == "broadly_down" else "neutral",
+                    "title": labels.get(str(breadth_state), "市场宽度变化"),
+                    "detail": f"上涨 {overview_items.get('up_count', 0)} 家，下跌 {overview_items.get('down_count', 0)} 家。",
+                }
+            )
+
+        for item in top_concepts:
+            rank_change = item.get("rank_change")
+            rank = item.get("rank")
+            previous_rank = item.get("previous_rank")
+            sector_name = item.get("sector_name") or item.get("sector_code")
+            if isinstance(rank_change, int) and rank_change >= 5:
+                events.append(
+                    {
+                        "event_type": "concept_rank_up",
+                        "severity": "positive",
+                        "title": f"{sector_name} 热度上升",
+                        "detail": f"概念热度排名由 #{previous_rank} 升至 #{rank}，上升 {rank_change} 位。",
+                        "sector_code": item.get("sector_code"),
+                        "sector_name": sector_name,
+                    }
+                )
+            elif isinstance(rank_change, int) and rank_change <= -5:
+                events.append(
+                    {
+                        "event_type": "concept_rank_down",
+                        "severity": "negative",
+                        "title": f"{sector_name} 热度回落",
+                        "detail": f"概念热度排名由 #{previous_rank} 降至 #{rank}，回落 {abs(rank_change)} 位。",
+                        "sector_code": item.get("sector_code"),
+                        "sector_name": sector_name,
+                    }
+                )
+            previous_leader = self._previous_concept_leaders.get(str(item.get("sector_code")))
+            leader = item.get("leader") if isinstance(item.get("leader"), dict) else {}
+            leader_code = leader.get("stock_code")
+            if previous_leader and leader_code and leader_code != previous_leader and int(rank or 999) <= 5:
+                events.append(
+                    {
+                        "event_type": "concept_leader_changed",
+                        "severity": "neutral",
+                        "title": f"{sector_name} 领涨股切换",
+                        "detail": f"当前领涨为 {leader.get('stock_name') or leader_code}，涨跌幅 {leader.get('change_pct')}%。",
+                        "sector_code": item.get("sector_code"),
+                        "sector_name": sector_name,
+                        "stock_code": leader_code,
+                        "stock_name": leader.get("stock_name"),
+                    }
+                )
+
+        for index, event in enumerate(events, start=1):
+            event.update({"id": f"{round_id}:{index}", "as_of": as_of, "round_id": round_id})
+        return events
+
     async def _persist_quote_caches(self, settings: RealtimeSettings) -> None:
         ttl = settings.cache_ttl_seconds
+        history_ttl = self._market_history_ttl()
+        trade_date = self._market_history_trade_date.isoformat() if self._market_history_trade_date else datetime.now(tz=SHANGHAI).date().isoformat()
         await redis_client.set_many_json(
             [
                 (await redis_client.key("realtime", "market-overview"), self._market_overview, ttl),
                 (await redis_client.key("realtime", "sectors"), list(self._sector_strength.values()), ttl),
                 (await redis_client.key("realtime", "pools"), self._pool_summaries, ttl),
+                (await redis_client.key("realtime", "market-timeline", trade_date), self._market_timeline, history_ttl),
+                (await redis_client.key("realtime", "market-events", trade_date), self._market_events, history_ttl),
             ]
         )
 
@@ -1475,10 +1881,27 @@ class RealtimeMarketService:
     def _rank_quotes(items: list[dict], *, reverse: bool, limit: int = 10) -> list[dict]:
         ranked = [item for item in items if item.get("change_pct") is not None]
         ranked.sort(key=lambda item: float(item.get("change_pct") or 0), reverse=reverse)
-        return [
-            {key: item.get(key) for key in ("stock_code", "stock_name", "last_price", "change_pct", "amount_yuan")}
-            for item in ranked[:limit]
-        ]
+        return [RealtimeMarketService._rank_quote_item(item) for item in ranked[:limit]]
+
+    @staticmethod
+    def _rank_quotes_by_metric(items: list[dict], *, metric: str, limit: int = 10) -> list[dict]:
+        ranked: list[dict] = []
+        for item in items:
+            try:
+                value = float(item.get(metric))
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                ranked.append(item)
+        ranked.sort(key=lambda item: float(item.get(metric) or 0), reverse=True)
+        return [RealtimeMarketService._rank_quote_item(item) for item in ranked[:limit]]
+
+    @staticmethod
+    def _rank_quote_item(item: dict) -> dict:
+        return {
+            key: item.get(key)
+            for key in ("stock_code", "stock_name", "last_price", "change_pct", "amount_yuan", "volume_hand")
+        }
 
     @staticmethod
     def _median(values: list[float]) -> float | None:
@@ -1507,16 +1930,34 @@ class RealtimeMarketService:
         return ext.get("limit_up") is not None and ext.get("limit_down") is not None
 
     @staticmethod
-    def _heat_score(changes: list[float], limit_up: int, limit_down: int, member_count: int, amount: float) -> float:
+    def _heat_breakdown(changes: list[float], limit_up: int, limit_down: int, member_count: int, amount: float) -> dict[str, float]:
         if not changes:
-            return 0.0
+            return {"change": 0.0, "breadth": 0.0, "limit": 0.0, "liquidity": 0.0}
         up_ratio = sum(1 for value in changes if value > 0) / len(changes)
         mean_change = sum(changes) / len(changes)
         change_component = min(35.0, max(0.0, (mean_change + 3.0) / 6.0 * 35.0))
         breadth_component = up_ratio * 30.0
         limit_component = min(25.0, limit_up / max(1, member_count) * 250.0) - min(10.0, limit_down / max(1, member_count) * 100.0)
-        liquidity_component = min(10.0, math.log10(max(1.0, amount)) - 6.0)
-        return round(min(100.0, max(0.0, change_component + breadth_component + limit_component + liquidity_component)), 2)
+        liquidity_component = min(10.0, max(0.0, math.log10(max(1.0, amount)) - 6.0))
+        return {
+            "change": round(change_component, 2),
+            "breadth": round(breadth_component, 2),
+            "limit": round(limit_component, 2),
+            "liquidity": round(liquidity_component, 2),
+        }
+
+    @classmethod
+    def _heat_score(cls, changes: list[float], limit_up: int, limit_down: int, member_count: int, amount: float) -> float:
+        breakdown = cls._heat_breakdown(changes, limit_up, limit_down, member_count, amount)
+        return round(min(100.0, max(0.0, sum(breakdown.values()))), 2)
+
+    @staticmethod
+    def _coverage_confidence(coverage_pct: float) -> str:
+        if coverage_pct >= 95:
+            return "high"
+        if coverage_pct >= 80:
+            return "medium"
+        return "low"
 
     @staticmethod
     def _is_market_session(now: datetime) -> bool:
@@ -1552,6 +1993,12 @@ class RealtimeMarketService:
         now = datetime.now(tz=SHANGHAI)
         expiry = datetime.combine(now.date(), time(15, 20), tzinfo=SHANGHAI)
         return max(60, int((expiry - now).total_seconds()))
+
+    @staticmethod
+    def _market_history_ttl() -> int:
+        now = datetime.now(tz=SHANGHAI)
+        expiry = datetime.combine(now.date(), time(16, 30), tzinfo=SHANGHAI)
+        return max(15 * 60, int((expiry - now).total_seconds()))
 
     @staticmethod
     def _is_stale(quote: dict | None, settings: RealtimeSettings, now: datetime) -> bool:
