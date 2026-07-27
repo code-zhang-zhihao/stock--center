@@ -65,6 +65,7 @@
 59. `59-scheduler-job-tags-and-retire-obsolete-jobs.sql`：新增调度标签及任务-标签关联表，seed 历史/每日/主数据/策略标签，并删除三个无效或已替换的任务定义。
 60. `60-tickflow-realtime-quote.sql`：新增 `market_data/tickflow` 加密 API Key 配置，并将实时 Quote 路由设为 TickFlow；MooTDX 实时分钟线配置与缓存链路保持不变。
 61. `61-realtime-research-foundation.sql`：第一期实时研究底座。增加 ST 主数据标识、TickFlow 标的池目录/成员有效期、REST Quote/五档深度额度配置，并将实时默认值收口为 60 秒全市场、10 秒候选 Quote/深度、6 路 MooTDX 分钟线。
+62. `62-data-assets-cache-performance-indexes.sql`：为数据中心的最新交易日覆盖率补充 `trade_date + stock_code` 前导索引，并刷新大表统计信息；必须由对应表 owner 在非事务会话执行。
 
 ## 产品化初始化规划
 
@@ -102,6 +103,8 @@ docs/sql/db-init.sql
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 
 `60-tickflow-realtime-quote.sql` 只新增配置中心对象与运行时参数，不改行情事实、分钟线或分钟因子表。执行后先在“系统设置中心 > 数据源 > TickFlow”新增并测试一个 active `api_key`，再启用 `realtime_market`；若实时运行时已经启用但没有可用 TickFlow Key，它会明确报错，不会静默把 Quote 切回 MooTDX。MooTDX 仍是实时分钟线唯一 Provider。
+
+`62-data-assets-cache-performance-indexes.sql` 必须由 `t_daily_bar`、`t_stock_daily_basic`、`t_stock_fund_flow_daily`、`t_stock_technical_factor_daily`、`t_stock_factor_daily`、`t_limit_event_daily` 的表 owner 或 `postgres` 执行。脚本中的 `CREATE INDEX CONCURRENTLY` 不能包在显式事务中，也不能通过会自动开启事务的 migration runner 执行。索引创建不删除业务数据；末尾 `ANALYZE` 只刷新规划器统计信息、不回收物理磁盘空间。`t_stock_factor_daily` 如需回收历史批量更新造成的实际膨胀，应在独立维护窗口先评估后再决定 `pg_repack` 或 `VACUUM FULL`，本脚本不执行该类高锁操作。
 
 `19-daily-close-ingest-batching.sql` 只更新调度任务元数据，不修改行情事实表。已执行过 `16` 的数据库曾用它展示 `minute_batch_size` 和 `quote_batch_size` 参数；后续 `45` 会废弃 EOD quote，因此新环境不应再把 `quote_batch_size` 作为常规参数。
 
@@ -154,7 +157,7 @@ cd python-back
 
 `41-index-weight-lookback-months.sql` 会删除 `t_index_component_index_code_stock_code_effective_date_sour_key` 这个旧快照口径冗余唯一约束，并更新调度任务元数据。它需要由 `t_index_component` owner 或 `postgres` 执行。建议在 `40` 执行完成后执行并 reload Scheduler；之后 `sync_index_catalog` 会默认用最近 3 个自然月窗口调用 Tushare `index_weight`，并取最新完整权重日期入库。
 
-`42-data-asset-health-cache.sql` 只写入 `refresh_data_asset_health` 调度任务定义，不创建 PostgreSQL 缓存表。数据中心健康度缓存使用 Redis，需配置 Redis Cache 数据源或 `.env` Redis 兜底。缓存为空或 Redis 不可用时后端会回退即时计算。执行后建议手动运行一次 `refresh_data_asset_health` 或调用 `POST /api/v1/data-assets/refresh?snapshot_key=all&async=true` 预热缓存，然后 reload Scheduler。
+`42-data-asset-health-cache.sql` 只写入 `refresh_data_asset_health` 调度任务定义，不创建 PostgreSQL 缓存表。数据中心健康度缓存使用 Redis，需配置 Redis Cache 数据源或 `.env` Redis 兜底。当前运行时会保留至少 48 小时的最后成功快照：刷新失败或当前 TTL 到期时，页面继续展示旧快照并标记为 stale，不会从页面请求回退为同步大表扫描；首次尚无任何快照时 API 返回 `data_assets_cache_building` 并由后台单实例构建。执行后建议手动运行一次 `refresh_data_asset_health` 或调用 `POST /api/v1/data-assets/refresh?snapshot_key=all&async=true` 预热缓存，然后 reload Scheduler。
 
 `43-redis-cache-data-source.sql` 只写入配置中心 seed，不创建 Redis 相关业务表。执行后可在“系统设置中心 > 数据源 > Redis Cache”中新增 `redis_url` 敏感值，例如 `redis://:password@host:6379/0`；运行时优先读取配置中心，未配置或配置不可用时回退 `.env`，再回退本地内存缓存。Redis 连接测试只执行一次 `PING`，不会暴露 URL 明文。Redis TTL 采用数据中心默认和专属项：`data_asset_cache_ttl_seconds` 是数据中心默认 TTL，`data_asset_summary_ttl_seconds` 和 `data_asset_daily_health_ttl_seconds` 可分别覆盖总览和完整性缓存，`default_cache_ttl_seconds` 预留给后续其他缓存族。
 

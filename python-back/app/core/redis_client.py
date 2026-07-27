@@ -86,6 +86,13 @@ class RedisClient:
         if client is None:
             self._memory_set(key, value, ttl_seconds=ttl_seconds)
             return True
+        try:
+            await client.set(key, json.dumps(value, ensure_ascii=False), ex=max(1, ttl_seconds))
+            return True
+        except Exception as exc:
+            logger.warning("redis set_json failed: key=%s error=%s", key, exc)
+            self._memory_set(key, value, ttl_seconds=ttl_seconds)
+            return True
 
     async def set_many_json(self, items: list[tuple[str, dict | list, int]]) -> bool:
         """Atomically write a coherent realtime cache snapshot when Redis is available.
@@ -161,13 +168,6 @@ class RedisClient:
             )
         except Exception as exc:
             logger.warning("redis release_lease failed: key=%s error=%s", key, exc)
-        try:
-            await client.set(key, json.dumps(value, ensure_ascii=False), ex=max(1, ttl_seconds))
-            return True
-        except Exception as exc:
-            logger.warning("redis set_json failed: key=%s error=%s", key, exc)
-            self._memory_set(key, value, ttl_seconds=ttl_seconds)
-            return True
 
     async def ttl(self, key: str) -> int | None:
         client = await self._get_client()

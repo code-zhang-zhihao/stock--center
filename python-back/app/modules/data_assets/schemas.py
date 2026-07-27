@@ -37,6 +37,7 @@ class DataAssetItem(BaseModel):
     table_name: str
     frequency: str
     row_count: int
+    row_count_is_estimate: bool = False
     latest_trade_date: date | None = None
     earliest_trade_date: date | None = None
     latest_at: datetime | None = None
@@ -120,6 +121,8 @@ class DataAssetCacheStatusItem(BaseModel):
     expires_at: datetime | None = None
     refreshed_at: datetime | None = None
     is_stale: bool = True
+    has_last_good: bool = False
+    refresh_in_progress: bool = False
     error_message: str | None = None
 
 
@@ -131,6 +134,8 @@ class DataAssetCacheStatusReport(BaseModel):
 class DataAssetRefreshResult(BaseModel):
     refreshed_keys: list[str]
     failed_keys: list[str] = Field(default_factory=list)
+    skipped_keys: list[str] = Field(default_factory=list)
+    refresh_in_progress: bool = False
     summary_rows: int = 0
     daily_health_rows: int = 0
     generated_at: datetime

@@ -8,7 +8,7 @@ from app.core.response import ApiResponse
 from app.db.session import get_session, get_sessionmaker
 from app.modules.data_assets.repository import DataAssetsRepository
 from app.modules.data_assets.schemas import DataAssetRefreshQueuedResult
-from app.modules.data_assets.service import DataAssetsService
+from app.modules.data_assets.service import DataAssetCacheMissError, DataAssetsService
 from app.modules.realtime_market.service import realtime_market_service
 
 
@@ -21,20 +21,30 @@ def service(session: AsyncSession) -> DataAssetsService:
 
 
 @router.get("/summary")
-async def get_data_assets_summary(session: AsyncSession = Depends(get_session)):
+async def get_data_assets_summary(
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
     try:
         return ApiResponse.ok(await service(session).cached_summary())
+    except DataAssetCacheMissError as exc:
+        background_tasks.add_task(_refresh_data_assets_cache_background, 3, "all")
+        return ApiResponse.fail(code="data_assets_cache_building", message=str(exc))
     except Exception as exc:
         return ApiResponse.fail(code="data_assets_summary_failed", message=str(exc))
 
 
 @router.get("/daily-health")
 async def get_data_assets_daily_health(
+    background_tasks: BackgroundTasks,
     days: int = Query(default=3, ge=1, le=15),
     session: AsyncSession = Depends(get_session),
 ):
     try:
         return ApiResponse.ok(await service(session).cached_daily_health(days=days))
+    except DataAssetCacheMissError as exc:
+        background_tasks.add_task(_refresh_data_assets_cache_background, days, "all")
+        return ApiResponse.fail(code="data_assets_cache_building", message=str(exc))
     except Exception as exc:
         return ApiResponse.fail(code="data_assets_daily_health_failed", message=str(exc))
 

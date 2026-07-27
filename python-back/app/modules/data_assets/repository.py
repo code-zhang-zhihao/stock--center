@@ -51,7 +51,7 @@ class DataAssetsRepository:
         ).scalars().all()
         return list(rows)
 
-    async def table_stats(self, definition: AssetDefinition) -> TableStats:
+    async def table_stats(self, definition: AssetDefinition, *, skip_latest_count: bool = False) -> TableStats:
         exists = bool(await self.session.scalar(text("select to_regclass(:table_name)"), {"table_name": definition.table_name}))
         if not exists:
             return TableStats(exists=False)
@@ -71,7 +71,7 @@ class DataAssetsRepository:
                 latest_trade_date = await self.session.scalar(
                     text(f"select {definition.date_column} from {definition.table_name}{where_sql} order by {definition.date_column} desc limit 1")
                 )
-                if latest_trade_date and definition.latest_count_column:
+                if latest_trade_date and definition.latest_count_column and not skip_latest_count:
                     latest_where = self._append_where(where_sql, f"{definition.date_column} = :latest_date")
                     latest_count = int(
                         await self.session.scalar(
@@ -111,6 +111,10 @@ class DataAssetsRepository:
             metrics=metrics,
             warnings=warnings,
         )
+
+    async def release_read_transaction(self) -> None:
+        """Release read locks between independent cache snapshots."""
+        await self.session.rollback()
 
     async def stock_daily_coverage(self, definition: AssetDefinition, trade_date: date | None) -> DataAssetCoverage | None:
         if definition.coverage_scope != "active_stock_daily" or not trade_date:

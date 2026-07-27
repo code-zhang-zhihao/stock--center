@@ -11,7 +11,7 @@
       </n-button>
     </header>
 
-    <n-alert v-if="errorMessage" class="page-alert" type="error" title="数据资产加载失败">{{ errorMessage }}</n-alert>
+    <n-alert v-if="errorMessage" class="page-alert" :type="errorType" :title="errorType === 'warning' ? '数据资产缓存生成中' : '数据资产加载失败'">{{ errorMessage }}</n-alert>
     <n-alert v-for="note in summary?.notes || []" :key="note" class="page-alert" type="warning">{{ note }}</n-alert>
 
     <section class="summary-grid">
@@ -159,7 +159,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue';
+import { computed, h, onMounted, onUnmounted, ref } from 'vue';
 import { NAlert, NButton, NDataTable, NInput, NModal, NSpin, NTabPane, NTabs, NTag, useMessage, type DataTableColumns } from 'naive-ui';
 import { RefreshCw } from 'lucide-vue-next';
 import { dataAssetsApi } from '@/api/data-assets';
@@ -183,12 +183,14 @@ const dailyHealth = ref<DataAssetDailyHealthReport | null>(null);
 const cacheStatus = ref<DataAssetCacheStatusReport | null>(null);
 const realtimeHealth = ref<RealtimeHealth | null>(null);
 const errorMessage = ref('');
+const errorType = ref<'error' | 'warning'>('error');
 const keyword = ref('');
 const categoryFilter = ref('all');
 const gapLoading = ref(false);
 const gapModalVisible = ref(false);
 const gapReport = ref<DataAssetGapReport | null>(null);
 const message = useMessage();
+let cacheRetryTimer: number | null = null;
 
 const realtimeLabel = computed(() => {
   if (!realtimeHealth.value?.enabled) return '未启用';
@@ -247,7 +249,7 @@ const assetColumns = computed<DataTableColumns<DataAssetItem>>(() => [
       : '-',
   },
   { title: '频率', key: 'frequency', width: 90 },
-  { title: '行数', key: 'row_count', width: 120, align: 'right', render: (row) => formatNumber(row.row_count) },
+  { title: '行数', key: 'row_count', width: 120, align: 'right', render: (row) => `${row.row_count_is_estimate ? '约 ' : ''}${formatNumber(row.row_count)}` },
   { title: '最新日期', key: 'latest_trade_date', width: 130, render: (row) => row.latest_trade_date || formatDate(row.latest_at) },
   { title: '最新数量', key: 'latest_count', width: 110, align: 'right', render: (row) => row.latest_count == null ? '-' : formatNumber(row.latest_count) },
   {
@@ -328,13 +330,13 @@ function cacheLabel(snapshotKey: string) {
 }
 
 function cacheStatusLabel(status: string | null) {
-  return ({ success: '正常', failed: '失败', missing: '未生成', disabled: '已关闭' } as Record<string, string>)[status || ''] || (status || '未知');
+  return ({ success: '正常', stale: '旧缓存', building: '生成中', failed: '失败', missing: '未生成', disabled: '已关闭' } as Record<string, string>)[status || ''] || (status || '未知');
 }
 
 function cacheTagType(status: string | null) {
   if (status === 'success') return 'success';
   if (status === 'failed') return 'error';
-  if (status === 'missing') return 'warning';
+  if (status === 'missing' || status === 'stale' || status === 'building') return 'warning';
   return 'default';
 }
 
@@ -386,36 +388,53 @@ async function openGaps(row: DataAssetItem) {
 async function loadSummary() {
   loading.value = true;
   errorMessage.value = '';
+  errorType.value = 'error';
   try {
-    const [loadedSummary, loadedDailyHealth, loadedCacheStatus, loadedRealtimeHealth] = await Promise.all([
+    const results = await Promise.allSettled([
       dataAssetsApi.summary(),
       dataAssetsApi.dailyHealth({ days: 3 }),
       dataAssetsApi.cacheStatus(),
       dataAssetsApi.realtimeHealth(),
     ]);
-    summary.value = loadedSummary;
-    dailyHealth.value = loadedDailyHealth;
-    cacheStatus.value = loadedCacheStatus;
-    realtimeHealth.value = loadedRealtimeHealth;
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '数据中心加载失败';
+    const [summaryResult, dailyHealthResult, cacheStatusResult, realtimeHealthResult] = results;
+    if (summaryResult.status === 'fulfilled') summary.value = summaryResult.value;
+    if (dailyHealthResult.status === 'fulfilled') dailyHealth.value = dailyHealthResult.value;
+    if (cacheStatusResult.status === 'fulfilled') cacheStatus.value = cacheStatusResult.value;
+    if (realtimeHealthResult.status === 'fulfilled') realtimeHealth.value = realtimeHealthResult.value;
+
+    const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (rejected.length) {
+      const cacheBuilding = rejected.some((result) => (result.reason as { code?: string } | undefined)?.code === 'data_assets_cache_building');
+      errorType.value = cacheBuilding ? 'warning' : 'error';
+      errorMessage.value = cacheBuilding
+        ? '缓存尚未生成，后台已开始构建；其他可用区块会继续展示。'
+        : (rejected[0].reason instanceof Error ? rejected[0].reason.message : '部分数据资产暂时无法加载');
+      if (cacheBuilding) scheduleCacheRetry();
+    }
   } finally {
     loading.value = false;
   }
 }
 
+function scheduleCacheRetry() {
+  if (cacheRetryTimer != null) return;
+  cacheRetryTimer = window.setTimeout(() => {
+    cacheRetryTimer = null;
+    void loadSummary();
+  }, 10000);
+}
+
 async function refreshCache() {
   refreshing.value = true;
   errorMessage.value = '';
+  errorType.value = 'error';
   try {
     const result = await dataAssetsApi.refresh({ days: 3, snapshot_key: 'all', async: true });
     message.success('数据资产缓存刷新已提交后台执行');
     if ('message' in result && result.message) {
       cacheStatus.value = await dataAssetsApi.cacheStatus();
     }
-    window.setTimeout(() => {
-      void loadSummary();
-    }, 5000);
+    scheduleCacheRetry();
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '数据中心缓存刷新失败';
   } finally {
@@ -425,6 +444,10 @@ async function refreshCache() {
 
 onMounted(() => {
   void loadSummary();
+});
+
+onUnmounted(() => {
+  if (cacheRetryTimer != null) window.clearTimeout(cacheRetryTimer);
 });
 </script>
 

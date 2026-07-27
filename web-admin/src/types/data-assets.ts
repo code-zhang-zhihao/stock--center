@@ -31,6 +31,7 @@ export interface DataAssetItem {
   table_name: string;
   frequency: string;
   row_count: number;
+  row_count_is_estimate: boolean;
   latest_trade_date: string | null;
   earliest_trade_date: string | null;
   latest_at: string | null;
@@ -114,6 +115,8 @@ export interface DataAssetCacheStatusItem {
   expires_at: string | null;
   refreshed_at: string | null;
   is_stale: boolean;
+  has_last_good: boolean;
+  refresh_in_progress: boolean;
   error_message: string | null;
 }
 
@@ -195,6 +198,8 @@ export interface RealtimeHealth {
 export interface DataAssetRefreshResult {
   refreshed_keys: string[];
   failed_keys: string[];
+  skipped_keys: string[];
+  refresh_in_progress: boolean;
   summary_rows: number;
   daily_health_rows: number;
   generated_at: string;
