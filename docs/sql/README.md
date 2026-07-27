@@ -68,6 +68,7 @@
 62. `62-data-assets-cache-performance-indexes.sql`：为数据中心的最新交易日覆盖率补充 `trade_date + stock_code` 前导索引，并刷新大表统计信息；必须由对应表 owner 在非事务会话执行。
 63. `63-realtime-runtime-stabilization.sql`：创建股票池一对一实时策略表，seed 系统池实时优先级/Quote/分钟档位，禁用动态全市场池作为目标，并将 TickFlow 实时限频安全比例设为 90%。
 64. `64-daily-close-late-facts-enrichment.sql`：将已执行旧四级流水线的涨跌停/炸板、停复牌和板块日线从 18:00 核心任务迁到 21:30 增强任务，只更新调度描述、默认 payload 和 metadata。
+65. `65-market-daily-sentiment.sql`：创建版本化 `t_market_sentiment_daily`，并 seed 22:15 的 `calculate_market_daily_sentiment` 每日任务；评分只读取 canonical 日线、涨跌停事件和交易日历，数据不足时记录 `pending`，不调用外部 Provider 或 LLM。
 
 ## 产品化初始化规划
 
@@ -103,6 +104,8 @@ docs/sql/db-init.sql
 `58-daily-close-four-stage-pipeline.sql` 不删除业务数据。它新增并默认启用 `daily_close_minute_ingest`，更新三个既有收盘任务的 cron、参数、超时和重试策略。脚本执行后需要 reload Scheduler；分钟线和分钟因子都保留最近 30 个交易日，分钟因子默认每 200 只股票一个 PostgreSQL 事务，可在 50–500 之间调整。
 
 `64-daily-close-late-facts-enrichment.sql` 适用于已经执行过旧版 `58` 的数据库。它只把 `daily_close_core_ingest.default_payload` 中的 `sync_stock_limit_status/sync_sector_bars` 改为 `false`，并把同两个开关在 `daily_close_enrichment_ingest.default_payload` 中改为 `true`；不会删除已入库事件、板块行情或历史运行记录。执行后 reload Scheduler。新环境执行已更新的 `58` 后也可以安全执行 `64`，结果一致。
+
+`65-market-daily-sentiment.sql` 需要在 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 之后执行，以便自动挂载“每日”标签；即使标签表不存在，建表和任务 seed 仍会完成。它只新增 Derived 表 `t_market_sentiment_daily` 和一个每日任务，不改写 `t_daily_bar/t_limit_event_daily` 等 canonical 事实，也不删除历史数据。任务在 22:15 读取已完成事实；日线 active universe 覆盖率低于 95% 或 `limit_list_d` 的 Raw 完成标记缺失时，写入 `pending` 而不是生成分数。部署代码、执行本 SQL 后需 reload Scheduler；如需先建立历史阶段基线，可在调度中心手动运行 `calculate_market_daily_sentiment` 并同时传入 `start_date`、`end_date` 和固定 `calculation_version=v1`。
 
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 

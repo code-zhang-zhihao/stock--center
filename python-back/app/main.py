@@ -13,6 +13,8 @@ from app.modules.data_assets.api import router as data_assets_router
 from app.modules.data_assets.scheduler_handlers import register_data_asset_jobs
 from app.modules.market_data.api import router as market_data_router
 from app.modules.market_data.scheduler_handlers import register_market_data_jobs
+from app.modules.market_insight.api import router as market_insight_router
+from app.modules.market_insight.scheduler_handlers import register_market_insight_jobs
 from app.modules.realtime_market.api import router as realtime_market_router
 from app.modules.realtime_market.service import realtime_market_service
 from app.modules.scheduler_center.api import router as scheduler_router
@@ -77,6 +79,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     register_data_asset_jobs()
     register_market_data_jobs()
+    register_market_insight_jobs()
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
     if settings.cors_origins:
         app.add_middleware(
@@ -88,6 +91,7 @@ def create_app() -> FastAPI:
         )
     app.include_router(config_center_router, prefix="/api/v1/config", tags=["config"])
     app.include_router(market_data_router, prefix="/api/v1/market-data", tags=["market-data"])
+    app.include_router(market_insight_router, prefix="/api/v1/market-insights", tags=["market-insights"])
     app.include_router(scheduler_router, prefix="/api/v1/scheduler", tags=["scheduler"])
     app.include_router(stock_pool_router, prefix="/api/v1/stock-pools", tags=["stock-pools"])
     app.include_router(data_assets_router, prefix="/api/v1/data-assets", tags=["data-assets"])
