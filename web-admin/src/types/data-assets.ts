@@ -165,6 +165,10 @@ export interface RealtimeMinuteMeta {
   updated_count: number;
   no_intraday_data_count: number;
   failed_count: number;
+  guaranteed_count: number;
+  guaranteed_overflow_count: number;
+  rotating_selected_count: number;
+  unregistered_count: number;
   duration_ms: number | null;
   error_samples: string[];
 }
@@ -180,6 +184,8 @@ export interface RealtimeHealth {
   minute_cache_count: number;
   minute_registered_count: number;
   minute_guaranteed_count: number;
+  minute_guaranteed_overflow_count: number;
+  minute_unregistered_count: number;
   reference_loaded_at: string | null;
   last_quote_round: RealtimeRoundMeta;
   last_minute_round: RealtimeMinuteMeta;

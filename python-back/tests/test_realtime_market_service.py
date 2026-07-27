@@ -1,39 +1,176 @@
 import asyncio
+from datetime import datetime, timezone
 
-from app.modules.realtime_market.schemas import RealtimeSettings
+from app.modules.realtime_market.schemas import RealtimeBlockMeta, RealtimeSettings
 from app.modules.realtime_market.service import RealtimeMarketService
 from app.modules.market_data.providers import MootdxProvider
 
 
-def test_minute_target_selection_keeps_fixed_priority_and_rotates_remainder():
+def test_minute_policy_keeps_guaranteed_targets_and_rotates_remaining_capacity():
     service = RealtimeMarketService()
+    candidate_codes = [f"6{code:05d}" for code in range(5, 505)]
+    service._active_codes = ["600001", "600002", "600003", "600004", *candidate_codes]
     service._pools = {
-        "holding": {"stock_codes": ["600001", "600002"]},
-        "focus": {"stock_codes": ["600003"]},
+        "holding": {
+            "pool_code": "holding", "pool_name": "持仓", "pool_type": "system", "stock_codes": ["600001", "600002"],
+            "realtime_policy": {"is_enabled": True, "priority": 0, "quote_lane": "hot", "minute_lane": "guaranteed"},
+        },
+        "focus": {
+            "pool_code": "focus", "pool_name": "重点", "pool_type": "system", "stock_codes": ["600003"],
+            "realtime_policy": {"is_enabled": True, "priority": 10, "quote_lane": "hot", "minute_lane": "guaranteed"},
+        },
+        "candidate": {
+            "pool_code": "candidate", "pool_name": "候选", "pool_type": "system", "stock_codes": candidate_codes,
+            "realtime_policy": {"is_enabled": True, "priority": 20, "quote_lane": "hot", "minute_lane": "rotating"},
+        },
     }
     service._page_targets = {"600004": 9_999_999_999.0}
-    registered = [f"6{code:05d}" for code in range(1, 501)]
     settings = RealtimeSettings(minute_guaranteed_target_count=200, minute_registered_target_limit=500)
 
-    first = service._select_minute_targets(registered, settings)
-    second = service._select_minute_targets(registered, settings)
+    _, first, first_plan = service._minute_target_plan(settings)
+    _, second, second_plan = service._minute_target_plan(settings)
+    first_codes = [item["stock_code"] for item in first]
+    second_codes = [item["stock_code"] for item in second]
 
     assert len(first) == 200
-    assert first[:4] == ["600001", "600002", "600003", "600004"]
-    assert second[:4] == first[:4]
-    assert first[4:] != second[4:]
+    assert first_codes[:4] == ["600001", "600002", "600003", "600004"]
+    assert second_codes[:4] == first_codes[:4]
+    assert first_codes[4:] != second_codes[4:]
+    assert first_plan["guaranteed_selected_count"] == 4
+    assert first_plan["rotating_selected_count"] == 196
+    assert second_plan["rotating_selected_count"] == 196
 
 
-def test_minute_registration_falls_back_to_active_universe_when_quotes_are_degraded():
+def test_minute_registration_never_falls_back_to_unrelated_active_universe():
     service = RealtimeMarketService()
     service._active_codes = [f"6{code:05d}" for code in range(1, 601)]
     settings = RealtimeSettings(minute_guaranteed_target_count=200, minute_registered_target_limit=500)
 
-    registered = service._registered_minute_targets(settings)
-    selected = service._select_minute_targets(registered, settings)
+    registered, selected, plan = service._minute_target_plan(settings)
 
-    assert len(registered) == 500
+    assert registered == []
+    assert selected == []
+    assert plan["unregistered_count"] == 0
+
+
+def test_realtime_target_merges_all_pool_memberships_with_explainable_effective_policy():
+    service = RealtimeMarketService()
+    service._active_codes = ["600001"]
+    service._stock_names = {"600001": "测试股"}
+    service._pools = {
+        "candidate": {
+            "pool_code": "candidate", "pool_name": "候选", "pool_type": "system", "stock_codes": ["600001"],
+            "realtime_policy": {"is_enabled": True, "priority": 20, "quote_lane": "hot", "minute_lane": "rotating"},
+        },
+        "holding": {
+            "pool_code": "holding", "pool_name": "持仓", "pool_type": "system", "stock_codes": ["600001"],
+            "realtime_policy": {"is_enabled": True, "priority": 0, "quote_lane": "hot", "minute_lane": "guaranteed"},
+        },
+    }
+
+    targets = service._realtime_targets(RealtimeSettings(strong_candidate_limit=0))
+
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["reason"] == "pool:holding"
+    assert target["priority"] == 0
+    assert target["quote_lane"] == "hot"
+    assert target["minute_lane"] == "guaranteed"
+    assert {item["pool_code"] for item in target["memberships"]} == {"holding", "candidate"}
+
+
+def test_strong_watch_candidates_only_come_from_the_latest_full_market_round():
+    service = RealtimeMarketService()
+    service._active_codes = ["600001", "600002"]
+    # An older direct page quote must not promote itself as a market-wide
+    # strong stock after the next universe round has been accepted.
+    service._quotes = {
+        "600001": {"stock_code": "600001", "change_pct": 9.0, "amount_yuan": 1_000_000},
+    }
+    service._market_round_quotes = {
+        "600002": {"stock_code": "600002", "change_pct": 2.0, "amount_yuan": 2_000_000},
+    }
+
+    targets = service._realtime_targets(RealtimeSettings(strong_candidate_limit=1))
+
+    assert [item["stock_code"] for item in targets] == ["600002"]
+    assert targets[0]["reason"] == "strong"
+
+
+def test_minute_guaranteed_overflow_is_explicit_and_never_silently_dropped():
+    service = RealtimeMarketService()
+    codes = [f"6{code:05d}" for code in range(1, 251)]
+    service._active_codes = codes
+    service._pools = {
+        "holding": {
+            "pool_code": "holding", "pool_name": "持仓", "pool_type": "system", "stock_codes": codes,
+            "realtime_policy": {"is_enabled": True, "priority": 0, "quote_lane": "hot", "minute_lane": "guaranteed"},
+        },
+    }
+
+    registered, selected, plan = service._minute_target_plan(
+        RealtimeSettings(minute_guaranteed_target_count=200, minute_registered_target_limit=500, strong_candidate_limit=0)
+    )
+
+    assert len(registered) == 250
     assert len(selected) == 200
+    assert plan == {
+        "guaranteed_selected_count": 200,
+        "guaranteed_overflow_count": 50,
+        "rotating_selected_count": 0,
+        "unregistered_count": 0,
+    }
+
+
+def test_market_overview_uses_only_the_current_full_market_round():
+    service = RealtimeMarketService()
+    service._active_codes = ["600001", "600002"]
+    service._quotes = {
+        "600001": {"stock_code": "600001", "change_pct": 1.0, "amount_yuan": 1},
+        "600002": {"stock_code": "600002", "change_pct": 2.0, "amount_yuan": 1},
+        # This is a retained, older page-watch quote and must not leak into
+        # the aggregate of a newly accepted full-market provider round.
+        "600003": {"stock_code": "600003", "change_pct": 9.0, "amount_yuan": 1},
+    }
+    current_round = {
+        "600001": {"stock_code": "600001", "change_pct": -1.0, "amount_yuan": 10, "source": "tickflow"},
+        "600002": {"stock_code": "600002", "change_pct": 3.0, "amount_yuan": 20, "source": "tickflow"},
+    }
+
+    overview = service._build_market_overview("round-current", current_round)
+
+    assert overview["round_id"] == "round-current"
+    assert overview["items"]["quote_count"] == 2
+    assert overview["items"]["average_change_pct"] == 1.0
+    assert overview["items"]["median_change_pct"] == 1.0
+    assert overview["items"]["total_amount_yuan"] == 30
+    assert overview["items"]["limit_events"]["available"] is False
+
+
+def test_tickflow_rate_budgets_use_ninety_percent_of_purchased_limits():
+    service = RealtimeMarketService()
+    service._configure_rate_budgets(
+        {
+            "quote_symbol_requests_per_minute": 60,
+            "quote_universe_requests_per_minute": 20,
+            "depth_batch_requests_per_minute": 60,
+            "realtime_safety_ratio": 0.9,
+        }
+    )
+
+    assert service._rate_budgets["quote_symbols"].safe_limit == 54
+    assert service._rate_budgets["quote_universe"].safe_limit == 18
+    assert service._rate_budgets["depth_batch"].safe_limit == 54
+    assert service._warm_quote_symbol_capacity(RealtimeSettings()) == 1200
+
+
+def test_realtime_block_status_reports_cache_age_at_read_time():
+    fresh = RealtimeBlockMeta(block="market", finished_at=datetime.now(timezone.utc), cache_freshness_seconds=0)
+
+    rendered = RealtimeMarketService._block_with_freshness(fresh)
+
+    assert rendered.cache_freshness_seconds is not None
+    assert 0 <= rendered.cache_freshness_seconds <= 1
 
 
 def test_minute_features_do_not_invent_amount_or_vwap():
@@ -104,6 +241,7 @@ def test_on_demand_fetch_fills_individual_quote_and_minute_cache(monkeypatch):
         service._new_minute_provider = lambda: MinuteProvider()
         service._is_continuous_market_session = lambda _now: True
         service._persist_minute_cache = lambda *_args, **_kwargs: asyncio.sleep(0)
+        service._leader_active = True
         async def fake_key(*parts):
             return ":".join(parts)
         async def ignore_cache_write(*_args, **_kwargs):
@@ -116,6 +254,28 @@ def test_on_demand_fetch_fills_individual_quote_and_minute_cache(monkeypatch):
         assert service._quotes["600519"]["last_price"] == 10.2
         assert service._minute_meta_by_stock["600519"]["status"] == "available"
         assert len(service._minutes["600519"]) == 1
+
+    asyncio.run(run())
+
+
+def test_on_demand_cache_miss_does_not_spend_quota_from_a_follower_instance():
+    async def run() -> None:
+        service = RealtimeMarketService()
+
+        async def not_leader(_settings):
+            return False
+
+        async def no_shared_cache(_code):
+            return None
+
+        service._acquire_leader = not_leader
+        service._hydrate_stock_cache = no_shared_cache
+        service._new_quote_provider = lambda _provider_code: (_ for _ in ()).throw(AssertionError("follower must not create a provider"))
+
+        result = await service._fetch_stock_on_demand("600519", RealtimeSettings(enabled=True))
+
+        assert result == "shared_cache"
+        assert "owned by another runtime instance" in service._on_demand_errors["600519"]
 
     asyncio.run(run())
 
@@ -145,7 +305,15 @@ def test_decision_target_pool_preserves_overflow_in_warm_watch_list():
     candidate_codes = [f"6{code:05d}" for code in range(1, 251)]
     service._active_codes = candidate_codes
     service._stock_names = {code: code for code in candidate_codes}
-    service._pools = {"candidate": {"stock_codes": candidate_codes}}
+    service._pools = {
+        "candidate": {
+            "pool_code": "candidate",
+            "pool_name": "候选",
+            "pool_type": "system",
+            "stock_codes": candidate_codes,
+            "realtime_policy": {"is_enabled": True, "priority": 20, "quote_lane": "hot", "minute_lane": "rotating"},
+        },
+    }
     service._quotes = {code: {"stock_code": code, "change_pct": index / 100, "amount_yuan": 1_000_000} for index, code in enumerate(candidate_codes)}
 
     hot, warm = service._build_decision_targets(RealtimeSettings(decision_target_limit=200))

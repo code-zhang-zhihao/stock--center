@@ -96,6 +96,18 @@ class TickflowQuoteProvider:
         rows = await asyncio.to_thread(self._quote_sync, symbols, True)
         return rows, rows
 
+    async def quote_source_symbols(self, source_symbols: list[str]) -> tuple[list[dict], list[dict]]:
+        """Fetch symbols whose exchange suffix cannot be inferred from stock code.
+
+        Core index symbols such as ``000001.SH`` overlap numerically with A-share
+        codes, so they must not use the stock-only ``tickflow_symbol`` mapper.
+        """
+        symbols = [str(symbol).strip().upper() for symbol in source_symbols if str(symbol).strip()]
+        if not symbols:
+            return [], []
+        rows = await asyncio.to_thread(self._quote_sync, symbols, True)
+        return rows, rows
+
     async def universe_quotes(self, universe_id: str = "CN_Equity_A") -> tuple[list[dict], list[dict]]:
         """Fetch a provider universe in one request; never synthesize it locally."""
         rows = await asyncio.to_thread(self._universe_quote_sync, universe_id)

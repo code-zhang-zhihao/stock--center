@@ -40,3 +40,25 @@ class StockPoolMember(Base):
     stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = created_at_column()
     updated_at: Mapped[datetime] = updated_at_column()
+
+
+class StockPoolRealtimePolicy(Base):
+    """Explicit runtime policy for one stock pool.
+
+    Membership describes what a stock belongs to.  The policy describes whether
+    and how that pool participates in the shared realtime runtime.
+    """
+
+    __tablename__ = "t_stock_pool_realtime_policy"
+
+    pool_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("t_stock_pool.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=1000)
+    quote_lane: Mapped[str] = mapped_column(String(20), nullable=False, default="off")
+    minute_lane: Mapped[str] = mapped_column(String(20), nullable=False, default="off")
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = updated_at_column()

@@ -1,6 +1,16 @@
-from app.modules.stock_pool.models import StockPool
+from app.modules.stock_pool.models import StockPool, StockPoolRealtimePolicy
 from app.modules.stock_pool.repository import StockPoolRepository
-from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolUpdate
+from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolRealtimePolicyUpdate, StockPoolUpdate
+
+
+def _policy_read(policy: StockPoolRealtimePolicy | None) -> dict:
+    return {
+        "is_enabled": bool(policy.is_enabled) if policy is not None else False,
+        "priority": int(policy.priority) if policy is not None else 1000,
+        "quote_lane": str(policy.quote_lane) if policy is not None else "off",
+        "minute_lane": str(policy.minute_lane) if policy is not None else "off",
+        "updated_at": policy.updated_at if policy is not None else None,
+    }
 
 
 class StockPoolError(Exception):
@@ -16,7 +26,7 @@ class StockPoolService:
         self.repository = repository
 
     @staticmethod
-    def _read(pool: StockPool, member_count: int = 0) -> dict:
+    def _read(pool: StockPool, member_count: int = 0, policy: StockPoolRealtimePolicy | None = None) -> dict:
         return {
             "id": pool.id,
             "pool_code": pool.pool_code,
@@ -29,13 +39,14 @@ class StockPoolService:
             "dynamic_rule": pool.dynamic_rule,
             "sort_order": pool.sort_order,
             "member_count": member_count,
+            "realtime_policy": _policy_read(policy),
             "created_at": pool.created_at,
             "updated_at": pool.updated_at,
         }
 
     async def list_pools(self) -> list[dict]:
         rows = await self.repository.list_pools()
-        return [self._read(row["pool"], row["member_count"]) for row in rows]
+        return [self._read(row["pool"], row["member_count"], row["policy"]) for row in rows]
 
     async def create_pool(self, payload: StockPoolCreate) -> dict:
         if await self.repository.get_pool(payload.pool_code):
@@ -53,17 +64,35 @@ class StockPoolService:
                 "sort_order": 1000,
             }
         )
+        policy_values = payload.realtime_policy.model_dump() if payload.realtime_policy is not None else None
+        self._assert_realtime_policy_allowed(pool, policy_values)
+        policy = await self.repository.create_realtime_policy(pool.id, policy_values)
         await self.repository.commit()
-        return self._read(pool)
+        return self._read(pool, policy=policy)
 
     async def update_pool(self, pool_code: str, payload: StockPoolUpdate) -> dict:
         pool = await self._require_pool(pool_code)
         values = payload.model_dump(exclude_unset=True)
+        policy_values = values.pop("realtime_policy", None)
         if pool.is_system and "pool_name" in values:
             raise StockPoolError("system_stock_pool_protected", f"系统股票池不可修改名称: {pool_code}")
         updated = await self.repository.update_pool(pool_code, values)
+        self._assert_realtime_policy_allowed(pool, policy_values)
+        policy = (
+            await self.repository.update_realtime_policy(pool.id, policy_values)
+            if policy_values is not None
+            else await self.repository.get_realtime_policy(pool.id)
+        )
         await self.repository.commit()
-        return self._read(updated or pool)
+        return self._read(updated or pool, policy=policy)
+
+    async def update_realtime_policy(self, pool_code: str, payload: StockPoolRealtimePolicyUpdate) -> dict:
+        pool = await self._require_pool(pool_code)
+        policy_values = payload.model_dump()
+        self._assert_realtime_policy_allowed(pool, policy_values)
+        policy = await self.repository.update_realtime_policy(pool.id, policy_values)
+        await self.repository.commit()
+        return self._read(pool, policy=policy)
 
     async def delete_pool(self, pool_code: str) -> dict:
         pool = await self._require_pool(pool_code)
@@ -143,3 +172,16 @@ class StockPoolService:
     def _assert_members_editable(pool: StockPool) -> None:
         if pool.is_dynamic:
             raise StockPoolError("dynamic_stock_pool_read_only", f"动态股票池由规则维护，不能手工修改成员: {pool.pool_code}")
+
+    @staticmethod
+    def _assert_realtime_policy_allowed(pool: StockPool, policy_values: dict | None) -> None:
+        if (
+            policy_values is not None
+            and pool.is_dynamic
+            and pool.dynamic_rule == "active_a_share"
+            and policy_values["is_enabled"]
+        ):
+            raise StockPoolError(
+                "dynamic_universe_realtime_policy_forbidden",
+                "全市场动态范围只能用于全市场 Quote，不能作为候选或分钟线目标池",
+            )

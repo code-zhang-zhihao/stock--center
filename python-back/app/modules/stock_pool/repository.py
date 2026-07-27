@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock
-from app.modules.stock_pool.models import StockPool, StockPoolMember
+from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
 
 
 class StockPoolRepository:
@@ -14,17 +14,18 @@ class StockPoolRepository:
 
     async def list_pools(self) -> list[dict]:
         result = await self.session.execute(
-            select(StockPool, func.count(StockPoolMember.id).label("member_count"))
+            select(StockPool, StockPoolRealtimePolicy, func.count(StockPoolMember.id).label("member_count"))
             .outerjoin(StockPoolMember, StockPoolMember.pool_id == StockPool.id)
-            .group_by(StockPool.id)
+            .outerjoin(StockPoolRealtimePolicy, StockPoolRealtimePolicy.pool_id == StockPool.id)
+            .group_by(StockPool.id, StockPoolRealtimePolicy.pool_id)
             .order_by(StockPool.is_system.desc(), StockPool.sort_order, StockPool.pool_code)
         )
         rows = []
-        for pool, member_count in result.all():
+        for pool, policy, member_count in result.all():
             resolved_count = int(member_count)
             if pool.is_dynamic and pool.dynamic_rule == "active_a_share":
                 resolved_count = int(await self.session.scalar(select(func.count()).select_from(Stock).where(Stock.status == "active")) or 0)
-            rows.append({"pool": pool, "member_count": resolved_count})
+            rows.append({"pool": pool, "policy": policy, "member_count": resolved_count})
         return rows
 
     async def get_pool(self, pool_code: str) -> StockPool | None:
@@ -34,6 +35,44 @@ class StockPoolRepository:
     async def create_pool(self, values: dict) -> StockPool:
         result = await self.session.execute(insert(StockPool).values(**values).returning(StockPool))
         return result.scalar_one()
+
+    async def create_realtime_policy(self, pool_id: int, values: dict | None = None) -> StockPoolRealtimePolicy:
+        resolved_values = {
+            "is_enabled": False,
+            "priority": 1000,
+            "quote_lane": "off",
+            "minute_lane": "off",
+            **(values or {}),
+        }
+        result = await self.session.execute(
+            insert(StockPoolRealtimePolicy)
+            .values(pool_id=pool_id, **resolved_values)
+            .on_conflict_do_nothing(index_elements=[StockPoolRealtimePolicy.pool_id])
+            .returning(StockPoolRealtimePolicy)
+        )
+        policy = result.scalar_one_or_none()
+        if policy is not None:
+            return policy
+        existing = await self.get_realtime_policy(pool_id)
+        if existing is None:  # pragma: no cover - database invariant guard.
+            raise RuntimeError(f"realtime policy create failed for stock pool {pool_id}")
+        return existing
+
+    async def get_realtime_policy(self, pool_id: int) -> StockPoolRealtimePolicy | None:
+        return await self.session.get(StockPoolRealtimePolicy, pool_id)
+
+    async def update_realtime_policy(self, pool_id: int, values: dict) -> StockPoolRealtimePolicy:
+        await self.create_realtime_policy(pool_id)
+        result = await self.session.execute(
+            update(StockPoolRealtimePolicy)
+            .where(StockPoolRealtimePolicy.pool_id == pool_id)
+            .values(**values, updated_at=datetime.now(timezone.utc))
+            .returning(StockPoolRealtimePolicy)
+        )
+        policy = result.scalar_one_or_none()
+        if policy is None:  # pragma: no cover - database invariant guard.
+            raise RuntimeError(f"realtime policy update failed for stock pool {pool_id}")
+        return policy
 
     async def update_pool(self, pool_code: str, values: dict) -> StockPool | None:
         if not values:
@@ -276,8 +315,18 @@ class StockPoolRepository:
         ).mappings().all()
         pool_rows = (
             await self.session.execute(
-                select(StockPool.pool_code, StockPool.pool_name, StockPool.pool_type, StockPool.is_system)
+                select(
+                    StockPool.pool_code,
+                    StockPool.pool_name,
+                    StockPool.pool_type,
+                    StockPool.is_system,
+                    StockPoolRealtimePolicy.is_enabled.label("realtime_enabled"),
+                    StockPoolRealtimePolicy.priority.label("realtime_priority"),
+                    StockPoolRealtimePolicy.quote_lane,
+                    StockPoolRealtimePolicy.minute_lane,
+                )
                 .join(StockPoolMember, StockPoolMember.pool_id == StockPool.id)
+                .outerjoin(StockPoolRealtimePolicy, StockPoolRealtimePolicy.pool_id == StockPool.id)
                 .where(StockPoolMember.stock_code == stock_code, StockPool.is_enabled.is_(True))
                 .order_by(StockPool.sort_order, StockPool.pool_code)
             )
@@ -303,6 +352,7 @@ class StockPoolRepository:
         if scope in {None, "system", "strategy", "user"}:
             for row in await self.list_pools():
                 pool = row["pool"]
+                policy = row["policy"]
                 category = "system" if pool.is_system else ("strategy" if pool.pool_type == "strategy" else "user")
                 if scope not in {None, category}:
                     continue
@@ -315,6 +365,7 @@ class StockPoolRepository:
                         "source": "stock_pool",
                         "updated_at": pool.updated_at,
                         "is_enabled": pool.is_enabled,
+                        "realtime_policy": self.realtime_policy_dict(policy),
                     }
                 )
         if scope in {None, "topic"}:
@@ -368,6 +419,16 @@ class StockPoolRepository:
                 for logical_group_key, name, level, count, updated_at in rows.all()
             )
         return items
+
+    @staticmethod
+    def realtime_policy_dict(policy: StockPoolRealtimePolicy | None) -> dict:
+        return {
+            "is_enabled": bool(policy.is_enabled) if policy is not None else False,
+            "priority": int(policy.priority) if policy is not None else 1000,
+            "quote_lane": str(policy.quote_lane) if policy is not None else "off",
+            "minute_lane": str(policy.minute_lane) if policy is not None else "off",
+            "updated_at": policy.updated_at if policy is not None else None,
+        }
 
     async def commit(self) -> None:
         await self.session.commit()

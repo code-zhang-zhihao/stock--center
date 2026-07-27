@@ -193,3 +193,75 @@ def test_redis_set_json_writes_when_remote_client_is_available(monkeypatch) -> N
         assert remote.calls == [("data-assets:summary", '{"ok": true}', 30)]
 
     asyncio.run(run())
+
+
+def test_redis_incremental_hash_cache_merges_only_changed_minute_fields(monkeypatch) -> None:
+    async def run() -> None:
+        client = RedisClient()
+
+        async def memory_only_client():
+            return None
+
+        monkeypatch.setattr(client, "_get_client", memory_only_client)
+        assert await client.hset_many_hashes_json(
+            [
+                ("realtime:minute-bars:600001", {"09:30": {"price": 10.0}, "__meta__": {"bar_count": 1}}, 30),
+                ("realtime:minute-bars:600002", {"09:30": {"price": 20.0}}, 30),
+            ]
+        ) is True
+        assert await client.hset_many_json(
+            "realtime:minute-bars:600001",
+            {"09:31": {"price": 10.1}, "__meta__": {"bar_count": 2}},
+            ttl_seconds=30,
+        ) is True
+
+        first = await client.hgetall_json("realtime:minute-bars:600001")
+        second = await client.hgetall_json("realtime:minute-bars:600002")
+        assert first == {
+            "09:30": {"price": 10.0},
+            "09:31": {"price": 10.1},
+            "__meta__": {"bar_count": 2},
+        }
+        assert second == {"09:30": {"price": 20.0}}
+
+    asyncio.run(run())
+
+
+def test_redis_incremental_hash_write_uses_remote_pipeline(monkeypatch) -> None:
+    class Pipeline:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def hset(self, key, *, mapping):
+            self.calls.append(("hset", key, mapping))
+
+        def expire(self, key, ttl):
+            self.calls.append(("expire", key, ttl))
+
+        async def execute(self):
+            self.calls.append(("execute",))
+
+    class RemoteClient:
+        def __init__(self) -> None:
+            self.pipeline_instance = Pipeline()
+
+        def pipeline(self, *, transaction):
+            assert transaction is True
+            return self.pipeline_instance
+
+    async def run() -> None:
+        client = RedisClient()
+        remote = RemoteClient()
+
+        async def get_client():
+            return remote
+
+        monkeypatch.setattr(client, "_get_client", get_client)
+        assert await client.hset_many_json("realtime:minute-bars:600001", {"09:30": {"price": 10.0}}, ttl_seconds=30) is True
+        assert remote.pipeline_instance.calls == [
+            ("hset", "realtime:minute-bars:600001", {"09:30": '{"price": 10.0}'}),
+            ("expire", "realtime:minute-bars:600001", 30),
+            ("execute",),
+        ]
+
+    asyncio.run(run())

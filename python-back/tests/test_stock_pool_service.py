@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolUpdate
+from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolRealtimePolicyUpdate, StockPoolUpdate
 from app.modules.stock_pool.service import StockPoolError, StockPoolService
 
 
@@ -29,19 +29,47 @@ class FakeRepository:
         }
         self.stock_codes = {"000001", "600519"}
         self.member_codes = {"000001"}
+        self.realtime_policies = {
+            1: SimpleNamespace(
+                is_enabled=True,
+                priority=20,
+                quote_lane="hot",
+                minute_lane="rotating",
+                updated_at=now,
+            ),
+        }
         self.candidates = [
             {"stock_code": "000001", "stock_name": "平安银行", "is_member": True},
             {"stock_code": "600519", "stock_name": "贵州茅台", "is_member": False},
         ]
         self.committed = 0
 
-    async def list_pools(self): return [{"pool": pool, "member_count": 0} for pool in self.pools.values()]
+    async def list_pools(self): return [{"pool": pool, "policy": self.realtime_policies.get(pool.id), "member_count": 0} for pool in self.pools.values()]
     async def get_pool(self, pool_code): return self.pools.get(pool_code)
     async def create_pool(self, values):
         now = datetime.now(timezone.utc)
         pool = SimpleNamespace(id=2, created_at=now, updated_at=now, **values)
         self.pools[pool.pool_code] = pool
         return pool
+    async def create_realtime_policy(self, pool_id, values=None):
+        policy = self.realtime_policies.get(pool_id)
+        if policy is None:
+            policy = SimpleNamespace(**{
+                "is_enabled": False,
+                "priority": 1000,
+                "quote_lane": "off",
+                "minute_lane": "off",
+                "updated_at": datetime.now(timezone.utc),
+                **(values or {}),
+            })
+            self.realtime_policies[pool_id] = policy
+        return policy
+    async def get_realtime_policy(self, pool_id): return self.realtime_policies.get(pool_id)
+    async def update_realtime_policy(self, pool_id, values):
+        policy = await self.create_realtime_policy(pool_id)
+        for key, value in values.items(): setattr(policy, key, value)
+        policy.updated_at = datetime.now(timezone.utc)
+        return policy
     async def update_pool(self, pool_code, values):
         pool = self.pools[pool_code]
         for key, value in values.items(): setattr(pool, key, value)
@@ -69,6 +97,38 @@ def test_custom_pool_is_created_with_custom_type() -> None:
         assert pool["pool_type"] == "custom"
         assert pool["is_system"] is False
         assert repository.committed == 1
+
+    asyncio.run(run())
+
+
+def test_create_and_edit_can_save_realtime_policy_with_pool_settings() -> None:
+    async def run() -> None:
+        repository = FakeRepository()
+        service = StockPoolService(repository)
+        policy = StockPoolRealtimePolicyUpdate(
+            is_enabled=True,
+            priority=20,
+            quote_lane="hot",
+            minute_lane="rotating",
+        )
+        created = await service.create_pool(
+            StockPoolCreate(pool_code="my_watchlist", pool_name="我的观察池", realtime_policy=policy)
+        )
+        assert created["realtime_policy"]["is_enabled"] is True
+        assert created["realtime_policy"]["quote_lane"] == "hot"
+
+        updated = await service.update_pool(
+            "candidate",
+            StockPoolUpdate(is_enabled=False, realtime_policy=StockPoolRealtimePolicyUpdate(
+                is_enabled=True,
+                priority=10,
+                quote_lane="hot",
+                minute_lane="guaranteed",
+            )),
+        )
+        assert updated["is_enabled"] is False
+        assert updated["realtime_policy"]["priority"] == 10
+        assert updated["realtime_policy"]["minute_lane"] == "guaranteed"
 
     asyncio.run(run())
 

@@ -10,8 +10,17 @@ export interface StockPool {
   dynamic_rule: string | null;
   sort_order: number;
   member_count: number;
+  realtime_policy: StockPoolRealtimePolicy;
   created_at: string;
   updated_at: string;
+}
+
+export interface StockPoolRealtimePolicy {
+  is_enabled: boolean;
+  priority: number;
+  quote_lane: 'hot' | 'warm' | 'off';
+  minute_lane: 'guaranteed' | 'rotating' | 'off';
+  updated_at: string | null;
 }
 
 export interface StockPoolMember {
@@ -72,7 +81,16 @@ export interface StockProfile {
   concepts: StockPoolSector[];
   tushare_industries: StockPoolSector[];
   sw_industries: Array<{ universe_id: string; universe_name: string; taxonomy_level: 'sw1' | 'sw2' | 'sw3' | string; logical_group_key: string | null }>;
-  stock_pools: Array<{ pool_code: string; pool_name: string; pool_type: string; is_system: boolean }>;
+  stock_pools: Array<{
+    pool_code: string;
+    pool_name: string;
+    pool_type: string;
+    is_system: boolean;
+    realtime_enabled: boolean | null;
+    realtime_priority: number | null;
+    quote_lane: 'hot' | 'warm' | 'off' | null;
+    minute_lane: 'guaranteed' | 'rotating' | 'off' | null;
+  }>;
 }
 
 export interface StockPoolCatalogItem {
@@ -83,6 +101,7 @@ export interface StockPoolCatalogItem {
   source: string;
   updated_at: string | null;
   is_enabled: boolean;
+  realtime_policy?: StockPoolRealtimePolicy;
   realtime?: {
     change_pct?: number | null;
     average_change_pct?: number | null;

@@ -6,6 +6,7 @@ import type {
   StockPoolMemberBatchResult,
   StockPoolMemberDetail,
   StockPoolMemberPage,
+  StockPoolRealtimePolicy,
   StockProfile,
 } from '@/types/stock-pool';
 
@@ -14,9 +15,19 @@ export const stockPoolApi = {
   catalog: (scope?: 'system' | 'strategy' | 'user' | 'topic' | 'industry') => requestData<StockPoolCatalogItem[]>({
     method: 'GET', url: '/stock-pools/catalog', params: { scope },
   }),
-  create: (payload: { pool_code: string; pool_name: string; description?: string | null }) =>
+  create: (payload: {
+    pool_code: string;
+    pool_name: string;
+    description?: string | null;
+    realtime_policy?: Omit<StockPoolRealtimePolicy, 'updated_at'>;
+  }) =>
     requestData<StockPool>({ method: 'POST', url: '/stock-pools', data: payload }),
-  update: (poolCode: string, payload: { pool_name?: string; description?: string | null; is_enabled?: boolean }) =>
+  update: (poolCode: string, payload: {
+    pool_name?: string;
+    description?: string | null;
+    is_enabled?: boolean;
+    realtime_policy?: Omit<StockPoolRealtimePolicy, 'updated_at'>;
+  }) =>
     requestData<StockPool>({ method: 'PATCH', url: `/stock-pools/${encodeURIComponent(poolCode)}`, data: payload }),
   remove: (poolCode: string) => requestData<StockPool>({ method: 'DELETE', url: `/stock-pools/${encodeURIComponent(poolCode)}` }),
   members: (poolCode: string, params: { keyword?: string; page: number; pageSize: number }) =>

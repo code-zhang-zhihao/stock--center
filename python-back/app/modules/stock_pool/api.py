@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.response import ApiResponse
 from app.db.session import get_session
 from app.modules.stock_pool.repository import StockPoolRepository
-from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolUpdate
+from app.modules.stock_pool.schemas import StockPoolCreate, StockPoolMemberBatchCreate, StockPoolRealtimePolicyUpdate, StockPoolUpdate
 from app.modules.stock_pool.service import StockPoolError, StockPoolService
 from app.modules.realtime_market.service import realtime_market_service
 
@@ -47,17 +47,46 @@ async def stock_pool_catalog(
 
 @router.post("")
 async def create_stock_pool(payload: StockPoolCreate, session: AsyncSession = Depends(get_session)):
-    return await _run(lambda: service(session).create_pool(payload))
+    async def run():
+        result = await service(session).create_pool(payload)
+        realtime_market_service.invalidate_reference()
+        return result
+
+    return await _run(run)
 
 
 @router.patch("/{pool_code}")
 async def update_stock_pool(pool_code: str, payload: StockPoolUpdate, session: AsyncSession = Depends(get_session)):
-    return await _run(lambda: service(session).update_pool(pool_code, payload))
+    async def run():
+        result = await service(session).update_pool(pool_code, payload)
+        realtime_market_service.invalidate_reference()
+        return result
+
+    return await _run(run)
+
+
+@router.put("/{pool_code}/realtime-policy")
+async def update_stock_pool_realtime_policy(
+    pool_code: str,
+    payload: StockPoolRealtimePolicyUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    async def run():
+        result = await service(session).update_realtime_policy(pool_code, payload)
+        realtime_market_service.invalidate_reference()
+        return result
+
+    return await _run(run)
 
 
 @router.delete("/{pool_code}")
 async def delete_stock_pool(pool_code: str, session: AsyncSession = Depends(get_session)):
-    return await _run(lambda: service(session).delete_pool(pool_code))
+    async def run():
+        result = await service(session).delete_pool(pool_code)
+        realtime_market_service.invalidate_reference()
+        return result
+
+    return await _run(run)
 
 
 @router.get("/{pool_code}/members")
@@ -87,13 +116,19 @@ async def add_stock_pool_members(
     payload: StockPoolMemberBatchCreate,
     session: AsyncSession = Depends(get_session),
 ):
-    return await _run(lambda: service(session).add_members(pool_code=pool_code, payload=payload))
+    async def run():
+        result = await service(session).add_members(pool_code=pool_code, payload=payload)
+        realtime_market_service.invalidate_reference()
+        return result
+
+    return await _run(run)
 
 
 @router.delete("/{pool_code}/members/{stock_code}")
 async def delete_stock_pool_member(pool_code: str, stock_code: str, session: AsyncSession = Depends(get_session)):
     async def run():
         await service(session).delete_member(pool_code=pool_code, stock_code=stock_code)
+        realtime_market_service.invalidate_reference()
         return {"pool_code": pool_code, "stock_code": stock_code, "deleted": True}
 
     return await _run(run)

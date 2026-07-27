@@ -44,12 +44,15 @@
         <div><span>Quote 缓存</span><strong>{{ formatNumber(realtimeHealth?.quote_cache_count) }}</strong></div>
         <div><span>Quote 过期</span><strong>{{ formatNumber(realtimeHealth?.quote_stale_count) }}</strong></div>
         <div><span>分钟登记 / 保障</span><strong>{{ formatNumber(realtimeHealth?.minute_registered_count) }} / {{ formatNumber(realtimeHealth?.minute_guaranteed_count) }}</strong></div>
+        <div><span>分钟保障溢出 / 未登记</span><strong>{{ formatNumber(realtimeHealth?.minute_guaranteed_overflow_count) }} / {{ formatNumber(realtimeHealth?.minute_unregistered_count) }}</strong></div>
         <div><span>最新 Quote 轮次</span><strong>{{ formatDateTime(realtimeHealth?.last_quote_round.finished_at) }}</strong></div>
         <div><span>Quote 覆盖</span><strong>{{ formatNumber(realtimeHealth?.last_quote_round.received_count) }} / {{ formatNumber(realtimeHealth?.last_quote_round.expected_count) }}</strong></div>
         <div><span>分钟更新 / 空分时</span><strong>{{ formatNumber(realtimeHealth?.last_minute_round.updated_count) }} / {{ formatNumber(realtimeHealth?.last_minute_round.no_intraday_data_count) }}</strong></div>
         <div><span>全市场覆盖 / 耗时</span><strong>{{ formatNumber(realtimeHealth?.market.received_count) }} / {{ formatNumber(realtimeHealth?.market.expected_count) }} · {{ formatNumber(realtimeHealth?.market.duration_ms) }}ms</strong></div>
         <div><span>决策池 / 温观察</span><strong>{{ formatNumber(realtimeHealth?.decision_target_count) }} / {{ formatNumber(realtimeHealth?.warm_target_count) }}</strong></div>
         <div><span>五档覆盖 / 缓存</span><strong>{{ formatNumber(realtimeHealth?.depth.received_count) }} / {{ formatNumber(realtimeHealth?.depth_cache_count) }}</strong></div>
+        <div><span>市场 / 决策缓存年龄</span><strong>{{ formatSeconds(realtimeHealth?.market.cache_freshness_seconds) }} / {{ formatSeconds(realtimeHealth?.decision_quote.cache_freshness_seconds) }}</strong></div>
+        <div><span>五档 / 分钟缓存年龄</span><strong>{{ formatSeconds(realtimeHealth?.depth.cache_freshness_seconds) }} / {{ formatSeconds(realtimeHealth?.minute.cache_freshness_seconds) }}</strong></div>
         <div><span>外部拉取租约</span><strong>{{ realtimeHealth?.leader_active ? '本实例持有' : '共享缓存读取' }}</strong></div>
       </div>
       <div v-if="Object.keys(realtimeHealth?.rate_budgets || {}).length" class="rate-budget-grid">
@@ -60,6 +63,28 @@
         </div>
       </div>
       <n-alert v-if="realtimeHealth?.error" class="realtime-error" type="warning">{{ realtimeHealth.error }}</n-alert>
+    </section>
+
+    <section class="market-overview-panel">
+      <div class="panel-heading">
+        <span>实时市场总览</span>
+        <span class="muted">{{ formatDateTime(marketOverview?.as_of) }} · {{ marketOverview?.round_id || '尚未形成有效轮次' }}</span>
+      </div>
+      <div class="market-overview-grid">
+        <div><span>全市场覆盖</span><strong>{{ formatNumber(marketOverview?.items.quote_count) }} / {{ formatNumber(marketOverview?.items.expected_quote_count) }} · {{ formatPercent(marketOverview?.items.coverage_pct) }}</strong></div>
+        <div><span>上涨 / 下跌 / 平盘</span><strong>{{ formatNumber(marketOverview?.items.up_count) }} / {{ formatNumber(marketOverview?.items.down_count) }} / {{ formatNumber(marketOverview?.items.flat_count) }}</strong></div>
+        <div><span>平均 / 中位涨跌</span><strong>{{ formatPercent(marketOverview?.items.average_change_pct) }} / {{ formatPercent(marketOverview?.items.median_change_pct) }}</strong></div>
+        <div><span>累计成交额</span><strong>{{ formatAmount(marketOverview?.items.total_amount_yuan) }}</strong></div>
+        <div><span>涨停 / 跌停</span><strong>{{ marketOverview?.items.limit_events?.available ? `${formatNumber(marketOverview.items.limit_events.limit_up_count)} / ${formatNumber(marketOverview.items.limit_events.limit_down_count)}` : '数据源未验证' }}</strong></div>
+        <div><span>≥5% / ≤-5%</span><strong>{{ formatNumber(marketOverview?.items.change_distribution?.up_5_pct) }} / {{ formatNumber(marketOverview?.items.change_distribution?.down_5_pct) }}</strong></div>
+      </div>
+      <div v-if="marketOverview?.items.core_indexes?.length" class="core-index-grid">
+        <div v-for="item in marketOverview.items.core_indexes" :key="item.index_code">
+          <span>{{ item.index_name }}</span>
+          <strong :class="changeClass(item.quote?.change_pct)">{{ item.available ? formatPercent(item.quote?.change_pct) : '未返回' }}</strong>
+          <small>{{ item.available ? formatNumber(item.quote?.last_price) : item.source_symbol }}</small>
+        </div>
+      </div>
     </section>
 
     <section class="health-panel">
@@ -163,6 +188,7 @@ import { computed, h, onMounted, onUnmounted, ref } from 'vue';
 import { NAlert, NButton, NDataTable, NInput, NModal, NSpin, NTabPane, NTabs, NTag, useMessage, type DataTableColumns } from 'naive-ui';
 import { RefreshCw } from 'lucide-vue-next';
 import { dataAssetsApi } from '@/api/data-assets';
+import { realtimeMarketApi } from '@/api/realtime-market';
 import type {
   DataAssetCacheStatusReport,
   DataAssetDailyHealthCell,
@@ -175,6 +201,7 @@ import type {
   RealtimeHealth,
   SchedulerRunBrief,
 } from '@/types/data-assets';
+import type { RealtimeMarketOverview } from '@/types/realtime-market';
 
 const loading = ref(false);
 const refreshing = ref(false);
@@ -182,6 +209,7 @@ const summary = ref<DataAssetSummary | null>(null);
 const dailyHealth = ref<DataAssetDailyHealthReport | null>(null);
 const cacheStatus = ref<DataAssetCacheStatusReport | null>(null);
 const realtimeHealth = ref<RealtimeHealth | null>(null);
+const marketOverview = ref<RealtimeMarketOverview | null>(null);
 const errorMessage = ref('');
 const errorType = ref<'error' | 'warning'>('error');
 const keyword = ref('');
@@ -198,7 +226,7 @@ const realtimeLabel = computed(() => {
 });
 
 function rateBudgetLabel(key: string) {
-  return ({ quote_universe: '全市场 Quote', quote_symbols: '候选 Quote', depth_batch: '五档深度' } as Record<string, string>)[key] || key;
+  return ({ quote_universe: '全市场 Quote', quote_symbols: '候选/指数 Quote', depth_batch: '五档深度', on_demand_quote: '页面按需预留' } as Record<string, string>)[key] || key;
 }
 
 const categoryOptions = [
@@ -344,6 +372,26 @@ function formatNumber(value: number | null | undefined) {
   return value == null ? '-' : value.toLocaleString('zh-CN');
 }
 
+function formatSeconds(value: number | null | undefined) {
+  return value == null ? '-' : `${value}s`;
+}
+
+function formatPercent(value: number | null | undefined) {
+  return value == null ? '-' : `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+}
+
+function formatAmount(value: number | null | undefined) {
+  if (value == null) return '-';
+  if (Math.abs(value) >= 100_000_000) return `${(value / 100_000_000).toFixed(2)} 亿`;
+  if (Math.abs(value) >= 10_000) return `${(value / 10_000).toFixed(2)} 万`;
+  return formatNumber(value);
+}
+
+function changeClass(value: number | null | undefined) {
+  if (value == null || value === 0) return '';
+  return value > 0 ? 'change-up' : 'change-down';
+}
+
 function formatDate(value: string | null | undefined) {
   return value ? value.slice(0, 10) : '-';
 }
@@ -395,12 +443,14 @@ async function loadSummary() {
       dataAssetsApi.dailyHealth({ days: 3 }),
       dataAssetsApi.cacheStatus(),
       dataAssetsApi.realtimeHealth(),
+      realtimeMarketApi.marketOverview(),
     ]);
-    const [summaryResult, dailyHealthResult, cacheStatusResult, realtimeHealthResult] = results;
+    const [summaryResult, dailyHealthResult, cacheStatusResult, realtimeHealthResult, marketOverviewResult] = results;
     if (summaryResult.status === 'fulfilled') summary.value = summaryResult.value;
     if (dailyHealthResult.status === 'fulfilled') dailyHealth.value = dailyHealthResult.value;
     if (cacheStatusResult.status === 'fulfilled') cacheStatus.value = cacheStatusResult.value;
     if (realtimeHealthResult.status === 'fulfilled') realtimeHealth.value = realtimeHealthResult.value;
+    if (marketOverviewResult.status === 'fulfilled') marketOverview.value = marketOverviewResult.value;
 
     const rejected = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (rejected.length) {
@@ -467,7 +517,7 @@ onUnmounted(() => {
 .cache-item { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: #667085; font-size: 12px; }
 .cache-item > span { color: #344054; font-weight: 700; }
 .cache-error { color: #b42318; max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.asset-panel, .runs-panel, .health-panel, .realtime-panel { border: 1px solid #d8e0e5; background: #fff; padding: 14px; margin-top: 14px; }
+.asset-panel, .runs-panel, .health-panel, .realtime-panel, .market-overview-panel { border: 1px solid #d8e0e5; background: #fff; padding: 14px; margin-top: 14px; }
 .realtime-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 10px; }
 .realtime-grid div { min-width: 0; border: 1px solid #e4e9ee; background: #f8fafb; padding: 9px; display: grid; gap: 4px; }
 .realtime-grid span { color: #667085; font-size: 12px; }
@@ -477,6 +527,14 @@ onUnmounted(() => {
 .rate-budget-grid strong { color: #344054; font-size: 13px; }
 .rate-budget-grid span, .rate-budget-grid small { color: #667085; font-size: 12px; }
 .realtime-error { margin-top: 10px; }
+.market-overview-grid, .core-index-grid { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; margin-top: 10px; }
+.market-overview-grid div, .core-index-grid div { min-width: 0; display: grid; gap: 4px; padding: 9px; border: 1px solid #e4e9ee; background: #f8fafb; }
+.market-overview-grid span, .core-index-grid span { color: #667085; font-size: 12px; }
+.market-overview-grid strong, .core-index-grid strong { color: #1f2933; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.core-index-grid { grid-template-columns: repeat(4, minmax(140px, 1fr)); }
+.core-index-grid small { color: #98a2b3; }
+.change-up { color: #d92d20 !important; }
+.change-down { color: #027a48 !important; }
 .panel-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
 .panel-toolbar :deep(.n-input) { width: 260px; }
 .panel-heading { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; font-weight: 700; color: #344054; }
@@ -509,6 +567,7 @@ onUnmounted(() => {
   .data-center-page { padding: 14px; }
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .realtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .market-overview-grid, .core-index-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rate-budget-grid { grid-template-columns: 1fr; }
   .panel-toolbar { align-items: stretch; flex-direction: column; }
   .panel-toolbar :deep(.n-input) { width: 100%; }

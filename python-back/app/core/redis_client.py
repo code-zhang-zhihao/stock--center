@@ -41,6 +41,7 @@ class RedisClient:
         self._runtime_config: RedisRuntimeConfig | None = None
         self._runtime_config_expires_at = 0.0
         self._memory_cache: dict[str, tuple[float, dict | list]] = {}
+        self._memory_hash_cache: dict[str, tuple[float, dict[str, dict | list]]] = {}
 
     async def runtime_config(self) -> RedisRuntimeConfig:
         now = time.time()
@@ -119,6 +120,78 @@ class RedisClient:
             for key, value, ttl_seconds in items:
                 self._memory_set(key, value, ttl_seconds=ttl_seconds)
             return True
+
+    async def hset_many_json(self, key: str, fields: dict[str, dict | list], *, ttl_seconds: int) -> bool:
+        """Merge JSON values into a Redis hash and renew its short-lived TTL.
+
+        Realtime minute bars use one field per minute.  This avoids replacing a
+        complete intraday series every time a new bar arrives.
+        """
+        if not fields:
+            return True
+        client = await self._get_client()
+        if client is None:
+            self._memory_hash_set(key, fields, ttl_seconds=ttl_seconds)
+            return True
+        try:
+            pipeline = client.pipeline(transaction=True)
+            pipeline.hset(key, mapping={field: json.dumps(value, ensure_ascii=False) for field, value in fields.items()})
+            pipeline.expire(key, max(1, ttl_seconds))
+            await pipeline.execute()
+            return True
+        except Exception as exc:
+            logger.warning("redis hset_many_json failed: key=%s fields=%s error=%s", key, len(fields), exc)
+            self._memory_hash_set(key, fields, ttl_seconds=ttl_seconds)
+            return True
+
+    async def hset_many_hashes_json(self, items: list[tuple[str, dict[str, dict | list], int]]) -> bool:
+        """Write incremental JSON fields for several hashes in one pipeline.
+
+        A minute refresh normally changes only the final one or two bars of
+        many stocks.  Grouping those per-stock hash updates keeps the Redis
+        part of the producer/consumer pipeline from becoming one RTT per
+        stock.
+        """
+        filtered = [(key, fields, ttl) for key, fields, ttl in items if fields]
+        if not filtered:
+            return True
+        client = await self._get_client()
+        if client is None:
+            for key, fields, ttl_seconds in filtered:
+                self._memory_hash_set(key, fields, ttl_seconds=ttl_seconds)
+            return True
+        try:
+            pipeline = client.pipeline(transaction=True)
+            for key, fields, ttl_seconds in filtered:
+                pipeline.hset(key, mapping={field: json.dumps(value, ensure_ascii=False) for field, value in fields.items()})
+                pipeline.expire(key, max(1, ttl_seconds))
+            await pipeline.execute()
+            return True
+        except Exception as exc:
+            logger.warning("redis hset_many_hashes_json failed: count=%s error=%s", len(filtered), exc)
+            for key, fields, ttl_seconds in filtered:
+                self._memory_hash_set(key, fields, ttl_seconds=ttl_seconds)
+            return True
+
+    async def hgetall_json(self, key: str) -> dict[str, dict | list] | None:
+        client = await self._get_client()
+        if client is None:
+            return self._memory_hash_get(key)
+        try:
+            raw = await client.hgetall(key)
+            if not raw:
+                return None
+            result: dict[str, dict | list] = {}
+            for field, value in raw.items():
+                field_text = field.decode("utf-8") if isinstance(field, bytes) else str(field)
+                value_text = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+                parsed = json.loads(value_text)
+                if isinstance(parsed, (dict, list)):
+                    result[field_text] = parsed
+            return result or None
+        except Exception as exc:
+            logger.warning("redis hgetall_json failed: key=%s error=%s", key, exc)
+            return self._memory_hash_get(key)
 
     async def acquire_lease(self, key: str, owner: str, *, ttl_seconds: int) -> bool:
         """Acquire or renew a short exclusive lease without exposing Redis details."""
@@ -343,6 +416,21 @@ class RedisClient:
             self._memory_cache.pop(key, None)
             return -2
         return ttl
+
+    def _memory_hash_set(self, key: str, fields: dict[str, dict | list], *, ttl_seconds: int) -> None:
+        current = self._memory_hash_get(key) or {}
+        current.update(fields)
+        self._memory_hash_cache[key] = (time.time() + max(1, ttl_seconds), current)
+
+    def _memory_hash_get(self, key: str) -> dict[str, dict | list] | None:
+        item = self._memory_hash_cache.get(key)
+        if item is None:
+            return None
+        expires_at, value = item
+        if expires_at <= time.time():
+            self._memory_hash_cache.pop(key, None)
+            return None
+        return dict(value)
 
 
 redis_client = RedisClient()

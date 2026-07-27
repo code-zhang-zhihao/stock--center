@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock, TradeCalendar
-from app.modules.stock_pool.models import StockPool, StockPoolMember
+from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
 
 
 class RealtimeMarketRepository:
@@ -122,11 +122,12 @@ class RealtimeMarketRepository:
     async def pool_reference(self, active_stock_codes: list[str]) -> dict[str, dict]:
         pools = (
             await self.session.execute(
-                select(StockPool)
+                select(StockPool, StockPoolRealtimePolicy)
+                .outerjoin(StockPoolRealtimePolicy, StockPoolRealtimePolicy.pool_id == StockPool.id)
                 .where(StockPool.is_enabled.is_(True))
                 .order_by(StockPool.sort_order, StockPool.pool_code)
             )
-        ).scalars().all()
+        ).all()
         members = (
             await self.session.execute(
                 select(StockPool.pool_code, StockPoolMember.stock_code)
@@ -138,7 +139,7 @@ class RealtimeMarketRepository:
             member_map.setdefault(pool_code, []).append(stock_code)
         active_set = set(active_stock_codes)
         result: dict[str, dict] = {}
-        for pool in pools:
+        for pool, policy in pools:
             if pool.is_dynamic and pool.dynamic_rule == "active_a_share":
                 codes = active_stock_codes
             else:
@@ -149,5 +150,11 @@ class RealtimeMarketRepository:
                 "pool_type": pool.pool_type,
                 "is_dynamic": pool.is_dynamic,
                 "stock_codes": codes,
+                "realtime_policy": {
+                    "is_enabled": bool(policy.is_enabled) if policy is not None else False,
+                    "priority": int(policy.priority) if policy is not None else 1000,
+                    "quote_lane": str(policy.quote_lane) if policy is not None else "off",
+                    "minute_lane": str(policy.minute_lane) if policy is not None else "off",
+                },
             }
         return result

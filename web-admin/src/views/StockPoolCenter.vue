@@ -59,7 +59,7 @@
                 <n-tag size="small" :bordered="false" :type="selectedPool.is_enabled ? 'success' : 'warning'">
                   {{ selectedPool.is_enabled ? '启用' : '停用' }}
                 </n-tag>
-                <n-tag v-if="selectedPool.is_system" size="small" :bordered="false">系统池</n-tag>
+                <n-tag v-if="selectedPool.is_system" size="small" :bordered="false">系统预置</n-tag>
                 <n-tag v-if="selectedPool.is_dynamic" size="small" :bordered="false" type="info">动态范围</n-tag>
               </div>
               <span class="mono muted">{{ selectedPool.pool_code }}</span>
@@ -67,15 +67,25 @@
               <p v-else-if="selectedPool.is_dynamic">成员随 <span class="mono">t_stock.status=active</span> 自动变化，不保存实体成员关系。</p>
             </div>
             <div class="pool-detail-actions">
-              <n-switch :value="selectedPool.is_enabled" :loading="savingPool" @update:value="togglePoolEnabled" />
-              <n-button v-if="!selectedPool.is_system" secondary @click="openEditPool">
+              <n-button secondary @click="openEditPool">
                 <template #icon><Pencil :size="16" /></template>
+                {{ selectedPool.is_system ? '配置' : '编辑' }}
               </n-button>
               <n-button v-if="!selectedPool.is_system" secondary type="error" @click="confirmDeletePool">
                 <template #icon><Trash2 :size="16" /></template>
               </n-button>
             </div>
           </div>
+
+          <section class="realtime-policy-panel">
+            <div>
+              <strong>实时监控</strong>
+              <p>{{ realtimePolicySummary }}</p>
+            </div>
+            <n-tag :type="selectedPool.is_enabled && selectedPool.realtime_policy.is_enabled ? 'success' : 'default'" :bordered="false">
+              {{ selectedPool.is_enabled && selectedPool.realtime_policy.is_enabled ? '已接入' : '未接入' }}
+            </n-tag>
+          </section>
 
           <div class="members-toolbar">
             <n-input v-model:value="memberKeyword" clearable size="small" placeholder="搜索股票代码 / 名称" @keyup.enter="searchMembers" />
@@ -131,12 +141,46 @@
         <n-form-item label="池编码">
           <n-input v-model:value="poolForm.pool_code" class="mono" :disabled="Boolean(editingPool)" placeholder="例如: my_watchlist" />
         </n-form-item>
-        <n-form-item label="池名称">
+        <n-form-item v-if="!editingPool?.is_system" label="池名称">
           <n-input v-model:value="poolForm.pool_name" placeholder="例如: 新能源观察池" />
         </n-form-item>
-        <n-form-item label="说明">
+        <n-form-item v-if="!editingPool?.is_system" label="说明">
           <n-input v-model:value="poolForm.description" type="textarea" :autosize="{ minRows: 3, maxRows: 6 }" />
         </n-form-item>
+        <n-form-item v-if="editingPool?.is_system" label="系统预置池">
+          <div class="system-pool-note">名称和编码由系统维护；你仍可配置启停和实时监控方式。</div>
+        </n-form-item>
+        <n-divider title-placement="left">运行设置</n-divider>
+        <n-form-item label="股票池状态">
+          <n-switch v-model:value="poolForm.is_enabled">
+            <template #checked>启用</template>
+            <template #unchecked>停用</template>
+          </n-switch>
+        </n-form-item>
+        <n-form-item label="参与实时监控">
+          <div class="form-control-with-help">
+            <n-switch
+              v-model:value="poolForm.realtime_policy.is_enabled"
+              :disabled="isEditingDynamicUniverse"
+              @update:value="applyRealtimeDefaults"
+            >
+              <template #checked>开启</template>
+              <template #unchecked>关闭</template>
+            </n-switch>
+            <span>{{ isEditingDynamicUniverse ? '全市场范围只用于市场总览，不能作为实时监控目标。' : '开启后，池内股票将参与实时行情和分钟线刷新。' }}</span>
+          </div>
+        </n-form-item>
+        <template v-if="poolForm.realtime_policy.is_enabled && !isEditingDynamicUniverse">
+          <n-form-item label="监控优先级">
+            <n-select v-model:value="poolForm.realtime_policy.priority" :options="realtimePriorityOptions" />
+          </n-form-item>
+          <n-form-item label="实时行情刷新">
+            <n-select v-model:value="poolForm.realtime_policy.quote_lane" :options="quoteLaneOptions" />
+          </n-form-item>
+          <n-form-item label="分钟线刷新">
+            <n-select v-model:value="poolForm.realtime_policy.minute_lane" :options="minuteLaneOptions" />
+          </n-form-item>
+        </template>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -262,6 +306,7 @@ import { ExternalLink, Pencil, Plus, RefreshCw, Search, Trash2 } from 'lucide-vu
 import {
   NButton,
   NDataTable,
+  NDivider,
   NEmpty,
   NForm,
   NFormItem,
@@ -278,7 +323,7 @@ import {
   type DataTableColumns,
 } from 'naive-ui';
 import { stockPoolApi } from '@/api/stock-pool';
-import type { StockPool, StockPoolCandidate, StockPoolCatalogItem, StockPoolMember, StockPoolMemberDetail, StockPoolMemberPage } from '@/types/stock-pool';
+import type { StockPool, StockPoolCandidate, StockPoolCatalogItem, StockPoolMember, StockPoolMemberDetail, StockPoolMemberPage, StockPoolRealtimePolicy } from '@/types/stock-pool';
 import { formatTime } from '@/utils/json';
 
 const router = useRouter();
@@ -300,7 +345,28 @@ const poolModalOpen = ref(false);
 const batchModalOpen = ref(false);
 const detailModalOpen = ref(false);
 const editingPool = ref<StockPool | null>(null);
-const poolForm = ref({ pool_code: '', pool_name: '', description: '' });
+type RealtimePolicyForm = Omit<StockPoolRealtimePolicy, 'updated_at'>;
+type PoolForm = {
+  pool_code: string;
+  pool_name: string;
+  description: string;
+  is_enabled: boolean;
+  realtime_policy: RealtimePolicyForm;
+};
+const defaultRealtimePolicy = (): RealtimePolicyForm => ({
+  is_enabled: false,
+  priority: 20,
+  quote_lane: 'hot',
+  minute_lane: 'rotating',
+});
+const defaultPoolForm = (): PoolForm => ({
+  pool_code: '',
+  pool_name: '',
+  description: '',
+  is_enabled: true,
+  realtime_policy: defaultRealtimePolicy(),
+});
+const poolForm = ref<PoolForm>(defaultPoolForm());
 const candidateKeyword = ref('');
 const candidateResults = ref<StockPoolCandidate[]>([]);
 const selectedCandidates = ref<StockPoolCandidate[]>([]);
@@ -313,6 +379,17 @@ const tableMaxHeight = ref(440);
 let candidateSearchTimer: ReturnType<typeof setTimeout> | undefined;
 
 const selectedPool = computed(() => pools.value.find((pool) => pool.pool_code === selectedPoolCode.value) || null);
+const isDynamicUniverse = computed(() => selectedPool.value?.is_dynamic && selectedPool.value.dynamic_rule === 'active_a_share');
+const isEditingDynamicUniverse = computed(() => editingPool.value?.is_dynamic && editingPool.value.dynamic_rule === 'active_a_share');
+const realtimePolicySummary = computed(() => {
+  const pool = selectedPool.value;
+  if (!pool) return '';
+  if (!pool.is_enabled) return '股票池已停用，不参与实时资源分配。';
+  if (isDynamicUniverse.value) return '全市场范围仅用于市场总览，不会占用候选行情或分钟线资源。';
+  const policy = pool.realtime_policy;
+  if (!policy.is_enabled) return '未接入实时监控；编辑股票池后可开启。';
+  return `${priorityLabel(policy.priority)}｜${quoteLaneLabel(policy.quote_lane)}｜${minuteLaneLabel(policy.minute_lane)}`;
+});
 const filteredPools = computed(() => {
   const keyword = poolKeyword.value.trim().toLowerCase();
   if (!keyword) return pools.value;
@@ -347,6 +424,29 @@ const catalogScopeOptions = [
   { label: '题材', value: 'topic' },
   { label: '申万行业', value: 'industry' },
 ];
+const quoteLaneOptions = [
+  { label: '高频（每 10 秒刷新）', value: 'hot' },
+  { label: '低频（每 60 秒刷新）', value: 'warm' },
+  { label: '不拉取实时行情', value: 'off' },
+];
+const minuteLaneOptions = [
+  { label: '保障（每分钟优先刷新）', value: 'guaranteed' },
+  { label: '轮流刷新（覆盖更多股票）', value: 'rotating' },
+  { label: '不拉取分钟线', value: 'off' },
+];
+const standardRealtimePriorityOptions = [
+  { label: '最高（持仓）', value: 0 },
+  { label: '高（重点关注）', value: 10 },
+  { label: '常规（候选股票）', value: 20 },
+  { label: '策略（策略池）', value: 30 },
+  { label: '低（温观察）', value: 100 },
+];
+const realtimePriorityOptions = computed(() => {
+  const priority = poolForm.value.realtime_policy.priority;
+  return standardRealtimePriorityOptions.some((item) => item.value === priority)
+    ? standardRealtimePriorityOptions
+    : [...standardRealtimePriorityOptions, { label: `自定义（${priority}）`, value: priority }];
+});
 const catalogColumns = computed<DataTableColumns<StockPoolCatalogItem>>(() => [
   { title: '类别', key: 'catalog_type', width: 100, render: (row) => ({ system: '系统池', strategy: '策略池', user: '用户池', topic: '题材', industry: '行业' }[row.catalog_type] || row.catalog_type) },
   { title: '名称', key: 'item_name', minWidth: 180 },
@@ -397,6 +497,19 @@ function formatRealtimeChange(row: StockPoolCatalogItem) {
   return value == null ? '-' : `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
 }
 
+function priorityLabel(priority: number) {
+  return ({ 0: '最高优先级', 10: '高优先级', 20: '常规优先级', 30: '策略优先级', 100: '低优先级' } as Record<number, string>)[priority]
+    || `自定义优先级（${priority}）`;
+}
+
+function quoteLaneLabel(lane: RealtimePolicyForm['quote_lane']) {
+  return ({ hot: '行情每 10 秒刷新', warm: '行情每 60 秒刷新', off: '不拉取实时行情' } as Record<RealtimePolicyForm['quote_lane'], string>)[lane];
+}
+
+function minuteLaneLabel(lane: RealtimePolicyForm['minute_lane']) {
+  return ({ guaranteed: '分钟线每分钟保障', rotating: '分钟线轮流刷新', off: '不拉取分钟线' } as Record<RealtimePolicyForm['minute_lane'], string>)[lane];
+}
+
 async function loadMembers() {
   if (!selectedPoolCode.value) return;
   loadingMembers.value = true;
@@ -427,19 +540,35 @@ function searchMembers() {
 
 function openCreatePool() {
   editingPool.value = null;
-  poolForm.value = { pool_code: '', pool_name: '', description: '' };
+  poolForm.value = defaultPoolForm();
   poolModalOpen.value = true;
 }
 
 function openEditPool() {
-  if (!selectedPool.value || selectedPool.value.is_system) return;
+  if (!selectedPool.value) return;
   editingPool.value = selectedPool.value;
+  const policy = selectedPool.value.realtime_policy;
   poolForm.value = {
     pool_code: selectedPool.value.pool_code,
     pool_name: selectedPool.value.pool_name,
     description: selectedPool.value.description || '',
+    is_enabled: selectedPool.value.is_enabled,
+    realtime_policy: {
+      is_enabled: selectedPool.value.is_dynamic ? false : policy.is_enabled,
+      priority: policy.priority,
+      quote_lane: policy.quote_lane,
+      minute_lane: policy.minute_lane,
+    },
   };
   poolModalOpen.value = true;
+}
+
+function applyRealtimeDefaults(isEnabled: boolean) {
+  if (!isEnabled) return;
+  const policy = poolForm.value.realtime_policy;
+  if (policy.priority === 1000) policy.priority = 20;
+  if (policy.quote_lane === 'off') policy.quote_lane = 'hot';
+  if (policy.minute_lane === 'off') policy.minute_lane = 'rotating';
 }
 
 async function savePool() {
@@ -447,6 +576,8 @@ async function savePool() {
     pool_code: poolForm.value.pool_code.trim(),
     pool_name: poolForm.value.pool_name.trim(),
     description: poolForm.value.description.trim() || null,
+    is_enabled: poolForm.value.is_enabled,
+    realtime_policy: { ...poolForm.value.realtime_policy },
   };
   if (!payload.pool_code || !payload.pool_name) {
     message.warning('请填写池编码和池名称');
@@ -455,7 +586,14 @@ async function savePool() {
   savingPool.value = true;
   try {
     const saved = editingPool.value
-      ? await stockPoolApi.update(editingPool.value.pool_code, { pool_name: payload.pool_name, description: payload.description })
+      ? await stockPoolApi.update(editingPool.value.pool_code, editingPool.value.is_system
+        ? { is_enabled: payload.is_enabled, realtime_policy: payload.realtime_policy }
+        : {
+            pool_name: payload.pool_name,
+            description: payload.description,
+            is_enabled: payload.is_enabled,
+            realtime_policy: payload.realtime_policy,
+          })
       : await stockPoolApi.create(payload);
     selectedPoolCode.value = saved.pool_code;
     poolModalOpen.value = false;
@@ -463,19 +601,6 @@ async function savePool() {
     message.success(editingPool.value ? '股票池已更新' : '股票池已创建');
   } catch (error) {
     message.error(errorMessage(error, '保存股票池失败'));
-  } finally {
-    savingPool.value = false;
-  }
-}
-
-async function togglePoolEnabled(value: boolean) {
-  if (!selectedPool.value) return;
-  savingPool.value = true;
-  try {
-    await stockPoolApi.update(selectedPool.value.pool_code, { is_enabled: value });
-    await loadPools();
-  } catch (error) {
-    message.error(errorMessage(error, '更新股票池状态失败'));
   } finally {
     savingPool.value = false;
   }
@@ -672,6 +797,11 @@ onBeforeUnmount(() => {
 .title-line h2 { margin: 0; font-size: 20px; }
 .pool-detail-main p { margin: 6px 0 0; color: #667085; font-size: 13px; }
 .pool-detail-actions { display: flex; align-items: center; gap: 8px; }
+.realtime-policy-panel { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 12px; border: 1px solid #d8e0e5; background: #f8fafc; }
+.realtime-policy-panel strong { color: #344054; font-size: 13px; }
+.realtime-policy-panel p { margin: 4px 0 0; color: #667085; font-size: 12px; }
+.system-pool-note, .form-control-with-help { color: #667085; font-size: 13px; line-height: 1.55; }
+.form-control-with-help { display: flex; align-items: center; gap: 10px; }
 .members-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px; border: 1px solid #e4e7ec; background: #f8fafc; }
 .members-toolbar :deep(.n-input) { min-width: 0; flex: 1; }
 .member-table-region { min-height: 0; flex: 1; overflow: hidden; border: 1px solid #d8e0e5; }
@@ -726,6 +856,8 @@ onBeforeUnmount(() => {
   .title-line h2 { font-size: 18px; }
   .pool-detail-main p { font-size: 12px; }
   .members-toolbar { flex-wrap: wrap; }
+  .realtime-policy-panel { align-items: stretch; flex-direction: column; }
+  .form-control-with-help { align-items: flex-start; flex-direction: column; gap: 6px; }
   .members-toolbar :deep(.n-input) { flex-basis: calc(100% - 42px); }
   .members-toolbar > :last-child { margin-left: auto; }
   .member-table-region :deep(.n-data-table-table) { min-width: 560px; }

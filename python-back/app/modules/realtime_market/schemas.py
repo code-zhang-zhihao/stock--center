@@ -58,6 +58,10 @@ class RealtimeMinuteMeta(BaseModel):
     updated_count: int = 0
     no_intraday_data_count: int = 0
     failed_count: int = 0
+    guaranteed_count: int = 0
+    guaranteed_overflow_count: int = 0
+    rotating_selected_count: int = 0
+    unregistered_count: int = 0
     duration_ms: int | None = None
     error_samples: list[str] = Field(default_factory=list)
 
@@ -75,6 +79,8 @@ class RealtimeStatus(BaseModel):
     minute_cache_count: int = 0
     minute_registered_count: int = 0
     minute_guaranteed_count: int = 0
+    minute_guaranteed_overflow_count: int = 0
+    minute_unregistered_count: int = 0
     reference_loaded_at: datetime | None = None
     last_quote_round: RealtimeRoundMeta = Field(default_factory=RealtimeRoundMeta)
     last_minute_round: RealtimeMinuteMeta = Field(default_factory=RealtimeMinuteMeta)

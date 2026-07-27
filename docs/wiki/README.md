@@ -21,6 +21,7 @@
 | 行情与历史事实 | `python-back/app/modules/market_data/` | `scheduler_handlers.py`、`history_backfill.py`、`entity_history_backfill.py` | 主数据同步、个股/板块/指数日频事实回填与 canonical 入库。 | [行情数据模块](30-模块地图/行情数据模块.md)、[历史数据资产初始化](20-核心流程/历史数据资产初始化.md) |
 | 因子计算 | `python-back/app/modules/indicator_engine/` | `backfill.py`、`repository.py`、`service.py` | 个股/板块/指数因子和技术快照计算。 | [历史数据资产初始化](20-核心流程/历史数据资产初始化.md) |
 | 数据资产巡检 | `python-back/app/modules/data_assets/` | `service.py` | 表级健康、覆盖率、生产任务与缓存。 | [数据库表索引](30-模块地图/数据库表索引.md) |
+| 实时研究底座 | `python-back/app/modules/realtime_market/` | `service.py`、`tickflow_runtime.py` | TickFlow REST Quote/五档、MooTDX 分钟线、Redis 租约与市场/题材/行业/股票池聚合；不做自动交易。 | [实时数据能力规划](70-规划/实时数据能力规划.md) |
 | 调度中心 | `python-back/app/modules/scheduler_center/` | `service.py`、`runtime.py`、`handlers.py` | 定义、触发、限时、重试、运行日志与取消。 | [调度中心模块](30-模块地图/调度中心模块.md) |
 | 管理后台 | `web-admin/src/` | `router/index.ts` | 数据中心、任务中心、板块与个股行情页面。 | [前端配置中心模块](30-模块地图/前端配置中心模块.md) |
 | 数据库演进 | `docs/sql/` | `README.md`、`55-data-asset-history-pipelines.sql`、`58-daily-close-four-stage-pipeline.sql` | Schema、索引、历史任务和每日四级流水线升级顺序。 | [数据库表索引](30-模块地图/数据库表索引.md) |
