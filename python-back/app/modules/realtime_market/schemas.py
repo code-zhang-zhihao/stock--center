@@ -43,7 +43,7 @@ class RealtimeRoundMeta(BaseModel):
 
 
 class RealtimeBlockMeta(RealtimeRoundMeta):
-    block: Literal["market", "decision_quote", "depth", "minute"] = "market"
+    block: Literal["market", "decision_quote", "depth", "minute", "strategy"] = "market"
     request_count: int = 0
     coverage_pct: float | None = None
     cache_freshness_seconds: int | None = None
@@ -88,6 +88,7 @@ class RealtimeStatus(BaseModel):
     decision_quote: RealtimeBlockMeta = Field(default_factory=lambda: RealtimeBlockMeta(block="decision_quote"))
     depth: RealtimeBlockMeta = Field(default_factory=lambda: RealtimeBlockMeta(block="depth"))
     minute: RealtimeBlockMeta = Field(default_factory=lambda: RealtimeBlockMeta(block="minute"))
+    strategy: RealtimeBlockMeta = Field(default_factory=lambda: RealtimeBlockMeta(block="strategy"))
     rate_budgets: dict[str, dict] = Field(default_factory=dict)
     leader_active: bool = False
     depth_cache_count: int = 0

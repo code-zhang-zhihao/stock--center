@@ -73,6 +73,7 @@
 67. `67-market-emotion-v2.sql`：新增可配置的 V2 双分情绪模型、每日评分事实与市场级北向资金流，支持 250 个交易日基线校准；V1 兼容情绪与原报告事实保留。
 68. `68-market-emotion-baseline-performance.sql`：为 V2 基线校准的北向历史回填、窗口查询和运行进度补充性能索引/调度元数据。
 69. `69-strategy-research-foundation.sql`：新增策略研究定义、T 日候选和模拟交易审计表，以及由候选派生的动态策略股票池约定；不 seed 策略、不调度扫描、不调用行情源或券商。
+70. `70-strategy-evaluation-lifecycle.sql`：新增策略不可变版本、信号事件、模拟交易分笔和日频基线回测，seed 盘后候选与手动回测任务；不连接券商或真实下单。
 67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 68. `68-market-emotion-baseline-performance.sql`：新增历史市场级北向资金流回填任务，默认按 120 交易日窗口补最近 250 个已有日线交易日；V2 基线改为精确交易日 lookback、20 日持久化检查点与运行进度，并把该手动校准任务超时上限调为 1800 秒。
 
@@ -115,7 +116,9 @@ docs/sql/db-init.sql
 
 `66-market-daily-review-facts.sql` 必须在 `65` 之后执行，并在部署后端后 reload Scheduler。它新增两张 Derived 表并把既有 `calculate_market_daily_sentiment` 的展示名称更新为“生成每日市场报告事实”，不会新增第二个定时任务。任务默认在生成情绪后继续生成概念热度、热点龙头和涨停关联证据；若只需大范围回填历史情绪基线，可传 `include_report_facts=false`。概念热度只读取 `t_daily_bar/t_stock_fund_flow_daily/t_limit_event_daily/t_sector_component`，因此不受 `ths_daily` 晚发布影响；当前公告没有每日全市场同步完成标记，报告只能显示已入库公告并明确标注完整性未知。脚本会把 `t_sector_bar` 的历史零行 `ths_daily` Raw 记录从 `captured` 修正为 `failed`，保留原始审计行、`ths_daily_empty_or_not_published` 错误码与错误说明。
 
-`69-strategy-research-foundation.sql` 必须在 `67` 之后由 `t_stock_pool` 与新策略表 owner 执行。脚本只创建 `t_strategy_definition/t_strategy_candidate/t_strategy_paper_trade`、索引、约束和注释，不写入策略、候选、股票池成员、调度定义或真实订单。部署后端、刷新前端后，策略中心才能创建草稿及其 `dynamic_rule='strategy_candidates'` 专属策略池；在 evaluator、T+1 确认和模拟成交执行器上线前，后端会拒绝 `status=enabled`。
+`69-strategy-research-foundation.sql` 必须在 `67` 之后由 `t_stock_pool` 与新策略表 owner 执行。它是策略定义、候选和纸面交易的基础表迁移，不写入策略、候选、股票池成员、调度定义或真实订单。部署后端、刷新前端后，策略中心才能创建草稿及其 `dynamic_rule='strategy_candidates'` 专属策略池；完整的 evaluator、T+1 确认和模拟成交执行器由后续 `70` 提供。
+
+`70-strategy-evaluation-lifecycle.sql` 必须紧接 `69` 执行。它为既有定义补 v1，建立 `t_strategy_version/t_strategy_signal_event/t_strategy_paper_trade_leg/t_strategy_backtest_run/t_strategy_backtest_trade`，并将候选的唯一键改为版本维度；已有 `enabled` 定义归一为 `research`。脚本同时 seed `evaluate_strategy_daily_candidates`（工作日 22:25）和 `run_strategy_backtest`（`cron_expr=null`，仅手动），并关联“策略”标签。它不删除已有候选、模拟交易、股票池成员或历史调度日志，也不连接券商。执行后部署后端/前端并 reload Scheduler；先在策略中心初始化内置策略、运行并人工审阅回测，再显式晋升某个版本至 `paper`。
 
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 

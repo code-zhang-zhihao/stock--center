@@ -1,6 +1,6 @@
 from datetime import date
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import (
@@ -16,6 +16,7 @@ from app.modules.market_data.models import (
     TradeCalendar,
 )
 from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
+from app.modules.strategy_center.models import StrategyCandidate, StrategyDefinition, StrategyPaperTrade, StrategyVersion
 
 
 class RealtimeMarketRepository:
@@ -333,11 +334,40 @@ class RealtimeMarketRepository:
         member_map: dict[str, list[str]] = {}
         for pool_code, stock_code in members:
             member_map.setdefault(pool_code, []).append(stock_code)
+        # A strategy pool is a view over auditable candidate/trade facts, not
+        # a static member list.  Loading it here keeps paper candidates inside
+        # the existing hot Quote / depth / minute target policy without a
+        # second realtime provider loop.
+        strategy_members = await self.session.execute(
+            select(StockPool.pool_code, StrategyCandidate.stock_code)
+            .join(StrategyDefinition, StrategyDefinition.id == StrategyCandidate.strategy_id)
+            .join(StrategyVersion, StrategyVersion.id == StrategyCandidate.strategy_version_id)
+            .outerjoin(StrategyPaperTrade, StrategyPaperTrade.candidate_id == StrategyCandidate.id)
+            .join(StockPool, StockPool.id == StrategyDefinition.pool_id)
+            .where(
+                StockPool.is_dynamic.is_(True),
+                StockPool.dynamic_rule == "strategy_candidates",
+                StrategyDefinition.status == "paper",
+                StrategyVersion.status == "paper",
+                or_(
+                    and_(
+                        StrategyCandidate.candidate_status.in_(("pending_confirmation", "watching")),
+                        StrategyCandidate.confirmation_deadline >= date.today(),
+                    ),
+                    StrategyCandidate.candidate_status == "entry_triggered",
+                    StrategyPaperTrade.trade_status == "open",
+                ),
+            )
+        )
+        for pool_code, stock_code in strategy_members.all():
+            member_map.setdefault(pool_code, []).append(stock_code)
         active_set = set(active_stock_codes)
         result: dict[str, dict] = {}
         for pool, policy in pools:
             if pool.is_dynamic and pool.dynamic_rule == "active_a_share":
                 codes = active_stock_codes
+            elif pool.is_dynamic and pool.dynamic_rule == "strategy_candidates":
+                codes = sorted(set(code for code in member_map.get(pool.pool_code, []) if code in active_set))
             else:
                 codes = [code for code in member_map.get(pool.pool_code, []) if code in active_set]
             result[pool.pool_code] = {

@@ -12,6 +12,7 @@ from app.modules.scheduler_center.validation import (
 SCHEMA = {
     "source": {"label": "数据源", "type": "string", "options": ["tushare", "akshare"], "required": True},
     "limit": {"label": "上限", "type": "number", "min": 1, "max": 20},
+    "version_no": {"label": "版本号", "type": "integer", "min": 1, "max": 99},
     "enabled": {"label": "启用", "type": "boolean"},
     "types": {"label": "类型", "type": "array", "options": ["concept", "industry"]},
     "params": {"label": "附加参数", "type": "json"},
@@ -34,11 +35,13 @@ def test_invalid_cron_is_rejected() -> None:
 
 
 def test_payload_validation_covers_types_ranges_and_unknowns() -> None:
-    valid = {"source": "tushare", "limit": 10, "enabled": True, "types": ["concept"], "params": {"trade_date": "20260101"}}
+    valid = {"source": "tushare", "limit": 10, "version_no": 1, "enabled": True, "types": ["concept"], "params": {"trade_date": "20260101"}}
     validate_payload(valid, SCHEMA)
 
     for invalid in (
         {**valid, "limit": 0},
+        {**valid, "version_no": 1.5},
+        {**valid, "version_no": True},
         {**valid, "source": "mootdx"},
         {**valid, "types": ["invalid"]},
         {**valid, "enabled": "true"},

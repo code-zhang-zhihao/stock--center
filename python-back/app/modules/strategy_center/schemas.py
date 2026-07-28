@@ -5,13 +5,15 @@ from pydantic import BaseModel, Field
 
 
 STRATEGY_CODE_PATTERN = r"^[a-z][a-z0-9_]{0,59}$"
-StrategyStatus = Literal["draft", "research", "enabled", "archived"]
+StrategyStatus = Literal["draft", "research", "paper", "archived"]
 StrategyEntryMode = Literal["auction", "open", "intraday"]
+StrategyVersionStatus = Literal["draft", "backtest_ready", "paper", "retired"]
 
 
 class StrategyDefinitionCreate(BaseModel):
     strategy_code: str = Field(pattern=STRATEGY_CODE_PATTERN, max_length=60)
     strategy_name: str = Field(min_length=1, max_length=160)
+    implementation_code: str | None = Field(default=None, pattern=STRATEGY_CODE_PATTERN, max_length=80)
     description: str | None = Field(default=None, max_length=4000)
     entry_mode: StrategyEntryMode = "auction"
     max_holding_trade_days: int = Field(default=3, ge=1, le=20)
@@ -29,6 +31,26 @@ class StrategyDefinitionUpdate(BaseModel):
     risk_config: dict | None = None
 
 
+class StrategyVersionCreate(BaseModel):
+    implementation_code: str = Field(pattern=STRATEGY_CODE_PATTERN, max_length=80)
+    rule_config: dict = Field(default_factory=dict)
+    risk_config: dict = Field(default_factory=dict)
+
+
+class StrategyVersionUpdate(BaseModel):
+    implementation_code: str | None = Field(default=None, pattern=STRATEGY_CODE_PATTERN, max_length=80)
+    rule_config: dict | None = None
+    risk_config: dict | None = None
+
+
+class StrategyBacktestCreate(BaseModel):
+    version_no: int = Field(ge=1)
+    start_date: date
+    end_date: date
+    fee_rate: float = Field(default=0.0005, ge=0, le=0.05)
+    slippage_bps: float = Field(default=10, ge=0, le=1000)
+
+
 class StrategyDefinitionRead(BaseModel):
     strategy_code: str
     strategy_name: str
@@ -43,6 +65,18 @@ class StrategyDefinitionRead(BaseModel):
     pool_name: str | None = None
     candidate_summary: dict = Field(default_factory=dict)
     trade_summary: dict = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class StrategyVersionRead(BaseModel):
+    version_no: int
+    implementation_code: str
+    status: StrategyVersionStatus
+    rule_config: dict = Field(default_factory=dict)
+    risk_config: dict = Field(default_factory=dict)
+    validation_summary: dict = Field(default_factory=dict)
+    published_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

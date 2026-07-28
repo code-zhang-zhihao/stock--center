@@ -157,35 +157,34 @@ class SchedulerService:
                 error_message=f"job handler not found: {job_code}",
             )
 
-        locked = False
         try:
-            locked = await self.repository.try_advisory_lock(job_code)
-            if not locked:
-                logger.info("scheduler job skipped: run_id=%s job_code=%s reason=already_running", run_id, job_code)
-                return await self._finish_run(
-                    run_id,
-                    status="skipped",
-                    error_code="already_running",
-                    error_message=f"job already running: {job_code}",
-                )
+            async with self.repository.hold_advisory_lock(job_code) as locked:
+                if not locked:
+                    logger.info("scheduler job skipped: run_id=%s job_code=%s reason=already_running", run_id, job_code)
+                    return await self._finish_run(
+                        run_id,
+                        status="skipped",
+                        error_code="already_running",
+                        error_message=f"job already running: {job_code}",
+                    )
 
-            async with _get_execution_semaphore():
-                run_row = await self.repository.get_run(run_id)
-                trigger_source = run_row.trigger_source if run_row else "manual"
-                result = await self._run_with_retry(run_id, job, payload, trigger_source)
-                logger.info(
-                    "scheduler job finished: run_id=%s job_code=%s status=%s affected_rows=%s",
-                    run_id,
-                    job_code,
-                    result.status,
-                    result.affected_rows,
-                )
-                return await self._finish_run(
-                    run_id,
-                    status=result.status,
-                    affected_rows=result.affected_rows,
-                    result_summary=result.summary,
-                )
+                async with _get_execution_semaphore():
+                    run_row = await self.repository.get_run(run_id)
+                    trigger_source = run_row.trigger_source if run_row else "manual"
+                    result = await self._run_with_retry(run_id, job, payload, trigger_source)
+                    logger.info(
+                        "scheduler job finished: run_id=%s job_code=%s status=%s affected_rows=%s",
+                        run_id,
+                        job_code,
+                        result.status,
+                        result.affected_rows,
+                    )
+                    return await self._finish_run(
+                        run_id,
+                        status=result.status,
+                        affected_rows=result.affected_rows,
+                        result_summary=result.summary,
+                    )
         except TimeoutError as exc:
             logger.warning("scheduler job timeout: run_id=%s job_code=%s error=%s", run_id, job_code, exc)
             return await self._finish_run(run_id, status="timeout", error_code="job_timeout", error_message=str(exc))
@@ -218,14 +217,6 @@ class SchedulerService:
                 error_message=str(exc),
                 result_summary=details if isinstance(details, dict) else None,
             )
-        finally:
-            if locked:
-                try:
-                    await self.repository.advisory_unlock(job_code)
-                    await self.repository.commit()
-                except Exception:
-                    await self.repository.rollback()
-
     async def _run_with_retry(
         self,
         run_id: str,

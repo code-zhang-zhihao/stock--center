@@ -1,5 +1,47 @@
-export type StrategyStatus = 'draft' | 'research' | 'enabled' | 'archived';
+export type StrategyStatus = 'draft' | 'research' | 'paper' | 'archived';
 export type StrategyEntryMode = 'auction' | 'open' | 'intraday';
+export type StrategyVersionStatus = 'draft' | 'backtest_ready' | 'paper' | 'retired';
+
+export interface StrategyTemplate {
+  strategy_code: string;
+  strategy_name: string;
+  description: string;
+  entry_mode: StrategyEntryMode;
+  max_holding_trade_days: number;
+  rule_config: Record<string, unknown>;
+  risk_config: Record<string, unknown>;
+  implementation_version: string;
+  required_inputs: string[];
+  supported_execution_models: string[];
+}
+
+export interface StrategyVersion {
+  version_no: number;
+  implementation_code: string;
+  status: StrategyVersionStatus;
+  rule_config: Record<string, unknown>;
+  risk_config: Record<string, unknown>;
+  validation_summary: Record<string, unknown>;
+  published_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StrategyBacktestRun {
+  run_code: string;
+  strategy_version_id: number;
+  start_date: string;
+  end_date: string;
+  execution_model: string;
+  status: 'running' | 'completed' | 'failed' | string;
+  fee_rate: number;
+  slippage_bps: number;
+  parameter_snapshot: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  started_at: string;
+  finished_at: string | null;
+  error_message: string | null;
+}
 
 export interface StrategyDefinition {
   strategy_code: string;
@@ -49,6 +91,8 @@ export interface StrategyCandidate {
     entry_at: string;
     entry_price: number;
     quantity: number;
+    initial_quantity: number;
+    open_quantity: number;
     exit_at: string | null;
     exit_price: number | null;
     realized_pnl_pct: number | null;

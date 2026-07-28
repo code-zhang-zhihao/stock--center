@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.modules.strategy_center.schemas import StrategyDefinitionCreate, StrategyDefinitionUpdate
-from app.modules.strategy_center.service import StrategyCenterError, StrategyCenterService
+from app.modules.strategy_center.service import StrategyCenterError, StrategyCenterService, _qualifies_for_paper_review
 
 
 class FakeRepository:
@@ -31,6 +31,9 @@ class FakeRepository:
             **definition_values,
         )
         return self.definition
+
+    async def create_version(self, **_kwargs):
+        return SimpleNamespace(version_no=1)
 
     async def update_definition(self, definition, values):
         for key, value in values.items():
@@ -64,33 +67,61 @@ def test_create_strategy_creates_a_dedicated_dynamic_pool_name() -> None:
         service = StrategyCenterService(repository)
         created = await service.create_definition(
             StrategyDefinitionCreate(
-                strategy_code="first_board_theme_relay",
+                strategy_code="my_first_board_theme_relay",
                 strategy_name="首板主线接力（研究）",
+                implementation_code="theme_first_board_relay",
                 entry_mode="auction",
-                max_holding_trade_days=3,
+                max_holding_trade_days=2,
             )
         )
-        assert repository.created_pool_code == "strategy_first_board_theme_relay"
+        assert repository.created_pool_code == "strategy_my_first_board_theme_relay"
         assert created["status"] == "draft"
-        assert created["pool_code"] == "strategy_first_board_theme_relay"
+        assert created["pool_code"] == "strategy_my_first_board_theme_relay"
         assert repository.committed == 1
 
     asyncio.run(run())
 
 
-def test_strategy_cannot_be_enabled_before_evaluator_exists() -> None:
+def test_strategy_cannot_be_placed_in_paper_mode_without_version_validation() -> None:
     async def run() -> None:
         repository = FakeRepository()
         service = StrategyCenterService(repository)
         await service.create_definition(
-            StrategyDefinitionCreate(strategy_code="research_rule", strategy_name="研究规则")
+            StrategyDefinitionCreate(
+                strategy_code="my_trend_breakout",
+                strategy_name="趋势突破（研究）",
+                implementation_code="trend_breakout",
+                entry_mode="open",
+                max_holding_trade_days=5,
+            )
         )
         try:
-            await service.update_definition("research_rule", StrategyDefinitionUpdate(status="enabled"))
+            await service.update_definition("my_trend_breakout", StrategyDefinitionUpdate(status="paper"))
         except StrategyCenterError as exc:
-            assert exc.code == "strategy_evaluator_not_available"
+            assert exc.code == "strategy_status_invalid"
         else:
-            raise AssertionError("strategy enable must be rejected before evaluator implementation")
+            raise AssertionError("strategy paper mode must require a validated version")
+
+    asyncio.run(run())
+
+
+def test_builtin_strategy_rejects_confirmation_mode_that_conflicts_with_implementation() -> None:
+    async def run() -> None:
+        service = StrategyCenterService(FakeRepository())
+        try:
+            await service.create_definition(
+                StrategyDefinitionCreate(
+                    strategy_code="wrong_mode_breakout",
+                    strategy_name="错误确认时点",
+                    implementation_code="trend_breakout",
+                    entry_mode="auction",
+                    max_holding_trade_days=5,
+                )
+            )
+        except StrategyCenterError as exc:
+            assert exc.code == "strategy_contract_mismatch"
+        else:
+            raise AssertionError("builtin execution contract must not be overridden by definition fields")
 
     asyncio.run(run())
 
@@ -99,8 +130,14 @@ def test_dashboard_states_that_no_execution_or_paper_trade_is_running() -> None:
     async def run() -> None:
         dashboard = await StrategyCenterService(FakeRepository()).dashboard()
         assert dashboard["execution_ready"] is False
-        assert "尚未实现" in dashboard["execution_readiness_reason"]
+        assert "完成 next_open_daily 基线回测" in dashboard["execution_readiness_reason"]
         assert dashboard["candidate_counts"] == {}
         assert dashboard["paper_trade_counts"] == {}
 
     asyncio.run(run())
+
+
+def test_paper_review_requires_broad_history_as_well_as_closed_trades() -> None:
+    assert not _qualifies_for_paper_review({"signal_trade_date_count": 10, "completed_trade_count": 299})
+    assert not _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 29})
+    assert _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 30})

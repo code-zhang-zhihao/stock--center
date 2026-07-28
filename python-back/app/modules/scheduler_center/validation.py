@@ -117,6 +117,14 @@ def _validate_payload_value(key: str, value: object, spec: dict) -> None:
         _validate_number_range(label, float(value), spec)
         return
 
+    if value_type == "integer":
+        # JSON has one numeric primitive, but integer fields such as strategy
+        # version numbers must not accept a fractional value or bool.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PayloadValidationError(f"参数 {label} 必须是整数")
+        _validate_number_range(label, float(value), spec)
+        return
+
     if value_type == "boolean":
         if not isinstance(value, bool):
             raise PayloadValidationError(f"参数 {label} 必须是布尔值")

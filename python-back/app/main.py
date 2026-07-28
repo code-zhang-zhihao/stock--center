@@ -21,6 +21,7 @@ from app.modules.scheduler_center.api import router as scheduler_router
 from app.modules.scheduler_center.runtime import scheduler_runtime
 from app.modules.stock_pool.api import router as stock_pool_router
 from app.modules.strategy_center.api import router as strategy_center_router
+from app.modules.strategy_center.scheduler_handlers import register_strategy_center_jobs
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ def create_app() -> FastAPI:
     register_data_asset_jobs()
     register_market_data_jobs()
     register_market_insight_jobs()
+    register_strategy_center_jobs()
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
     if settings.cors_origins:
         app.add_middleware(

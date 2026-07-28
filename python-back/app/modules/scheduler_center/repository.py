@@ -1,9 +1,12 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy import case, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.session import get_engine
 from app.modules.scheduler_center.models import SchedulerJob, SchedulerJobRun, SchedulerJobTag, SchedulerTag
 
 _UNSET = object()
@@ -251,18 +254,30 @@ class SchedulerRepository:
         )
         return [dict(row) for row in result.mappings().all()]
 
-    async def try_advisory_lock(self, job_code: str) -> bool:
-        result = await self.session.execute(
-            text("SELECT pg_try_advisory_lock(hashtext(:lock_key)::bigint)").bindparams(
-                lock_key=f"scheduler:{job_code}"
-            )
-        )
-        return bool(result.scalar_one())
+    @asynccontextmanager
+    async def hold_advisory_lock(self, job_code: str) -> AsyncIterator[bool]:
+        """Hold a job lock on a connection that is never reused mid-run.
 
-    async def advisory_unlock(self, job_code: str) -> None:
-        await self.session.execute(
-            text("SELECT pg_advisory_unlock(hashtext(:lock_key)::bigint)").bindparams(lock_key=f"scheduler:{job_code}")
-        )
+        Handlers may commit progress and facts repeatedly.  A session-level
+        PostgreSQL advisory lock acquired through that ORM session can then be
+        returned to the pool and later unlocked from a different database
+        session, leaving a stale ``already_running`` lock.  The dedicated
+        connection below has precisely the lock lifetime and is closed after
+        release even when the handler fails.
+        """
+
+        lock_key = f"scheduler:{job_code}"
+        lock_stmt = text("SELECT pg_try_advisory_lock(hashtext(:lock_key)::bigint)").bindparams(lock_key=lock_key)
+        unlock_stmt = text("SELECT pg_advisory_unlock(hashtext(:lock_key)::bigint)").bindparams(lock_key=lock_key)
+        async with get_engine().connect() as connection:
+            result = await connection.execute(lock_stmt)
+            locked = bool(result.scalar_one())
+            try:
+                yield locked
+            finally:
+                if locked:
+                    await connection.execute(unlock_stmt)
+                await connection.commit()
 
     async def commit(self) -> None:
         await self.session.commit()

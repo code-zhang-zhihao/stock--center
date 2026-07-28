@@ -20,6 +20,7 @@ from app.modules.realtime_market.tickflow_runtime import (
     TickflowProviderFactory,
     TickflowQuoteProvider,
 )
+from app.modules.strategy_center.realtime_service import StrategyRealtimeService
 
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,9 @@ class RealtimeMarketService:
             "decision_quote": RealtimeBlockMeta(block="decision_quote"),
             "depth": RealtimeBlockMeta(block="depth"),
             "minute": RealtimeBlockMeta(block="minute"),
+            "strategy": RealtimeBlockMeta(block="strategy"),
         }
+        self._strategy_runtime = StrategyRealtimeService()
         self._depth_by_stock: dict[str, dict] = {}
         self._depth_history_by_stock: dict[str, list[dict]] = {}
         self._decision_targets: list[dict] = []
@@ -178,6 +181,7 @@ class RealtimeMarketService:
             decision_quote=block_status["decision_quote"],
             depth=block_status["depth"],
             minute=block_status["minute"],
+            strategy=block_status["strategy"],
             rate_budgets=rate_budgets,
             leader_active=self._leader_active,
             depth_cache_count=len(self._depth_by_stock),
@@ -996,7 +1000,11 @@ class RealtimeMarketService:
         changed: list[tuple[str, dict, int]] = []
         for row in rows:
             code = row["stock_code"]
-            snapshot = {**row, "features": self._depth_features(row)}
+            snapshot = {
+                **row,
+                "depth_time": row.get("depth_time").isoformat() if isinstance(row.get("depth_time"), datetime) else str(row.get("depth_time") or ""),
+                "features": self._depth_features(row),
+            }
             history = [snapshot, *self._depth_history_by_stock.get(code, [])][:3]
             self._depth_by_stock[code] = snapshot
             self._depth_history_by_stock[code] = history
@@ -1006,6 +1014,7 @@ class RealtimeMarketService:
             "depth", round_id, started, "tickflow", len(codes), len({row["stock_code"] for row in rows}), len(errors), errors,
             request_count=requests, degraded=bool(errors), degraded_reason="depth_batch_error" if errors else None,
         )
+        await self._refresh_strategy_runtime(settings)
 
     def _block_meta(
         self,
@@ -1208,6 +1217,36 @@ class RealtimeMarketService:
             "minute", round_id, started, "mootdx", len(selected), updated, len(errors), errors,
             request_count=len(selected), degraded=bool(errors), degraded_reason="per_symbol_errors" if errors else None,
         )
+        await self._refresh_strategy_runtime(settings)
+
+    async def _refresh_strategy_runtime(self, settings: RealtimeSettings) -> None:
+        """Consume shared polling caches for paper confirmations/exits only."""
+        started = clock.monotonic()
+        round_id = uuid.uuid4().hex[:16]
+        now = datetime.now(tz=SHANGHAI)
+        try:
+            summary = await self._strategy_runtime.process(
+                now=now,
+                quotes=self._quotes,
+                depths=self._depth_by_stock,
+                depth_history=self._depth_history_by_stock,
+                minutes=self._minutes,
+                blocks={name: meta.model_dump(mode="json") for name, meta in self._blocks.items()},
+            )
+            target_count = int(summary.get("candidate_count") or 0) + int(summary.get("open_trade_count") or 0)
+            execution_count = int(summary.get("triggered_count") or 0) + int(summary.get("exit_count") or 0)
+            degraded_count = int(summary.get("degraded_count") or 0)
+            self._blocks["strategy"] = self._block_meta(
+                "strategy", round_id, started, "shared_realtime_cache", target_count, execution_count, degraded_count,
+                [], request_count=0, degraded=degraded_count > 0,
+                degraded_reason="strategy_cache_degraded" if degraded_count else None,
+            )
+        except Exception as exc:
+            logger.exception("strategy realtime process failed")
+            self._blocks["strategy"] = self._block_meta(
+                "strategy", round_id, started, "shared_realtime_cache", 0, 0, 1,
+                [f"{type(exc).__name__}: {exc}"], request_count=0, degraded=True, degraded_reason="strategy_runtime_error",
+            )
 
     async def _is_open_market_session(self, now: datetime) -> bool:
         if not self._is_market_session(now):
