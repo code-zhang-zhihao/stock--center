@@ -76,6 +76,7 @@ async def daily_review(
 async def emotion_daily(
     trade_date: date | None = None,
     model_code: str | None = Query(default=None, min_length=1, max_length=80),
+    history_limit: int = Query(default=60, ge=20, le=1000),
     session: AsyncSession = Depends(get_session),
 ):
     try:
@@ -83,6 +84,7 @@ async def emotion_daily(
             await MarketEmotionService(MarketInsightRepository(session)).read(
                 trade_date=trade_date,
                 model_code=model_code,
+                history_limit=history_limit,
             )
         )
     except ValueError as exc:

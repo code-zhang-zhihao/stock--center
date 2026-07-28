@@ -50,6 +50,34 @@
         <div v-if="stageDays.length" class="stage-days"><span v-for="item in stageDays" :key="item[0]">{{ stageLabel(item[0]) }} {{ item[1] }} 日</span></div>
         <p class="panel-note">T+1/T+3 市场广度和核心指数验证会由后续策略/回测层写入；当前校准预览明确显示其未计算状态，不使用未来数据倒灌当日评分。</p>
       </section>
+
+      <section v-if="selected" class="surface curve-surface">
+        <div class="panel-heading">
+          <div><span class="panel-kicker">校准评分轨迹</span><h2>短线接力与大盘风险偏好</h2></div>
+          <span class="muted">{{ curveMeta }}</span>
+        </div>
+        <MarketChart
+          :option="emotionCurveOption"
+          :loading="loadingCurve"
+          :empty="!curvePoints.length"
+          empty-text="该模型尚无可绘制的日度情绪事实；请先完成基线校准"
+          height="360px"
+        />
+        <div v-if="curveSegments.length" class="stage-timeline" aria-label="主阶段时间带">
+          <span
+            v-for="segment in curveSegments"
+            :key="`${segment.stage}-${segment.startDate}`"
+            class="stage-segment"
+            :class="`stage-${segment.stage}`"
+            :style="{ flexGrow: segment.days }"
+            :title="`${segment.label}：${segment.startDate} 至 ${segment.endDate}，${segment.days} 个交易日`"
+          >{{ segment.days >= 7 ? `${segment.label} ${segment.days}日` : '' }}</span>
+        </div>
+        <div class="curve-footer">
+          <span v-for="item in stageLegend" :key="item.stage"><i :class="`stage-${item.stage}`" />{{ item.label }}</span>
+          <span class="quality-note">实线为可评分日；曲线中仍包含 {{ curveDegradedCount }} 个“降级”日，其可选事实缺失已在单日评分明细中保留。</span>
+        </div>
+      </section>
     </n-spin>
 
     <n-modal v-model:show="createOpen" preset="card" title="新建 V2 情绪模型草稿" style="width: min(520px, calc(100vw - 28px))">
@@ -61,17 +89,23 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue';
+import type { EChartsOption } from 'echarts';
 import { NAlert, NButton, NEmpty, NForm, NFormItem, NInput, NInputNumber, NModal, NSelect, NSpin, NTag, useMessage } from 'naive-ui';
 import { Plus } from 'lucide-vue-next';
+import MarketChart from '@/components/MarketChart.vue';
 import { marketInsightApi } from '@/api/market-insight';
 import { schedulerApi } from '@/api/scheduler';
-import type { MarketEmotionModel } from '@/types/market-insight';
+import type { MarketEmotionDaily, MarketEmotionModel } from '@/types/market-insight';
 
 type WeightCard = 'short_term' | 'risk_on';
 const message = useMessage();
 const models = ref<MarketEmotionModel[]>([]);
 const selected = ref<MarketEmotionModel | null>(null);
 const loading = ref(false); const saving = ref(false); const creating = ref(false); const calibrating = ref(false); const activating = ref(false); const createOpen = ref(false);
+type EmotionTrendPoint = NonNullable<MarketEmotionDaily['trend']>[number];
+const curvePoints = ref<EmotionTrendPoint[]>([]);
+const loadingCurve = ref(false);
+let curveRequestSequence = 0;
 const createForm = reactive({ model_code: '', model_name: '', clone_from: null as string | null });
 const form = reactive({ model_name: '', percentile_window_days: 120, minimum_history_days: 60, baseline_trade_days: 250 });
 const parameters = reactive<any>({ short_term: {}, risk_on: {}, stage_thresholds: {} });
@@ -82,6 +116,66 @@ const isDraft = computed(() => selected.value?.status === 'draft');
 const parameterError = computed(() => { if (!selected.value) return ''; const totals = (['short_term', 'risk_on'] as WeightCard[]).map(weightTotal); if (totals.some((total) => total !== 100)) return '每张评分卡权重必须恰好合计 100%。'; const t = parameters.stage_thresholds || {}; if (!(Number(t.ice_point) < Number(t.retreat) && Number(t.retreat) < Number(t.recovery) && Number(t.recovery) < Number(t.active) && Number(t.active) < Number(t.climax))) return '阶段阈值必须依次满足：冰点 < 退潮 < 修复 < 活跃 < 高潮。'; return ''; });
 const stageDays = computed(() => Object.entries((selected.value?.calibration_summary?.stage_days || {}) as Record<string, number>));
 const calibrationStatus = computed(() => selected.value?.calibration_summary?.baseline_complete ? '基线完成' : (selected.value?.calibration_summary?.status === 'running' ? '校准中' : '待校准'));
+const stageMeta: Record<string, { label: string; color: string }> = {
+  ice_point: { label: '冰点', color: '#64748b' },
+  recovery: { label: '修复', color: '#0f766e' },
+  active: { label: '活跃', color: '#2563eb' },
+  climax: { label: '高潮', color: '#d97706' },
+  retreat: { label: '退潮', color: '#dc2626' },
+  pending: { label: '待完成', color: '#94a3b8' },
+};
+const stageLegend = computed(() => Object.entries(stageMeta).filter(([stage]) => stage !== 'pending').map(([stage, value]) => ({ stage, ...value })));
+const curveSegments = computed(() => {
+  const segments: Array<{ stage: string; label: string; days: number; startDate: string; endDate: string }> = [];
+  for (const point of curvePoints.value) {
+    const stage = point.primary_stage_code || 'pending';
+    const last = segments[segments.length - 1];
+    if (last && last.stage === stage) {
+      last.days += 1;
+      last.endDate = point.trade_date;
+      continue;
+    }
+    segments.push({ stage, label: stageMeta[stage]?.label || stage, days: 1, startDate: point.trade_date, endDate: point.trade_date });
+  }
+  return segments;
+});
+const curveDegradedCount = computed(() => curvePoints.value.filter((item) => item.status === 'degraded').length);
+const curveMeta = computed(() => {
+  if (!curvePoints.value.length) return '等待基线评分数据';
+  const first = curvePoints.value[0]?.trade_date;
+  const last = curvePoints.value[curvePoints.value.length - 1]?.trade_date;
+  return `${first} 至 ${last} · ${curvePoints.value.length} 个交易日`;
+});
+const emotionCurveOption = computed<EChartsOption>(() => ({
+  animation: false,
+  tooltip: { trigger: 'axis' },
+  legend: { data: ['短线接力情绪分', '大盘风险偏好分'], top: 0, right: 4 },
+  grid: { left: 42, right: 24, top: 40, bottom: 74 },
+  xAxis: {
+    type: 'category',
+    boundaryGap: false,
+    data: curvePoints.value.map((item) => item.trade_date),
+    axisLabel: { hideOverlap: true, formatter: (value: string) => value.slice(5) },
+  },
+  yAxis: { type: 'value', min: 0, max: 100, interval: 20, name: '分数', splitLine: { lineStyle: { color: '#edf1f5' } } },
+  dataZoom: curvePoints.value.length > 80
+    ? [{ type: 'inside', start: 0, end: 100 }, { type: 'slider', height: 18, bottom: 16, start: 0, end: 100 }]
+    : [],
+  series: [
+    {
+      name: '短线接力情绪分', type: 'line', showSymbol: false, smooth: 0.16,
+      data: curvePoints.value.map((item) => item.short_term_score),
+      lineStyle: { color: '#ea580c', width: 2.4 }, itemStyle: { color: '#ea580c' },
+      areaStyle: { color: 'rgba(234,88,12,.08)' }, connectNulls: false,
+    },
+    {
+      name: '大盘风险偏好分', type: 'line', showSymbol: false, smooth: 0.16,
+      data: curvePoints.value.map((item) => item.market_risk_on_score),
+      lineStyle: { color: '#0f766e', width: 2.4 }, itemStyle: { color: '#0f766e' },
+      areaStyle: { color: 'rgba(15,118,110,.06)' }, connectNulls: false,
+    },
+  ],
+}));
 
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)); }
 function statusLabel(status: string) { return ({ draft: '草稿', calibrating: '校准中', ready: '待启用', active: '已启用', archived: '已归档' } as Record<string, string>)[status] || status; }
@@ -93,7 +187,23 @@ function weightTotal(key: WeightCard) { return Math.round(Object.values(paramete
 function calibrationValue(key: string) { const value = selected.value?.calibration_summary?.[key]; return typeof value === 'number' ? (Number.isInteger(value) ? value.toLocaleString('zh-CN') : value.toFixed(2)) : '-'; }
 function validationValue(horizon: string, key: string, suffix = '') { const validation = selected.value?.calibration_summary?.validation as Record<string, Record<string, unknown>> | undefined; const value = validation?.[horizon]?.[key]; return typeof value === 'number' ? `${value.toFixed(2)}${suffix}` : '-'; }
 function calibrationLabel(model: MarketEmotionModel) { const summary = model.calibration_summary || {}; return summary.baseline_complete ? `基线完成：${summary.ready_or_degraded_days || 0} 个可评分交易日` : (model.status === 'calibrating' ? '后台正在按 20 个交易日分批校准' : '尚未完成基线校准'); }
-function selectModel(model: MarketEmotionModel) { selected.value = model; form.model_name = model.model_name; form.percentile_window_days = model.percentile_window_days; form.minimum_history_days = model.minimum_history_days; form.baseline_trade_days = model.baseline_trade_days; const value = clone(model.parameter_json || {}); parameters.short_term = value.short_term || {}; parameters.risk_on = value.risk_on || {}; parameters.stage_thresholds = value.stage_thresholds || {}; }
+function selectModel(model: MarketEmotionModel) { selected.value = model; form.model_name = model.model_name; form.percentile_window_days = model.percentile_window_days; form.minimum_history_days = model.minimum_history_days; form.baseline_trade_days = model.baseline_trade_days; const value = clone(model.parameter_json || {}); parameters.short_term = value.short_term || {}; parameters.risk_on = value.risk_on || {}; parameters.stage_thresholds = value.stage_thresholds || {}; void loadCurve(model); }
+async function loadCurve(model: MarketEmotionModel) {
+  const requestSequence = ++curveRequestSequence;
+  loadingCurve.value = true;
+  curvePoints.value = [];
+  try {
+    const response = await marketInsightApi.emotionDaily({
+      model_code: model.model_code,
+      history_limit: Math.max(60, Math.min(model.baseline_trade_days, 1000)),
+    });
+    if (requestSequence === curveRequestSequence) curvePoints.value = response.trend || [];
+  } catch (error) {
+    if (requestSequence === curveRequestSequence) message.error(error instanceof Error ? error.message : '加载情绪评分轨迹失败');
+  } finally {
+    if (requestSequence === curveRequestSequence) loadingCurve.value = false;
+  }
+}
 async function load() { loading.value = true; try { models.value = (await marketInsightApi.emotionModels()).items; const chosen = selected.value && models.value.find((item) => item.model_code === selected.value?.model_code); if (chosen) selectModel(chosen); else if (models.value[0]) selectModel(models.value[0]); } catch (error) { message.error(error instanceof Error ? error.message : '加载情绪模型失败'); } finally { loading.value = false; } }
 function openCreate(cloneFrom?: string) { createForm.model_code = ''; createForm.model_name = ''; createForm.clone_from = cloneFrom || selected.value?.model_code || null; createOpen.value = true; }
 async function create() { if (!createForm.model_code || !createForm.model_name) { message.warning('请填写模型代码和名称'); return; } creating.value = true; try { const model = await marketInsightApi.createEmotionModel(createForm); createOpen.value = false; await load(); const created = models.value.find((item) => item.model_code === model.model_code); if (created) selectModel(created); message.success('草稿已创建'); } catch (error) { message.error(error instanceof Error ? error.message : '创建草稿失败'); } finally { creating.value = false; } }
@@ -104,5 +214,5 @@ onMounted(() => { void load(); });
 </script>
 
 <style scoped>
-.emotion-model-page { padding: 22px 24px 34px; color: #17212b; }.topbar { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:14px; }.eyebrow,.panel-kicker{color:#9a6700;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.topbar h1{margin:4px 0 0;font-size:26px}.topbar p{max-width:830px;margin:8px 0 0;color:#667085;line-height:1.6}.page-alert{margin-bottom:14px}.model-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.model-card,.surface{border:1px solid #dce5e9;border-radius:9px;background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.03)}.model-card{padding:14px;cursor:pointer;display:grid;gap:11px}.model-card.selected{border-color:#3182ce;box-shadow:0 0 0 2px #bee3f8}.model-card-head{display:flex;justify-content:space-between;gap:10px}.model-card-head>div{display:grid;gap:3px}.model-card strong{font-size:15px}.model-card small,.model-card p,.muted{color:#667085;font-size:12px}.model-card p{margin:0;line-height:1.5}.model-stats{display:flex;flex-wrap:wrap;gap:6px}.model-stats span,.stage-days span{padding:3px 6px;border-radius:4px;color:#475467;background:#f2f4f7;font-size:11px}.model-stats b{color:#1d2939}.surface{padding:16px;margin-top:14px}.panel-heading{display:flex;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-heading h2{margin:3px 0 0;font-size:18px}.settings-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.settings-grid>label,.weight-list>label{display:grid;gap:5px;color:#475467;font-size:12px}.weight-panels{display:grid;grid-template-columns:1fr 1fr .75fr;gap:12px;margin-top:14px}.weight-panel{padding:12px;border:1px solid #e4e9ef;border-radius:7px;background:#fbfcfd}.weight-panel h3{display:flex;justify-content:space-between;gap:10px;margin:0 0 9px;font-size:14px}.weight-panel h3 small{color:#667085;font-size:11px;font-weight:400}.weight-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.weight-list>label{grid-template-columns:minmax(0,1fr) 88px;align-items:center}.editor-actions,.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}.parameter-alert{margin-top:12px}.validation-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.validation-grid article{display:grid;gap:6px;padding:12px;border:1px solid #e4e9ef;border-radius:7px}.validation-grid span{color:#667085;font-size:12px}.validation-grid strong{font-size:18px}.stage-days{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.panel-note{margin:12px 0 0;color:#667085;font-size:12px;line-height:1.6}@media(max-width:1100px){.model-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-grid,.validation-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.weight-panels{grid-template-columns:1fr}}@media(max-width:700px){.emotion-model-page{padding:14px}.topbar{flex-direction:column}.model-grid,.settings-grid,.validation-grid,.weight-list{grid-template-columns:1fr}}
+.emotion-model-page { padding: 22px 24px 34px; color: #17212b; }.topbar { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:14px; }.eyebrow,.panel-kicker{color:#9a6700;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.topbar h1{margin:4px 0 0;font-size:26px}.topbar p{max-width:830px;margin:8px 0 0;color:#667085;line-height:1.6}.page-alert{margin-bottom:14px}.model-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.model-card,.surface{border:1px solid #dce5e9;border-radius:9px;background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.03)}.model-card{padding:14px;cursor:pointer;display:grid;gap:11px}.model-card.selected{border-color:#3182ce;box-shadow:0 0 0 2px #bee3f8}.model-card-head{display:flex;justify-content:space-between;gap:10px}.model-card-head>div{display:grid;gap:3px}.model-card strong{font-size:15px}.model-card small,.model-card p,.muted{color:#667085;font-size:12px}.model-card p{margin:0;line-height:1.5}.model-stats{display:flex;flex-wrap:wrap;gap:6px}.model-stats span,.stage-days span{padding:3px 6px;border-radius:4px;color:#475467;background:#f2f4f7;font-size:11px}.model-stats b{color:#1d2939}.surface{padding:16px;margin-top:14px}.panel-heading{display:flex;justify-content:space-between;gap:12px;margin-bottom:14px}.panel-heading h2{margin:3px 0 0;font-size:18px}.settings-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.settings-grid>label,.weight-list>label{display:grid;gap:5px;color:#475467;font-size:12px}.weight-panels{display:grid;grid-template-columns:1fr 1fr .75fr;gap:12px;margin-top:14px}.weight-panel{padding:12px;border:1px solid #e4e9ef;border-radius:7px;background:#fbfcfd}.weight-panel h3{display:flex;justify-content:space-between;gap:10px;margin:0 0 9px;font-size:14px}.weight-panel h3 small{color:#667085;font-size:11px;font-weight:400}.weight-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.weight-list>label{grid-template-columns:minmax(0,1fr) 88px;align-items:center}.editor-actions,.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}.parameter-alert{margin-top:12px}.validation-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.validation-grid article{display:grid;gap:6px;padding:12px;border:1px solid #e4e9ef;border-radius:7px}.validation-grid span{color:#667085;font-size:12px}.validation-grid strong{font-size:18px}.stage-days{display:flex;flex-wrap:wrap;gap:7px;margin-top:12px}.panel-note{margin:12px 0 0;color:#667085;font-size:12px;line-height:1.6}.curve-surface{overflow:hidden}.stage-timeline{display:flex;min-height:26px;overflow:hidden;margin-top:7px;border:1px solid #e4e9ef;border-radius:5px;background:#f8fafc}.stage-segment{display:grid;min-width:1px;place-items:center;overflow:hidden;padding:0 4px;color:#fff;font-size:10px;font-weight:700;line-height:1;white-space:nowrap}.stage-ice_point{background:#64748b}.stage-recovery{background:#0f766e}.stage-active{background:#2563eb}.stage-climax{background:#d97706}.stage-retreat{background:#dc2626}.stage-pending{background:#94a3b8}.curve-footer{display:flex;flex-wrap:wrap;align-items:center;gap:7px 14px;margin-top:9px;color:#667085;font-size:11px}.curve-footer>span{display:inline-flex;align-items:center;gap:4px}.curve-footer i{width:8px;height:8px;border-radius:50%}.quality-note{margin-left:auto;max-width:560px;line-height:1.45;text-align:right}.editor-actions,.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}.parameter-alert{margin-top:12px}@media(max-width:1100px){.model-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.settings-grid,.validation-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.weight-panels{grid-template-columns:1fr}.quality-note{margin-left:0;text-align:left}}@media(max-width:700px){.emotion-model-page{padding:14px}.topbar{flex-direction:column}.model-grid,.settings-grid,.validation-grid,.weight-list{grid-template-columns:1fr}.curve-footer{align-items:flex-start;flex-direction:column;gap:6px}.quality-note{max-width:none}}
 </style>

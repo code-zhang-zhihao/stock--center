@@ -11,6 +11,10 @@ from app.modules.market_data.entity_history_backfill import (
     SectorDailyFactsBackfillService,
 )
 from app.modules.market_data.history_backfill import StockDailyBackfillRequest, StockDailyBackfillService
+from app.modules.market_data.market_north_flow_backfill import (
+    MarketNorthFlowBackfillRequest,
+    MarketNorthFlowBackfillService,
+)
 from app.modules.market_data.repository import MarketDataRepository
 from app.modules.market_data.sync_service import (
     CORE_INDEX_DEFINITIONS,
@@ -359,6 +363,80 @@ class SyncIndexCatalogHandler:
             result = await service.sync_index_catalog(payload)
         return JobResult(
             affected_rows=result.index_count + result.component_count,
+            summary=result.model_dump(mode="json"),
+        )
+
+
+class BackfillMarketNorthFlowHandler:
+    """Backfill the compact market-level northbound flow fact before V2 calibration."""
+
+    job_code = "backfill_market_north_flow"
+    job_type = "market_data"
+    parameter_schema = {
+        "start_date": {
+            "label": "开始日期",
+            "type": "string",
+            "required": False,
+            "description": "与结束日期一起指定精确回填区间；为空时按最近已有个股日线向前取交易日数。",
+        },
+        "end_date": {
+            "label": "结束日期",
+            "type": "string",
+            "required": False,
+            "description": "为空时使用最近已有个股日线的交易日。仅填结束日期时仍按交易日数向前回填。",
+        },
+        "trade_days": {
+            "label": "回填交易日数",
+            "type": "number",
+            "default": 250,
+            "required": False,
+            "min": 60,
+            "max": 1000,
+            "description": "未指定开始日期时，回填最近多少个已有个股日线的交易日；V2 默认基线使用 250。",
+        },
+        "only_missing": {
+            "label": "只补缺失",
+            "type": "boolean",
+            "default": True,
+            "required": False,
+            "description": "跳过已存在且 north_money 非空的日期；空值仍会重新请求并补齐。",
+        },
+        "request_window_trade_days": {
+            "label": "单次请求交易日数",
+            "type": "number",
+            "default": 120,
+            "required": False,
+            "min": 20,
+            "max": 250,
+            "description": "moneyflow_hsgt 的日期区间窗口。默认 250 日只需约 3 次请求，避免逐日调用。",
+        },
+        "fail_fast": {
+            "label": "遇错立即失败",
+            "type": "boolean",
+            "default": False,
+            "required": False,
+            "description": "关闭时，单个 Provider 区间失败会记录并继续其余窗口，便于后续 append_safe 重跑。",
+        },
+    }
+    default_payload = {
+        "start_date": None,
+        "end_date": None,
+        "trade_days": 250,
+        "only_missing": True,
+        "request_window_trade_days": 120,
+        "fail_fast": False,
+    }
+    force_async = True
+
+    async def run(self, context: JobExecutionContext) -> JobResult:
+        payload = MarketNorthFlowBackfillRequest(**{**self.default_payload, **context.payload})
+        result = await MarketNorthFlowBackfillService(get_sessionmaker()).run(
+            payload,
+            progress_reporter=context.report_progress,
+        )
+        return JobResult(
+            status="success" if result.target_trade_date_count else "skipped",
+            affected_rows=result.upserted_rows,
             summary=result.model_dump(mode="json"),
         )
 
@@ -1137,6 +1215,7 @@ def register_market_data_jobs() -> None:
     job_handler_registry.register(SyncTradeCalendarHandler())
     job_handler_registry.register(SyncStockBasicHandler())
     job_handler_registry.register(SyncIndexCatalogHandler())
+    job_handler_registry.register(BackfillMarketNorthFlowHandler())
     job_handler_registry.register(BackfillStockDailyFactsHandler())
     job_handler_registry.register(BackfillStockDailyFactorsHandler())
     job_handler_registry.register(BackfillSectorDailyFactsHandler())

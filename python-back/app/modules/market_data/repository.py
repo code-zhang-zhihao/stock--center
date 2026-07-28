@@ -1126,6 +1126,24 @@ class MarketDataRepository:
             conflict_attrs=["trade_date", "source"],
         )
 
+    async def existing_complete_market_north_flow_dates(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        source: str,
+    ) -> set[date]:
+        """Return dates with the score-relevant north-money field present."""
+        rows = await self.session.execute(
+            select(MarketNorthFlowDaily.trade_date).where(
+                MarketNorthFlowDaily.source == source,
+                MarketNorthFlowDaily.trade_date >= start_date,
+                MarketNorthFlowDaily.trade_date <= end_date,
+                MarketNorthFlowDaily.north_money.is_not(None),
+            )
+        )
+        return set(rows.scalars().all())
+
     async def upsert_margin_summary_rows(self, rows: list[dict]) -> int:
         return await self.upsert_rows(
             MarginSummaryDaily,

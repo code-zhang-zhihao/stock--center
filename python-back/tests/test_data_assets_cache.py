@@ -195,6 +195,45 @@ def test_redis_set_json_writes_when_remote_client_is_available(monkeypatch) -> N
     asyncio.run(run())
 
 
+def test_redis_bulk_json_writes_tickflow_depth_timestamp_as_iso_string(monkeypatch) -> None:
+    class Pipeline:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def set(self, key, value, *, ex):
+            self.calls.append(("set", key, value, ex))
+
+        async def execute(self):
+            self.calls.append(("execute",))
+
+    class RemoteClient:
+        def __init__(self) -> None:
+            self.pipeline_instance = Pipeline()
+
+        def pipeline(self, *, transaction):
+            assert transaction is True
+            return self.pipeline_instance
+
+    async def run() -> None:
+        client = RedisClient()
+        remote = RemoteClient()
+
+        async def get_client():
+            return remote
+
+        monkeypatch.setattr(client, "_get_client", get_client)
+        depth_time = datetime(2026, 7, 28, 10, 14, 20, tzinfo=timezone.utc)
+        assert await client.set_many_json(
+            [("realtime:depth:300663", {"depth_time": depth_time}, 30)]
+        ) is True
+        assert remote.pipeline_instance.calls == [
+            ("set", "realtime:depth:300663", '{"depth_time": "2026-07-28T10:14:20+00:00"}', 30),
+            ("execute",),
+        ]
+
+    asyncio.run(run())
+
+
 def test_redis_incremental_hash_cache_merges_only_changed_minute_fields(monkeypatch) -> None:
     async def run() -> None:
         client = RedisClient()

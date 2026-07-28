@@ -1,15 +1,45 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime, time as clock_time
+from decimal import Decimal
+from enum import Enum
 import json
 import logging
 import time
 from typing import Any
+from uuid import UUID
 
 from app.core.config import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _json_default(value: Any) -> Any:
+    """Encode cache values with the same public representation as API JSON.
+
+    Provider adapters intentionally retain typed timestamps (notably TickFlow
+    depth ``depth_time``) until they cross an I/O boundary.  Redis is that
+    boundary: converting here keeps the realtime cache generic and prevents a
+    single datetime from aborting an otherwise valid pipeline write.
+    """
+    if isinstance(value, (datetime, date, clock_time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, UUID):
+        return str(value)
+    item = getattr(value, "item", None)
+    if callable(item):
+        return item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _json_dumps(value: dict | list) -> str:
+    return json.dumps(value, ensure_ascii=False, default=_json_default)
 
 
 @dataclass(frozen=True)
@@ -88,7 +118,7 @@ class RedisClient:
             self._memory_set(key, value, ttl_seconds=ttl_seconds)
             return True
         try:
-            await client.set(key, json.dumps(value, ensure_ascii=False), ex=max(1, ttl_seconds))
+            await client.set(key, _json_dumps(value), ex=max(1, ttl_seconds))
             return True
         except Exception as exc:
             logger.warning("redis set_json failed: key=%s error=%s", key, exc)
@@ -112,7 +142,7 @@ class RedisClient:
         try:
             pipeline = client.pipeline(transaction=True)
             for key, value, ttl_seconds in items:
-                pipeline.set(key, json.dumps(value, ensure_ascii=False), ex=max(1, ttl_seconds))
+                pipeline.set(key, _json_dumps(value), ex=max(1, ttl_seconds))
             await pipeline.execute()
             return True
         except Exception as exc:
@@ -135,7 +165,7 @@ class RedisClient:
             return True
         try:
             pipeline = client.pipeline(transaction=True)
-            pipeline.hset(key, mapping={field: json.dumps(value, ensure_ascii=False) for field, value in fields.items()})
+            pipeline.hset(key, mapping={field: _json_dumps(value) for field, value in fields.items()})
             pipeline.expire(key, max(1, ttl_seconds))
             await pipeline.execute()
             return True
@@ -163,7 +193,7 @@ class RedisClient:
         try:
             pipeline = client.pipeline(transaction=True)
             for key, fields, ttl_seconds in filtered:
-                pipeline.hset(key, mapping={field: json.dumps(value, ensure_ascii=False) for field, value in fields.items()})
+                pipeline.hset(key, mapping={field: _json_dumps(value) for field, value in fields.items()})
                 pipeline.expire(key, max(1, ttl_seconds))
             await pipeline.execute()
             return True

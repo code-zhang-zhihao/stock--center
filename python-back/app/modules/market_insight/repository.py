@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import Date, and_, cast, func, or_, select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import Date, and_, bindparam, cast, func, or_, select, text
+from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import (
@@ -65,6 +66,27 @@ class MarketInsightRepository:
                 )
             ).scalars().all()
         )
+
+    async def open_trade_dates_before(self, *, before_date: date, limit: int) -> list[date]:
+        """Return at most ``limit`` CN open dates strictly before a date.
+
+        V2 baseline scoring only needs the percentile lookback before its
+        first target date.  Reading a calendar-sized pre-window (previously
+        620 natural days) made the initial aggregate unnecessarily large.
+        """
+        if limit <= 0:
+            return []
+        rows = await self.session.execute(
+            select(TradeCalendar.trade_date)
+            .where(
+                TradeCalendar.market == "CN",
+                TradeCalendar.is_open.is_(True),
+                TradeCalendar.trade_date < before_date,
+            )
+            .order_by(TradeCalendar.trade_date.desc())
+            .limit(limit)
+        )
+        return list(reversed(rows.scalars().all()))
 
     async def active_stock_count(self) -> int:
         return int(
@@ -766,104 +788,100 @@ class MarketInsightRepository:
         )
         return list(reversed(rows.scalars().all()))
 
-    async def v2_market_metrics(self, trade_dates: list[date]) -> dict[date, dict]:
+    async def v2_market_metrics(
+        self,
+        trade_dates: list[date],
+        *,
+        progress_reporter: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> dict[date, dict]:
         """Aggregate V2 inputs from a listing-day-aware eligible universe.
 
-        The sixth and twentieth open dates are correlated lookups against the
-        CN trade calendar.  This keeps the "exclude first five trading days"
-        rule exact without running a full-history row-number window for every
-        daily calculation.  Only a short pre-window is read for the 20-day
-        high/low window.
+        The sixth and twentieth open dates are resolved once per eligible
+        stock.  The market aggregate itself only reads the requested dates;
+        20-day high/low uses the existing ``(stock_code, trade_date DESC)``
+        index through a bounded LATERAL lookup.  It must not sort a broad
+        history range with a window function for every calibration run.
         """
         if not trade_dates:
             return {}
-        min_date = min(trade_dates)
-        max_date = max(trade_dates)
+        # Resolve listing-day cutoffs once per eligible stock.  Keeping the
+        # correlated trade-calendar lookup inside a DailyBar history scan made
+        # PostgreSQL execute it against millions of rows during calibration.
         sixth_open_date = self._open_date_after_listing(offset=5)
         twentieth_open_date = self._open_date_after_listing(offset=19)
-        ranked_bars = (
+        eligible_stocks = (
+            select(
+                Stock.stock_code.label("stock_code"),
+                sixth_open_date.label("sixth_open_date"),
+                twentieth_open_date.label("twentieth_open_date"),
+            )
+            .where(Stock.list_date.is_not(None), *_active_stock_filters())
+            .cte("v2_eligible_stocks")
+        )
+        target_bars = (
             select(
                 DailyBar.stock_code.label("stock_code"),
                 DailyBar.trade_date.label("trade_date"),
-                DailyBar.open_price.label("open_price"),
-                DailyBar.high_price.label("high_price"),
-                DailyBar.low_price.label("low_price"),
                 DailyBar.close_price.label("close_price"),
                 DailyBar.change_pct.label("change_pct"),
                 DailyBar.amount_yuan.label("amount_yuan"),
-                twentieth_open_date.label("twentieth_open_date"),
-                func.max(DailyBar.close_price)
-                .over(partition_by=DailyBar.stock_code, order_by=DailyBar.trade_date, rows=(-19, 0))
-                .label("high_20"),
-                func.min(DailyBar.close_price)
-                .over(partition_by=DailyBar.stock_code, order_by=DailyBar.trade_date, rows=(-19, 0))
-                .label("low_20"),
+                eligible_stocks.c.twentieth_open_date.label("twentieth_open_date"),
             )
-            .join(Stock, Stock.stock_code == DailyBar.stock_code)
+            .select_from(DailyBar)
+            .join(eligible_stocks, eligible_stocks.c.stock_code == DailyBar.stock_code)
             .where(
-                DailyBar.trade_date >= min_date - timedelta(days=60),
-                DailyBar.trade_date <= max_date,
-                Stock.list_date.is_not(None),
-                DailyBar.trade_date >= sixth_open_date,
-                *_active_stock_filters(),
+                DailyBar.trade_date.in_(trade_dates),
+                DailyBar.trade_date >= eligible_stocks.c.sixth_open_date,
             )
-            .cte("v2_ranked_bars")
+            .cte("v2_target_bars")
         )
         rows = await self.session.execute(
             select(
-                ranked_bars.c.trade_date.label("trade_date"),
+                target_bars.c.trade_date.label("trade_date"),
                 func.count().label("daily_bar_count"),
-                func.count().filter(ranked_bars.c.change_pct > 0).label("up_count"),
-                func.count().filter(ranked_bars.c.change_pct < 0).label("down_count"),
-                func.count().filter(ranked_bars.c.change_pct == 0).label("flat_count"),
-                func.count().filter(ranked_bars.c.change_pct >= 5).label("wide_up_count"),
-                func.count().filter(ranked_bars.c.change_pct <= -5).label("wide_down_count"),
-                func.avg(ranked_bars.c.change_pct).label("average_change_pct"),
-                func.percentile_cont(0.5).within_group(ranked_bars.c.change_pct.asc()).label("median_change_pct"),
-                func.sum(ranked_bars.c.amount_yuan).label("total_amount_yuan"),
+                func.count().filter(target_bars.c.change_pct > 0).label("up_count"),
+                func.count().filter(target_bars.c.change_pct < 0).label("down_count"),
+                func.count().filter(target_bars.c.change_pct == 0).label("flat_count"),
+                func.count().filter(target_bars.c.change_pct >= 5).label("wide_up_count"),
+                func.count().filter(target_bars.c.change_pct <= -5).label("wide_down_count"),
+                func.avg(target_bars.c.change_pct).label("average_change_pct"),
+                func.percentile_cont(0.5).within_group(target_bars.c.change_pct.asc()).label("median_change_pct"),
+                func.sum(target_bars.c.amount_yuan).label("total_amount_yuan"),
                 func.sum(StockFundFlowDaily.main_net_inflow).label("main_net_inflow"),
                 func.avg(StockFundFlowDaily.main_net_ratio).label("main_net_ratio"),
-                func.count().filter(ranked_bars.c.close_price >= StockFactorDaily.ma20).label("above_ma20_count"),
-                func.count().filter(ranked_bars.c.close_price >= StockFactorDaily.ma60).label("above_ma60_count"),
+                func.count().filter(target_bars.c.close_price >= StockFactorDaily.ma20).label("above_ma20_count"),
+                func.count().filter(target_bars.c.close_price >= StockFactorDaily.ma60).label("above_ma60_count"),
                 func.count(StockFactorDaily.id).label("factor_count"),
-                func.count().filter(ranked_bars.c.trade_date >= ranked_bars.c.twentieth_open_date).label("twenty_day_stock_count"),
-                func.count().filter(
-                    and_(ranked_bars.c.trade_date >= ranked_bars.c.twentieth_open_date, ranked_bars.c.close_price >= ranked_bars.c.high_20)
-                ).label("new_high_20_count"),
-                func.count().filter(
-                    and_(ranked_bars.c.trade_date >= ranked_bars.c.twentieth_open_date, ranked_bars.c.close_price <= ranked_bars.c.low_20)
-                ).label("new_low_20_count"),
                 func.avg(StockFactorDaily.volatility_20d).label("volatility_20d"),
                 func.avg(StockFactorDaily.amount_ratio).label("amount_ratio"),
                 func.avg(StockDailyBasic.turnover_rate).label("turnover_rate"),
             )
-            .select_from(ranked_bars)
+            .select_from(target_bars)
             .outerjoin(
                 StockFundFlowDaily,
                 and_(
-                    StockFundFlowDaily.stock_code == ranked_bars.c.stock_code,
-                    StockFundFlowDaily.trade_date == ranked_bars.c.trade_date,
+                    StockFundFlowDaily.stock_code == target_bars.c.stock_code,
+                    StockFundFlowDaily.trade_date == target_bars.c.trade_date,
                 ),
             )
             .outerjoin(
                 StockFactorDaily,
                 and_(
-                    StockFactorDaily.stock_code == ranked_bars.c.stock_code,
-                    StockFactorDaily.trade_date == ranked_bars.c.trade_date,
+                    StockFactorDaily.stock_code == target_bars.c.stock_code,
+                    StockFactorDaily.trade_date == target_bars.c.trade_date,
                     StockFactorDaily.source == "system:daily_close",
                 ),
             )
             .outerjoin(
                 StockDailyBasic,
                 and_(
-                    StockDailyBasic.stock_code == ranked_bars.c.stock_code,
-                    StockDailyBasic.trade_date == ranked_bars.c.trade_date,
+                    StockDailyBasic.stock_code == target_bars.c.stock_code,
+                    StockDailyBasic.trade_date == target_bars.c.trade_date,
                 ),
             )
-            .where(ranked_bars.c.trade_date.in_(trade_dates))
-            .group_by(ranked_bars.c.trade_date)
+            .group_by(target_bars.c.trade_date)
         )
-        return {
+        result = {
             row.trade_date: {
                 "daily_bar_count": int(row.daily_bar_count or 0),
                 "up_count": int(row.up_count or 0),
@@ -879,15 +897,112 @@ class MarketInsightRepository:
                 "above_ma20_count": int(row.above_ma20_count or 0),
                 "above_ma60_count": int(row.above_ma60_count or 0),
                 "factor_count": int(row.factor_count or 0),
-                "twenty_day_stock_count": int(row.twenty_day_stock_count or 0),
-                "new_high_20_count": int(row.new_high_20_count or 0),
-                "new_low_20_count": int(row.new_low_20_count or 0),
+                "twenty_day_stock_count": 0,
+                "new_high_20_count": 0,
+                "new_low_20_count": 0,
                 "volatility_20d": _float_or_none(row.volatility_20d),
                 "amount_ratio": _float_or_none(row.amount_ratio),
                 "turnover_rate": _float_or_none(row.turnover_rate),
             }
             for row in rows
         }
+        # A per-target LATERAL lookup reads no more than twenty rows through
+        # DailyBar's stock/date index.  Keep this compact PostgreSQL shape
+        # explicit: SQLAlchemy's nested correlation form can instead
+        # materialise the target CTE repeatedly on some PostgreSQL versions.
+        high_low_statement = text(
+            """
+            WITH eligible AS MATERIALIZED (
+                SELECT
+                    stock.stock_code,
+                    (
+                        SELECT calendar.trade_date
+                        FROM t_trade_calendar AS calendar
+                        WHERE calendar.market = 'CN'
+                          AND calendar.is_open = TRUE
+                          AND calendar.trade_date >= stock.list_date
+                        ORDER BY calendar.trade_date
+                        OFFSET 5 LIMIT 1
+                    ) AS sixth_open_date,
+                    (
+                        SELECT calendar.trade_date
+                        FROM t_trade_calendar AS calendar
+                        WHERE calendar.market = 'CN'
+                          AND calendar.is_open = TRUE
+                          AND calendar.trade_date >= stock.list_date
+                        ORDER BY calendar.trade_date
+                        OFFSET 19 LIMIT 1
+                    ) AS twentieth_open_date
+                FROM t_stock AS stock
+                WHERE stock.list_date IS NOT NULL
+                  AND stock.status = 'active'
+                  AND stock.is_st = FALSE
+                  AND stock.exchange IN ('SH', 'SZ', 'SSE', 'SZSE')
+            ), target AS MATERIALIZED (
+                SELECT bar.stock_code, bar.trade_date, bar.close_price, eligible.twentieth_open_date
+                FROM t_daily_bar AS bar
+                JOIN eligible ON eligible.stock_code = bar.stock_code
+                WHERE bar.trade_date = ANY(:trade_dates)
+                  AND bar.trade_date >= eligible.sixth_open_date
+            )
+            SELECT
+                target.trade_date,
+                count(*) FILTER (WHERE target.trade_date >= target.twentieth_open_date) AS twenty_day_stock_count,
+                count(*) FILTER (
+                    WHERE target.trade_date >= target.twentieth_open_date
+                      AND target.close_price >= high_low.high_20
+                ) AS new_high_20_count,
+                count(*) FILTER (
+                    WHERE target.trade_date >= target.twentieth_open_date
+                      AND target.close_price <= high_low.low_20
+                ) AS new_low_20_count
+            FROM target
+            JOIN LATERAL (
+                SELECT max(sample.close_price) AS high_20, min(sample.close_price) AS low_20
+                FROM (
+                    SELECT history.close_price
+                    FROM t_daily_bar AS history
+                    WHERE history.stock_code = target.stock_code
+                      AND history.trade_date <= target.trade_date
+                    ORDER BY history.trade_date DESC
+                    LIMIT 20
+                ) AS sample
+            ) AS high_low ON TRUE
+            GROUP BY target.trade_date
+            """
+        ).bindparams(bindparam("trade_dates", type_=ARRAY(Date())))
+        # Limit the index-probe part to 20 trade dates at a time.  This keeps
+        # memory and one database statement bounded on the remote PostgreSQL
+        # instance; a 370-date baseline can therefore surface progress every
+        # short batch rather than appearing stuck in a single giant query.
+        high_low_batch_size = 20
+        high_low_batch_total = (len(trade_dates) + high_low_batch_size - 1) // high_low_batch_size
+        for offset in range(0, len(trade_dates), high_low_batch_size):
+            high_low_batch_index = offset // high_low_batch_size + 1
+            high_low_rows = await self.session.execute(
+                high_low_statement,
+                {"trade_dates": trade_dates[offset : offset + high_low_batch_size]},
+            )
+            for row in high_low_rows:
+                if row.trade_date not in result:
+                    continue
+                result[row.trade_date].update(
+                    {
+                        "twenty_day_stock_count": int(row.twenty_day_stock_count or 0),
+                        "new_high_20_count": int(row.new_high_20_count or 0),
+                        "new_low_20_count": int(row.new_low_20_count or 0),
+                    }
+                )
+            if progress_reporter is not None:
+                await progress_reporter(
+                    {
+                        "subphase": "twenty_day_high_low",
+                        "high_low_batch_index": high_low_batch_index,
+                        "high_low_batch_total": high_low_batch_total,
+                        "high_low_batch_trade_date_count": len(trade_dates[offset : offset + high_low_batch_size]),
+                    }
+                )
+        return result
 
     async def v2_limit_event_rows(self, trade_dates: list[date]) -> dict[date, list[dict]]:
         if not trade_dates:

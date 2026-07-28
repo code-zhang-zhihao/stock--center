@@ -1,6 +1,8 @@
 from datetime import date
+from types import SimpleNamespace
 
 from app.modules.market_insight.emotion_service import (
+    MarketEmotionService,
     _auxiliary_state,
     _forward_validation,
     _is_one_word_limit,
@@ -87,3 +89,96 @@ def test_calibration_forward_validation_is_separate_from_score_inputs():
     assert validation["t_plus_1"]["high_short_score_average_breadth_pct"] == 66
     assert validation["t_plus_3"]["sample_count"] == 1
     assert "不参与" in validation["note"]
+
+
+async def test_baseline_progress_serializes_trade_dates_for_jsonb():
+    class Repository:
+        values = None
+        committed = False
+
+        async def update_emotion_model(self, _model, values):
+            self.values = values
+
+        async def commit(self):
+            self.committed = True
+
+    repository = Repository()
+    service = MarketEmotionService(repository)
+
+    await service._set_baseline_progress(
+        SimpleNamespace(),
+        phase="loading_inputs",
+        first_trade_date=date(2025, 7, 16),
+        last_trade_date=date(2026, 7, 27),
+    )
+
+    assert repository.values == {
+        "status": "calibrating",
+        "calibration_summary": {
+            "status": "running",
+            "phase": "loading_inputs",
+            "first_trade_date": "2025-07-16",
+            "last_trade_date": "2026-07-27",
+        },
+    }
+    assert repository.committed is True
+
+
+async def test_emotion_read_allows_full_calibration_curve_but_bounds_history_limit():
+    model = SimpleNamespace(
+        model_code="test_model",
+        model_name="测试模型",
+        status="ready",
+        percentile_window_days=120,
+        minimum_history_days=60,
+        baseline_trade_days=250,
+        parameter_json={},
+        calibration_summary={},
+        published_at=None,
+        updated_at=None,
+    )
+    row = SimpleNamespace(
+        trade_date=date(2026, 7, 27),
+        model_code="test_model",
+        status="ready",
+        short_term_score=70.0,
+        market_risk_on_score=60.0,
+        primary_stage_code="active",
+        auxiliary_state_code="trial",
+        metrics={},
+        scorecards={},
+        stage_evidence=[],
+        coverage={},
+        parameter_snapshot={},
+        external_confirmations={},
+        calculated_at=None,
+    )
+
+    class Repository:
+        history_limit = None
+
+        async def get_emotion_model(self, _model_code):
+            return model
+
+        async def emotion_daily(self, **_kwargs):
+            return row
+
+        async def emotion_history(self, *, model_code, limit):
+            assert model_code == "test_model"
+            self.history_limit = limit
+            return [row]
+
+    repository = Repository()
+    payload = await MarketEmotionService(repository).read(model_code="test_model", history_limit=5000)
+
+    assert repository.history_limit == 1000
+    assert payload["trend"] == [
+        {
+            "trade_date": "2026-07-27",
+            "short_term_score": 70.0,
+            "market_risk_on_score": 60.0,
+            "primary_stage_code": "active",
+            "auxiliary_state_code": "trial",
+            "status": "ready",
+        }
+    ]

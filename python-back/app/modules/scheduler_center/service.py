@@ -263,11 +263,31 @@ class SchedulerService:
         handler = job_handler_registry.get(job.job_code)
         if handler is None:
             raise SchedulerError("job_handler_not_found", f"job handler not found: {job.job_code}")
+
+        async def report_progress(progress: dict) -> None:
+            """Store the latest progress without making it a job dependency."""
+            try:
+                run = await self.repository.get_run(run_id)
+                if run is None or run.status != "running":
+                    return
+                summary = dict(run.result_summary or {})
+                summary["progress"] = jsonable_encoder(progress)
+                await self.repository.update_run(run_id, {"result_summary": summary})
+                await self.repository.commit()
+            except Exception as exc:  # pragma: no cover - diagnostic path only
+                logger.warning(
+                    "scheduler progress write skipped: run_id=%s job_code=%s error=%s",
+                    run_id,
+                    job.job_code,
+                    exc,
+                )
+
         context = JobExecutionContext(
             run_id=run_id,
             job_code=job.job_code,
             trigger_source=trigger_source,
             payload=payload,
+            progress_reporter=report_progress,
         )
         timeout_seconds = int(job.timeout_seconds or 0)
         if timeout_seconds > 0:
@@ -284,13 +304,21 @@ class SchedulerService:
         error_message: str | None = None,
         result_summary: dict | None = None,
     ) -> SchedulerRunRead:
+        # A timeout/cancellation has no final JobResult.  Preserve the last
+        # handler checkpoint so the task center can show where it stopped.
+        if result_summary is None:
+            try:
+                existing = await self.repository.get_run(run_id)
+                result_summary = dict(existing.result_summary or {}) if existing else {}
+            except Exception:
+                result_summary = {}
         values = {
             "status": status,
             "affected_rows": affected_rows,
             "finished_at": datetime.now(timezone.utc),
             "error_code": error_code,
             "error_message": error_message,
-            "result_summary": jsonable_encoder(result_summary or {}),
+            "result_summary": jsonable_encoder(result_summary),
         }
         try:
             row = await self._finish_run_with_repository(self.repository, run_id, values)

@@ -12,7 +12,10 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, timedelta
 from statistics import mean
-from typing import Any, Iterable
+from time import perf_counter
+from typing import Any, Awaitable, Callable, Iterable
+
+from fastapi.encoders import jsonable_encoder
 
 from app.modules.market_insight.models import MarketEmotionDaily, MarketEmotionModel
 from app.modules.market_insight.repository import MarketInsightRepository
@@ -111,6 +114,7 @@ class MarketEmotionService:
         trade_date: date | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
+        progress_reporter: Callable[[dict], Awaitable[None]] | None = None,
     ) -> EmotionCalculation:
         if mode not in {"daily", "baseline"}:
             raise ValueError("emotion_mode 只能为 daily 或 baseline")
@@ -126,17 +130,40 @@ class MarketEmotionService:
         if not target_dates:
             return EmotionCalculation(model.model_code, mode, [], [], 0)
 
-        # Baselines need a long pre-window.  Daily runs reuse the immutable
-        # V2 metric history already persisted by that baseline and only read a
-        # bounded context for board streaks, theme continuity and the 5-day
-        # amount comparison.
-        context_days = 620 if mode == "baseline" else 180
-        context_dates = await self.repository.open_trade_dates_between(
-            start_date=target_dates[0] - timedelta(days=context_days),
-            end_date=target_dates[-1],
+        # The baseline needs exactly one percentile window before its first
+        # target date, not a broad calendar-sized pre-window.  The old 620
+        # natural-day range caused every input aggregate to read hundreds of
+        # unnecessary dates before any progress could be persisted.
+        lookback_trade_days = int(model.percentile_window_days) if mode == "baseline" else 21
+        context_dates = await self.repository.open_trade_dates_before(
+            before_date=target_dates[0],
+            limit=lookback_trade_days,
         )
-        all_dates = list(dict.fromkeys(context_dates))
-        inputs = await self._load_inputs(all_dates)
+        all_dates = list(dict.fromkeys([*context_dates, *target_dates]))
+        if mode == "baseline":
+            await self._set_baseline_progress(
+                model,
+                phase="loading_inputs",
+                target_total=len(target_dates),
+                target_completed=0,
+                context_trade_days=len(context_dates),
+                first_trade_date=target_dates[0],
+                last_trade_date=target_dates[-1],
+            )
+        await self._report_progress(
+            progress_reporter,
+            {
+                "phase": "loading_inputs",
+                "mode": mode,
+                "target_total": len(target_dates),
+                "target_completed": 0,
+                "context_trade_days": len(context_dates),
+                "input_trade_days": len(all_dates),
+                "first_trade_date": target_dates[0].isoformat(),
+                "last_trade_date": target_dates[-1].isoformat(),
+            },
+        )
+        inputs = await self._load_inputs(all_dates, mode=mode, progress_reporter=progress_reporter)
         active_stock_count = await self.repository.active_stock_count()
         raw_by_date = _build_raw_metrics(all_dates=all_dates, inputs=inputs)
         completion = inputs["completion"]
@@ -159,6 +186,9 @@ class MarketEmotionService:
             [float(row.short_term_score) for row in existing if row.short_term_score is not None], maxlen=5
         )
         rows: list[dict] = []
+        pending_upsert: list[dict] = []
+        upserted = 0
+        completed_targets = 0
         for current_date in all_dates:
             raw = raw_by_date.get(current_date, {})
             if current_date in target_set:
@@ -174,6 +204,8 @@ class MarketEmotionService:
                     external_confirmations=inputs["external_confirmations"],
                 )
                 rows.append(row)
+                pending_upsert.append(row)
+                completed_targets += 1
                 if row["short_term_score"] is not None:
                     prior_short_scores.append(float(row["short_term_score"]))
             if mode == "baseline" or current_date in target_set:
@@ -182,12 +214,32 @@ class MarketEmotionService:
                     if numeric is not None:
                         historical_metrics[key].append(numeric)
 
-        # Baseline execution deliberately commits in short date chunks.  This
-        # bounds one upsert transaction and makes manual runs observable.
-        upserted = 0
-        for offset in range(0, len(rows), 20):
-            upserted += await self.repository.upsert_emotion_daily_rows(rows[offset : offset + 20])
+            # Keep the write transaction bounded and expose a genuine
+            # checkpoint.  A timeout after a later batch now leaves useful
+            # immutable rows and an exact resume point rather than 0 rows.
+            if len(pending_upsert) >= 20:
+                upserted += await self.repository.upsert_emotion_daily_rows(pending_upsert)
+                await self.repository.commit()
+                pending_upsert.clear()
+                await self._checkpoint_progress(
+                    model=model,
+                    mode=mode,
+                    progress_reporter=progress_reporter,
+                    completed_targets=completed_targets,
+                    target_total=len(target_dates),
+                    upserted_rows=upserted,
+                )
+        if pending_upsert:
+            upserted += await self.repository.upsert_emotion_daily_rows(pending_upsert)
             await self.repository.commit()
+            await self._checkpoint_progress(
+                model=model,
+                mode=mode,
+                progress_reporter=progress_reporter,
+                completed_targets=completed_targets,
+                target_total=len(target_dates),
+                upserted_rows=upserted,
+            )
 
         calibration_summary = None
         if mode == "baseline":
@@ -207,7 +259,13 @@ class MarketEmotionService:
             await self.repository.commit()
         return EmotionCalculation(model.model_code, mode, target_dates, rows, upserted, calibration_summary)
 
-    async def read(self, *, trade_date: date | None = None, model_code: str | None = None) -> dict:
+    async def read(
+        self,
+        *,
+        trade_date: date | None = None,
+        model_code: str | None = None,
+        history_limit: int = 60,
+    ) -> dict:
         model = await (self.repository.get_emotion_model(model_code) if model_code else self.repository.active_emotion_model())
         if model is None:
             return {
@@ -223,7 +281,11 @@ class MarketEmotionService:
                 "model": serialize_emotion_model(model),
                 "trade_date": trade_date.isoformat() if trade_date else None,
             }
-        history = await self.repository.emotion_history(model_code=model.model_code, limit=60)
+        # The post-close page keeps its compact 60-day default.  The model
+        # center requests the calibrated baseline (up to 1,000 days) so its
+        # curve is a validation view rather than a misleading short excerpt.
+        normalized_history_limit = max(20, min(int(history_limit), 1000))
+        history = await self.repository.emotion_history(model_code=model.model_code, limit=normalized_history_limit)
         payload = serialize_emotion_daily(row)
         return {
             "available": row.status in {"ready", "degraded"},
@@ -346,17 +408,118 @@ class MarketEmotionService:
         )
         return dates[-int(model.baseline_trade_days) :]
 
-    async def _load_inputs(self, all_dates: list[date]) -> dict[str, Any]:
-        return {
-            "market": await self.repository.v2_market_metrics(all_dates),
-            "events": await self.repository.v2_limit_event_rows(all_dates),
-            "completion": await self.repository.limit_event_completion_capabilities(all_dates),
-            "premiums": await self.repository.previous_limit_up_premiums(all_dates),
-            "themes": await self.repository.v2_theme_metrics(all_dates),
-            "north": await self.repository.v2_north_flows(all_dates),
-            "indices": await self.repository.v2_index_metrics(all_dates),
-            "external_confirmations": await self.repository.v2_external_confirmations(up_to=all_dates[-1]),
+    async def _load_inputs(
+        self,
+        all_dates: list[date],
+        *,
+        mode: str,
+        progress_reporter: Callable[[dict], Awaitable[None]] | None,
+    ) -> dict[str, Any]:
+        """Load V2 fact blocks sequentially and make each block observable.
+
+        A single AsyncSession must not execute these aggregates concurrently.
+        The checkpoints identify the exact slow block without compromising the
+        existing transaction/session model.
+        """
+        async def market_progress(progress: dict) -> None:
+            await self._report_progress(
+                progress_reporter,
+                {
+                    "phase": "loading_inputs",
+                    "mode": mode,
+                    "current_block": "market",
+                    "block_index": 1,
+                    "block_total": 8,
+                    "input_trade_days": len(all_dates),
+                    **progress,
+                },
+            )
+
+        loaders: tuple[tuple[str, Callable[[], Awaitable[Any]]], ...] = (
+            (
+                "market",
+                lambda: self.repository.v2_market_metrics(all_dates, progress_reporter=market_progress),
+            ),
+            ("events", lambda: self.repository.v2_limit_event_rows(all_dates)),
+            ("completion", lambda: self.repository.limit_event_completion_capabilities(all_dates)),
+            ("premiums", lambda: self.repository.previous_limit_up_premiums(all_dates)),
+            ("themes", lambda: self.repository.v2_theme_metrics(all_dates)),
+            ("north", lambda: self.repository.v2_north_flows(all_dates)),
+            ("indices", lambda: self.repository.v2_index_metrics(all_dates)),
+            ("external_confirmations", lambda: self.repository.v2_external_confirmations(up_to=all_dates[-1])),
+        )
+        inputs: dict[str, Any] = {}
+        for index, (block, loader) in enumerate(loaders, start=1):
+            await self._report_progress(
+                progress_reporter,
+                {
+                    "phase": "loading_inputs",
+                    "mode": mode,
+                    "current_block": block,
+                    "block_index": index,
+                    "block_total": len(loaders),
+                    "input_trade_days": len(all_dates),
+                },
+            )
+            started = perf_counter()
+            inputs[block] = await loader()
+            await self._report_progress(
+                progress_reporter,
+                {
+                    "phase": "loading_inputs",
+                    "mode": mode,
+                    "current_block": block,
+                    "block_index": index,
+                    "block_total": len(loaders),
+                    "block_status": "completed",
+                    "elapsed_ms": int((perf_counter() - started) * 1000),
+                    "input_trade_days": len(all_dates),
+                },
+            )
+        return inputs
+
+    async def _checkpoint_progress(
+        self,
+        *,
+        model: MarketEmotionModel,
+        mode: str,
+        progress_reporter: Callable[[dict], Awaitable[None]] | None,
+        completed_targets: int,
+        target_total: int,
+        upserted_rows: int,
+    ) -> None:
+        progress = {
+            "phase": "scoring_and_persisting",
+            "mode": mode,
+            "target_completed": completed_targets,
+            "target_total": target_total,
+            "upserted_rows": upserted_rows,
         }
+        if mode == "baseline":
+            await self._set_baseline_progress(model, **progress)
+        await self._report_progress(progress_reporter, progress)
+
+    async def _set_baseline_progress(self, model: MarketEmotionModel, **progress: Any) -> None:
+        # JSONB does not accept Python ``date`` objects.  The initial baseline
+        # checkpoint intentionally carries its first/last trade dates, so
+        # normalise the whole progress payload at this persistence boundary.
+        calibration_summary = jsonable_encoder({"status": "running", **progress})
+        await self.repository.update_emotion_model(
+            model,
+            {
+                "status": "calibrating",
+                "calibration_summary": calibration_summary,
+            },
+        )
+        await self.repository.commit()
+
+    @staticmethod
+    async def _report_progress(
+        progress_reporter: Callable[[dict], Awaitable[None]] | None,
+        progress: dict,
+    ) -> None:
+        if progress_reporter is not None:
+            await progress_reporter(progress)
 
 
 def default_emotion_parameters() -> dict:

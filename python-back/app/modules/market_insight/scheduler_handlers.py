@@ -91,6 +91,7 @@ class CalculateMarketDailySentimentHandler:
                     trade_date=_parse_date(payload.get("trade_date")),
                     start_date=_parse_date(payload.get("start_date")),
                     end_date=_parse_date(payload.get("end_date")),
+                    progress_reporter=context.report_progress,
                 )
                 return JobResult(
                     status="success" if emotion_result.ready_count else "skipped",
@@ -123,6 +124,7 @@ class CalculateMarketDailySentimentHandler:
                         trade_date=_parse_date(payload.get("trade_date")),
                         start_date=_parse_date(payload.get("start_date")),
                         end_date=_parse_date(payload.get("end_date")),
+                        progress_reporter=context.report_progress,
                     )
                     emotion_summary = emotion_result.summary()
                 except ValueError as exc:

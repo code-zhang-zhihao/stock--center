@@ -12,7 +12,7 @@ export const marketInsightApi = {
     url: '/market-insights/daily-review',
     params,
   }),
-  emotionDaily: (params?: { trade_date?: string; model_code?: string }) => requestData<MarketEmotionDaily>({
+  emotionDaily: (params?: { trade_date?: string; model_code?: string; history_limit?: number }) => requestData<MarketEmotionDaily>({
     method: 'GET',
     url: '/market-insights/emotion-daily',
     params,
