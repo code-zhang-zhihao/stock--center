@@ -285,7 +285,7 @@ class MarketEmotionService:
         # center requests the calibrated baseline (up to 1,000 days) so its
         # curve is a validation view rather than a misleading short excerpt.
         normalized_history_limit = max(20, min(int(history_limit), 1000))
-        history = await self.repository.emotion_history(model_code=model.model_code, limit=normalized_history_limit)
+        history = await self.repository.emotion_trend_history(model_code=model.model_code, limit=normalized_history_limit)
         payload = serialize_emotion_daily(row)
         return {
             "available": row.status in {"ready", "degraded"},
@@ -293,15 +293,79 @@ class MarketEmotionService:
             "model": serialize_emotion_model(model),
             "trend": [
                 {
-                    "trade_date": item.trade_date.isoformat(),
-                    "short_term_score": _number(item.short_term_score),
-                    "market_risk_on_score": _number(item.market_risk_on_score),
-                    "primary_stage_code": item.primary_stage_code,
-                    "auxiliary_state_code": item.auxiliary_state_code,
-                    "status": item.status,
+                    "trade_date": item["trade_date"].isoformat(),
+                    "short_term_score": _number(item["short_term_score"]),
+                    "market_risk_on_score": _number(item["market_risk_on_score"]),
+                    "primary_stage_code": item["primary_stage_code"],
+                    "auxiliary_state_code": item["auxiliary_state_code"],
+                    "status": item["status"],
                 }
                 for item in history
             ],
+        }
+
+    async def validation_preview(
+        self,
+        *,
+        model_code: str | None = None,
+        history_limit: int = 1000,
+    ) -> dict:
+        """Evaluate persisted scores against later settled market facts.
+
+        This is intentionally a read-only research view.  It uses the raw
+        inputs retained on each already-scored V2 row, so a revised canonical
+        fact cannot silently change an old validation result, and no future
+        observation can flow back into that date's score or stage.
+        """
+        model = await (
+            self.repository.get_emotion_model(model_code)
+            if model_code
+            else self.repository.active_emotion_model()
+        )
+        if model is None:
+            return {
+                "available": False,
+                "reason": "market_emotion_model_not_found",
+                "model_code": model_code,
+            }
+        normalized_history_limit = max(60, min(int(history_limit), 1000))
+        rows = await self.repository.emotion_validation_history(
+            model_code=model.model_code,
+            limit=normalized_history_limit,
+        )
+        if not rows:
+            return {
+                "available": False,
+                "reason": "market_emotion_not_calculated",
+                "model": serialize_emotion_model(model),
+            }
+
+        first_trade_date = rows[0]["trade_date"]
+        last_trade_date = rows[-1]["trade_date"]
+        calendar_dates = await self.repository.open_trade_dates_between(
+            start_date=first_trade_date,
+            end_date=last_trade_date,
+        )
+        raw_by_date = {
+            row["trade_date"]: {
+                "up_ratio_pct": _number(row.get("up_ratio_pct")),
+                "core_index_trend": _number(row.get("core_index_trend")),
+            }
+            for row in rows
+        }
+        validation = _forward_validation(
+            rows=rows,
+            target_dates=calendar_dates,
+            raw_by_date=raw_by_date,
+        )
+        return {
+            "available": bool(validation["eligible_score_days"]),
+            "model": serialize_emotion_model(model),
+            "history_start_trade_date": first_trade_date.isoformat(),
+            "history_end_trade_date": last_trade_date.isoformat(),
+            "stored_row_count": len(rows),
+            "calendar_trade_day_count": len(calendar_dates),
+            "validation": validation,
         }
 
     async def list_models(self) -> list[dict]:
@@ -831,55 +895,192 @@ def _calibration_summary(
 
 
 def _forward_validation(*, rows: list[dict], target_dates: list[date], raw_by_date: dict[date, dict]) -> dict:
-    """Summarise T+1/T+3 facts for calibration only.
+    """Summarise score-conditioned T+1/T+3 market outcomes.
 
-    This function is deliberately called after all score rows are built.  Its
-    forward observations never enter scorecards, percentiles or stage rules.
+    The forward path is built only after all score rows are constructed.  In
+    particular, T+3 is a three-trading-day *cumulative* equally weighted core
+    index change, rather than the unrelated change on only the third day.
+    Nothing returned here enters scorecards, percentiles or stage rules.
     """
     row_by_date = {row["trade_date"]: row for row in rows}
-    samples: dict[int, list[tuple[float, float | None, float | None]]] = {1: [], 3: []}
+    samples: dict[str, dict[int, list[dict[str, float | None]]]] = {
+        "short_term": {1: [], 3: []},
+        "risk_on": {1: [], 3: []},
+    }
+    eligible_score_days = 0
     for index, current_date in enumerate(target_dates):
         row = row_by_date.get(current_date)
         if not row or row.get("status") not in {"ready", "degraded"}:
             continue
-        score = _number(row.get("short_term_score"))
-        if score is None:
+        scores = {
+            "short_term": _number(row.get("short_term_score")),
+            "risk_on": _number(row.get("market_risk_on_score")),
+        }
+        if not any(value is not None for value in scores.values()):
             continue
+        eligible_score_days += 1
         for horizon in (1, 3):
             if index + horizon >= len(target_dates):
                 continue
-            future = raw_by_date.get(target_dates[index + horizon], {})
-            breadth = _number(future.get("up_ratio_pct"))
-            index_change = _number(future.get("core_index_trend"))
-            if breadth is not None or index_change is not None:
-                samples[horizon].append((score, breadth, index_change))
-
-    def summary(horizon: int) -> dict:
-        values = samples[horizon]
-        breadth = [item[1] for item in values if item[1] is not None]
-        index_change = [item[2] for item in values if item[2] is not None]
-        high = [item for item in values if item[0] >= 70]
-        low = [item for item in values if item[0] < 40]
-        return {
-            "sample_count": len(values),
-            "average_market_breadth_pct": _round(mean(breadth), 2) if breadth else None,
-            "average_core_index_change_pct": _round(mean(index_change), 4) if index_change else None,
-            "high_short_score_sample_count": len(high),
-            "high_short_score_average_breadth_pct": _mean_at(high, 1),
-            "low_short_score_sample_count": len(low),
-            "low_short_score_average_breadth_pct": _mean_at(low, 1),
-        }
+            path_dates = target_dates[index + 1 : index + horizon + 1]
+            path = [raw_by_date.get(item, {}) for item in path_dates]
+            final_breadth = _number(path[-1].get("up_ratio_pct")) if path else None
+            daily_core_changes = [_number(item.get("core_index_trend")) for item in path]
+            core_cumulative_return = (
+                _compound_pct(daily_core_changes)
+                if path and all(value is not None for value in daily_core_changes)
+                else None
+            )
+            if final_breadth is None and core_cumulative_return is None:
+                continue
+            for score_name, score in scores.items():
+                if score is not None:
+                    samples[score_name][horizon].append(
+                        {
+                            "score": score,
+                            "market_breadth_pct": final_breadth,
+                            "core_index_cumulative_return_pct": core_cumulative_return,
+                        }
+                    )
 
     return {
-        "t_plus_1": summary(1),
-        "t_plus_3": summary(3),
-        "note": "仅用于校准验证；T+1/T+3 事实不参与任一当日分数、分位或阶段判定",
+        "method_version": "v2_persisted_forward_outcome",
+        "eligible_score_days": eligible_score_days,
+        "short_term": {
+            "t_plus_1": _forward_outcome_summary(samples["short_term"][1]),
+            "t_plus_3": _forward_outcome_summary(samples["short_term"][3]),
+        },
+        "risk_on": {
+            "t_plus_1": _forward_outcome_summary(samples["risk_on"][1]),
+            "t_plus_3": _forward_outcome_summary(samples["risk_on"][3]),
+        },
+        "outcome_definition": {
+            "market_breadth_pct": "目标日合格股票上涨比例",
+            "core_index_cumulative_return_pct": "从 T 后第 1 个开市日至 T+N 的七个核心指数日均涨跌幅复利累计值",
+            "score_groups": "低分 [0,40)，中分 [40,70)，高分 [70,100]",
+        },
+        "note": "仅用于历史环境区分度验证；后续事实不参与任一当日分数、分位或阶段判定，也不代表候选股策略收益或买卖建议。",
     }
 
 
-def _mean_at(values: list[tuple[float, float | None, float | None]], position: int) -> float | None:
-    selected = [item[position] for item in values if item[position] is not None]
-    return _round(mean(selected), 2) if selected else None
+def _forward_outcome_summary(samples: list[dict[str, float | None]]) -> dict:
+    """Return transparent score buckets and rank relationships for one horizon."""
+    groups = (
+        ("low", "低分", "[0,40)", 0.0, 40.0),
+        ("middle", "中分", "[40,70)", 40.0, 70.0),
+        ("high", "高分", "[70,100]", 70.0, 100.000001),
+    )
+    buckets: list[dict] = []
+    by_code: dict[str, dict] = {}
+    for code, label, score_range, lower, upper in groups:
+        values = [item for item in samples if lower <= float(item["score"] or 0) < upper]
+        breadth = _sample_mean(values, "market_breadth_pct")
+        core_return = _sample_mean(values, "core_index_cumulative_return_pct", digits=4)
+        bucket = {
+            "code": code,
+            "label": label,
+            "score_range": score_range,
+            "sample_count": len(values),
+            "average_market_breadth_pct": breadth,
+            "average_core_index_cumulative_return_pct": core_return,
+            "market_breadth_above_50_pct": _sample_rate(values, "market_breadth_pct", threshold=50),
+            "core_index_positive_pct": _sample_rate(values, "core_index_cumulative_return_pct", threshold=0),
+        }
+        buckets.append(bucket)
+        by_code[code] = bucket
+
+    high, low = by_code["high"], by_code["low"]
+    high_low = {
+        "breadth_pct_point_difference": _difference(
+            high["average_market_breadth_pct"], low["average_market_breadth_pct"], digits=2
+        ),
+        "core_index_return_pct_point_difference": _difference(
+            high["average_core_index_cumulative_return_pct"], low["average_core_index_cumulative_return_pct"], digits=4
+        ),
+        "high_sample_count": high["sample_count"],
+        "low_sample_count": low["sample_count"],
+    }
+    return {
+        "sample_count": len(samples),
+        "average_market_breadth_pct": _sample_mean(samples, "market_breadth_pct"),
+        "average_core_index_cumulative_return_pct": _sample_mean(samples, "core_index_cumulative_return_pct", digits=4),
+        "market_breadth_rank_correlation": _spearman(samples, "score", "market_breadth_pct"),
+        "core_index_return_rank_correlation": _spearman(samples, "score", "core_index_cumulative_return_pct"),
+        "buckets": buckets,
+        "high_low_difference": high_low,
+        "relationship": _relationship(high_low),
+    }
+
+
+def _compound_pct(values: list[float | None]) -> float | None:
+    if not values or any(value is None for value in values):
+        return None
+    result = 1.0
+    for value in values:
+        result *= 1 + float(value or 0) / 100
+    return _round((result - 1) * 100, 4)
+
+
+def _sample_mean(samples: list[dict[str, float | None]], key: str, *, digits: int = 2) -> float | None:
+    values = [float(item[key]) for item in samples if item.get(key) is not None]
+    return _round(mean(values), digits) if values else None
+
+
+def _sample_rate(samples: list[dict[str, float | None]], key: str, *, threshold: float) -> float | None:
+    values = [float(item[key]) for item in samples if item.get(key) is not None]
+    return _round(sum(value > threshold for value in values) / len(values) * 100, 2) if values else None
+
+
+def _difference(high: float | None, low: float | None, *, digits: int) -> float | None:
+    return _round(high - low, digits) if high is not None and low is not None else None
+
+
+def _relationship(high_low: dict) -> str:
+    if int(high_low["high_sample_count"] or 0) < 15 or int(high_low["low_sample_count"] or 0) < 15:
+        return "insufficient_samples"
+    breadth = _number(high_low.get("breadth_pct_point_difference"))
+    core_return = _number(high_low.get("core_index_return_pct_point_difference"))
+    if breadth is None and core_return is None:
+        return "insufficient_outcomes"
+    if (breadth is None or breadth >= 0) and (core_return is None or core_return >= 0):
+        return "positive"
+    if (breadth is None or breadth <= 0) and (core_return is None or core_return <= 0):
+        return "inverse"
+    return "mixed"
+
+
+def _spearman(samples: list[dict[str, float | None]], x_key: str, y_key: str) -> float | None:
+    pairs = [
+        (float(item[x_key]), float(item[y_key]))
+        for item in samples
+        if item.get(x_key) is not None and item.get(y_key) is not None
+    ]
+    if len(pairs) < 3:
+        return None
+    x_ranks = _midranks([item[0] for item in pairs])
+    y_ranks = _midranks([item[1] for item in pairs])
+    x_mean, y_mean = mean(x_ranks), mean(y_ranks)
+    numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_ranks, y_ranks, strict=True))
+    denominator_left = sum((x - x_mean) ** 2 for x in x_ranks)
+    denominator_right = sum((y - y_mean) ** 2 for y in y_ranks)
+    if denominator_left <= 0 or denominator_right <= 0:
+        return None
+    return _round(numerator / (denominator_left * denominator_right) ** 0.5, 4)
+
+
+def _midranks(values: list[float]) -> list[float]:
+    ordered = sorted(enumerate(values), key=lambda item: item[1])
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(ordered):
+        end = start + 1
+        while end < len(ordered) and ordered[end][1] == ordered[start][1]:
+            end += 1
+        rank = (start + 1 + end) / 2
+        for index, _value in ordered[start:end]:
+            ranks[index] = rank
+        start = end
+    return ranks
 
 
 def serialize_emotion_model(model: MarketEmotionModel) -> dict:

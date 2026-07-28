@@ -101,6 +101,25 @@ async def emotion_models(session: AsyncSession = Depends(get_session)):
         return ApiResponse.fail(code="market_emotion_models_read_failed", message=str(exc))
 
 
+@router.get("/emotion-models/{model_code}/validation")
+async def emotion_model_validation(
+    model_code: str,
+    history_limit: int = Query(default=1000, ge=60, le=1000),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        return ApiResponse.ok(
+            await MarketEmotionService(MarketInsightRepository(session)).validation_preview(
+                model_code=model_code,
+                history_limit=history_limit,
+            )
+        )
+    except ValueError as exc:
+        return ApiResponse.fail(code="market_emotion_validation_invalid_request", message=str(exc))
+    except Exception as exc:
+        return ApiResponse.fail(code="market_emotion_validation_read_failed", message=str(exc))
+
+
 @router.get("/emotion-models/{model_code}")
 async def emotion_model_detail(model_code: str, session: AsyncSession = Depends(get_session)):
     try:

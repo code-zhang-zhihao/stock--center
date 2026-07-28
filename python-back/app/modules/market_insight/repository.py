@@ -34,6 +34,20 @@ from app.modules.market_insight.models import (
 )
 
 
+# The daily close pipeline settles exactly these seven broad/core indices.
+# Keep this list local to the insight read model rather than averaging any
+# additional index history that may later be backfilled into ``t_index_bar``.
+CORE_INDEX_CODES: tuple[str, ...] = (
+    "000001.SH",
+    "399001.SZ",
+    "399006.SZ",
+    "000300.SH",
+    "000905.SH",
+    "000852.SH",
+    "000016.SH",
+)
+
+
 def _active_stock_filters() -> tuple:
     return (
         Stock.status == "active",
@@ -780,6 +794,12 @@ class MarketInsightRepository:
         ).scalar_one_or_none()
 
     async def emotion_history(self, *, model_code: str, limit: int = 60) -> list[MarketEmotionDaily]:
+        """Return complete historic rows for internal callers that need JSON audits.
+
+        UI curve and validation callers must use one of the lean projections
+        below.  Loading all JSON scorecards for a 250-day curve is needlessly
+        expensive across a remote PostgreSQL connection.
+        """
         rows = await self.session.execute(
             select(MarketEmotionDaily)
             .where(MarketEmotionDaily.model_code == model_code)
@@ -787,6 +807,66 @@ class MarketInsightRepository:
             .limit(limit)
         )
         return list(reversed(rows.scalars().all()))
+
+    async def emotion_trend_history(self, *, model_code: str, limit: int = 60) -> list[dict]:
+        """Fetch only fields needed to draw the V2 score curve."""
+        rows = await self.session.execute(
+            select(
+                MarketEmotionDaily.trade_date,
+                MarketEmotionDaily.short_term_score,
+                MarketEmotionDaily.market_risk_on_score,
+                MarketEmotionDaily.primary_stage_code,
+                MarketEmotionDaily.auxiliary_state_code,
+                MarketEmotionDaily.status,
+            )
+            .where(MarketEmotionDaily.model_code == model_code)
+            .order_by(MarketEmotionDaily.trade_date.desc())
+            .limit(limit)
+        )
+        return [
+            {
+                "trade_date": row.trade_date,
+                "short_term_score": _float_or_none(row.short_term_score),
+                "market_risk_on_score": _float_or_none(row.market_risk_on_score),
+                "primary_stage_code": row.primary_stage_code,
+                "auxiliary_state_code": row.auxiliary_state_code,
+                "status": row.status,
+            }
+            for row in reversed(rows.all())
+        ]
+
+    async def emotion_validation_history(self, *, model_code: str, limit: int = 1000) -> list[dict]:
+        """Fetch the persisted score and outcome inputs used by validation only.
+
+        The JSONB paths deliberately select just two raw facts.  Validation is
+        a read-only UI query and must not transfer 250 complete scorecards,
+        evidence arrays and parameter snapshots merely to recompute T+1/T+3
+        aggregates.
+        """
+        rows = await self.session.execute(
+            select(
+                MarketEmotionDaily.trade_date,
+                MarketEmotionDaily.status,
+                MarketEmotionDaily.short_term_score,
+                MarketEmotionDaily.market_risk_on_score,
+                MarketEmotionDaily.metrics["up_ratio_pct"]["raw_value"].astext.label("up_ratio_pct"),
+                MarketEmotionDaily.metrics["core_index_trend"]["raw_value"].astext.label("core_index_trend"),
+            )
+            .where(MarketEmotionDaily.model_code == model_code)
+            .order_by(MarketEmotionDaily.trade_date.desc())
+            .limit(limit)
+        )
+        return [
+            {
+                "trade_date": row.trade_date,
+                "status": row.status,
+                "short_term_score": _float_or_none(row.short_term_score),
+                "market_risk_on_score": _float_or_none(row.market_risk_on_score),
+                "up_ratio_pct": _float_or_none(row.up_ratio_pct),
+                "core_index_trend": _float_or_none(row.core_index_trend),
+            }
+            for row in reversed(rows.all())
+        ]
 
     async def v2_market_metrics(
         self,
@@ -1074,7 +1154,10 @@ class MarketInsightRepository:
                 func.avg(IndexBar.change_pct).label("average_change_pct"),
                 func.avg((IndexBar.high_price - IndexBar.low_price) / func.nullif(IndexBar.close_price, 0) * 100).label("amplitude_pct"),
             )
-            .where(IndexBar.trade_date.in_(trade_dates))
+            .where(
+                IndexBar.trade_date.in_(trade_dates),
+                IndexBar.index_code.in_(CORE_INDEX_CODES),
+            )
             .group_by(IndexBar.trade_date)
         )
         return {

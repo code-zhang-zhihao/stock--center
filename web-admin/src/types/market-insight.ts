@@ -161,3 +161,48 @@ export interface MarketEmotionDaily {
     status: string;
   }>;
 }
+
+export interface MarketEmotionValidationBucket {
+  code: 'low' | 'middle' | 'high' | string;
+  label: string;
+  score_range: string;
+  sample_count: number;
+  average_market_breadth_pct: number | null;
+  average_core_index_cumulative_return_pct: number | null;
+  market_breadth_above_50_pct: number | null;
+  core_index_positive_pct: number | null;
+}
+
+export interface MarketEmotionValidationHorizon {
+  sample_count: number;
+  average_market_breadth_pct: number | null;
+  average_core_index_cumulative_return_pct: number | null;
+  market_breadth_rank_correlation: number | null;
+  core_index_return_rank_correlation: number | null;
+  buckets: MarketEmotionValidationBucket[];
+  high_low_difference: {
+    breadth_pct_point_difference: number | null;
+    core_index_return_pct_point_difference: number | null;
+    high_sample_count: number;
+    low_sample_count: number;
+  };
+  relationship: 'positive' | 'inverse' | 'mixed' | 'insufficient_samples' | 'insufficient_outcomes' | string;
+}
+
+export interface MarketEmotionValidationPreview {
+  available: boolean;
+  reason?: string | null;
+  model?: MarketEmotionModel;
+  history_start_trade_date?: string;
+  history_end_trade_date?: string;
+  stored_row_count?: number;
+  calendar_trade_day_count?: number;
+  validation?: {
+    method_version: string;
+    eligible_score_days: number;
+    short_term: { t_plus_1: MarketEmotionValidationHorizon; t_plus_3: MarketEmotionValidationHorizon };
+    risk_on: { t_plus_1: MarketEmotionValidationHorizon; t_plus_3: MarketEmotionValidationHorizon };
+    outcome_definition: Record<string, string>;
+    note: string;
+  };
+}

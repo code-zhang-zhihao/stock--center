@@ -73,10 +73,10 @@ def test_calibration_forward_validation_is_separate_from_score_inputs():
     dates = [date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 22), date(2026, 7, 23)]
     validation = _forward_validation(
         rows=[
-            {"trade_date": dates[0], "status": "ready", "short_term_score": 75},
-            {"trade_date": dates[1], "status": "ready", "short_term_score": 35},
-            {"trade_date": dates[2], "status": "pending", "short_term_score": None},
-            {"trade_date": dates[3], "status": "ready", "short_term_score": 80},
+            {"trade_date": dates[0], "status": "ready", "short_term_score": 75, "market_risk_on_score": 58},
+            {"trade_date": dates[1], "status": "ready", "short_term_score": 35, "market_risk_on_score": 32},
+            {"trade_date": dates[2], "status": "pending", "short_term_score": None, "market_risk_on_score": None},
+            {"trade_date": dates[3], "status": "ready", "short_term_score": 80, "market_risk_on_score": 82},
         ],
         target_dates=dates,
         raw_by_date={
@@ -85,9 +85,12 @@ def test_calibration_forward_validation_is_separate_from_score_inputs():
             dates[3]: {"up_ratio_pct": 70, "core_index_trend": 0.5},
         },
     )
-    assert validation["t_plus_1"]["sample_count"] == 2
-    assert validation["t_plus_1"]["high_short_score_average_breadth_pct"] == 66
-    assert validation["t_plus_3"]["sample_count"] == 1
+    short_t1 = validation["short_term"]["t_plus_1"]
+    assert short_t1["sample_count"] == 2
+    assert short_t1["buckets"][2]["average_market_breadth_pct"] == 66
+    assert validation["short_term"]["t_plus_3"]["sample_count"] == 1
+    assert validation["short_term"]["t_plus_3"]["average_core_index_cumulative_return_pct"] > 0
+    assert validation["risk_on"]["t_plus_1"]["sample_count"] == 2
     assert "不参与" in validation["note"]
 
 
@@ -163,10 +166,19 @@ async def test_emotion_read_allows_full_calibration_curve_but_bounds_history_lim
         async def emotion_daily(self, **_kwargs):
             return row
 
-        async def emotion_history(self, *, model_code, limit):
+        async def emotion_trend_history(self, *, model_code, limit):
             assert model_code == "test_model"
             self.history_limit = limit
-            return [row]
+            return [
+                {
+                    "trade_date": row.trade_date,
+                    "short_term_score": row.short_term_score,
+                    "market_risk_on_score": row.market_risk_on_score,
+                    "primary_stage_code": row.primary_stage_code,
+                    "auxiliary_state_code": row.auxiliary_state_code,
+                    "status": row.status,
+                }
+            ]
 
     repository = Repository()
     payload = await MarketEmotionService(repository).read(model_code="test_model", history_limit=5000)
@@ -182,3 +194,70 @@ async def test_emotion_read_allows_full_calibration_curve_but_bounds_history_lim
             "status": "ready",
         }
     ]
+
+
+async def test_validation_preview_reads_only_persisted_score_inputs():
+    dates = [date(2026, 7, 20), date(2026, 7, 21), date(2026, 7, 22), date(2026, 7, 23)]
+    model = SimpleNamespace(
+        model_code="test_model",
+        model_name="测试模型",
+        status="active",
+        percentile_window_days=120,
+        minimum_history_days=60,
+        baseline_trade_days=250,
+        parameter_json={},
+        calibration_summary={},
+        published_at=None,
+        updated_at=None,
+    )
+
+    def row(trade_date, status, short, risk, breadth, core):
+        return SimpleNamespace(
+            trade_date=trade_date,
+            status=status,
+            short_term_score=short,
+            market_risk_on_score=risk,
+            metrics={
+                "up_ratio_pct": {"raw_value": breadth},
+                "core_index_trend": {"raw_value": core},
+            },
+        )
+
+    class Repository:
+        async def get_emotion_model(self, model_code):
+            assert model_code == "test_model"
+            return model
+
+        async def emotion_validation_history(self, *, model_code, limit):
+            assert model_code == "test_model"
+            assert limit == 250
+            return [
+                {
+                    "trade_date": item.trade_date,
+                    "status": item.status,
+                    "short_term_score": item.short_term_score,
+                    "market_risk_on_score": item.market_risk_on_score,
+                    "up_ratio_pct": item.metrics["up_ratio_pct"]["raw_value"],
+                    "core_index_trend": item.metrics["core_index_trend"]["raw_value"],
+                }
+                for item in [
+                    row(dates[0], "ready", 76, 56, 52, 0.1),
+                    row(dates[1], "ready", 35, 32, 66, 1.2),
+                    row(dates[2], "ready", 62, 72, 40, -0.8),
+                    row(dates[3], "ready", 80, 85, 70, 0.5),
+                ]
+            ]
+
+        async def open_trade_dates_between(self, *, start_date, end_date):
+            assert start_date == dates[0]
+            assert end_date == dates[-1]
+            return dates
+
+    preview = await MarketEmotionService(Repository()).validation_preview(
+        model_code="test_model",
+        history_limit=250,
+    )
+
+    assert preview["available"] is True
+    assert preview["validation"]["short_term"]["t_plus_1"]["sample_count"] == 3
+    assert preview["validation"]["risk_on"]["t_plus_3"]["sample_count"] == 1
