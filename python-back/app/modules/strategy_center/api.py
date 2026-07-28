@@ -66,6 +66,16 @@ async def backtests(
     return await _run(lambda: service(session).backtests(strategy_code=strategy_code, limit=limit))
 
 
+@router.get("/{strategy_code}/optimizations")
+async def optimizations(
+    strategy_code: str,
+    limit: int = Query(default=20, ge=1, le=50),
+    trial_limit: int = Query(default=20, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _run(lambda: service(session).optimizations(strategy_code=strategy_code, limit=limit, trial_limit=trial_limit))
+
+
 @router.post("/{strategy_code}/versions")
 async def create_version(
     strategy_code: str,
@@ -100,6 +110,7 @@ async def run_backtest(
             end_date=payload.end_date,
             fee_rate=payload.fee_rate,
             slippage_bps=payload.slippage_bps,
+            baseline_candidate_limit=payload.baseline_candidate_limit,
         )
     )
 

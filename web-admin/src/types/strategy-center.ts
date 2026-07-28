@@ -43,6 +43,36 @@ export interface StrategyBacktestRun {
   error_message: string | null;
 }
 
+export interface StrategyOptimizationTrial {
+  trial_no: number;
+  parameter_patch: Record<string, unknown>;
+  train_summary: Record<string, unknown>;
+  validation_summary: Record<string, unknown>;
+  robustness_summary: Record<string, unknown>;
+  verdict: 'eligible' | 'rejected' | 'data_insufficient' | string;
+  rank_no: number | null;
+  created_at: string;
+}
+
+export interface StrategyOptimizationRun {
+  run_code: string;
+  strategy_version_id: number;
+  baseline_backtest_run_id: number;
+  status: 'running' | 'completed' | 'failed' | string;
+  train_end_date: string;
+  search_space: Record<string, unknown>;
+  requirements: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  started_at: string | null;
+  finished_at: string | null;
+  error_message: string | null;
+}
+
+export interface StrategyOptimizationReview {
+  run: StrategyOptimizationRun;
+  trials: StrategyOptimizationTrial[];
+}
+
 export interface StrategyDefinition {
   strategy_code: string;
   strategy_name: string;

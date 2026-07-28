@@ -203,3 +203,48 @@ class StrategyBacktestTrade(Base):
     candidate_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     execution_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class StrategyOptimizationRun(Base):
+    __tablename__ = "t_strategy_optimization_run"
+    __table_args__ = (UniqueConstraint("run_code", name="uq_t_strategy_optimization_run_code"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_id: Mapped[int] = mapped_column(ForeignKey("t_strategy_definition.id", ondelete="CASCADE"), nullable=False)
+    strategy_version_id: Mapped[int] = mapped_column(
+        ForeignKey("t_strategy_version.id", ondelete="RESTRICT"), nullable=False
+    )
+    baseline_backtest_run_id: Mapped[int] = mapped_column(
+        ForeignKey("t_strategy_backtest_run.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
+    train_end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    search_space: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    requirements: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class StrategyOptimizationTrial(Base):
+    __tablename__ = "t_strategy_optimization_trial"
+    __table_args__ = (UniqueConstraint("optimization_run_id", "trial_no", name="uq_t_strategy_optimization_trial_business"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    optimization_run_id: Mapped[int] = mapped_column(
+        ForeignKey("t_strategy_optimization_run.id", ondelete="CASCADE"), nullable=False
+    )
+    trial_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    parameter_patch: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    train_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    validation_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    robustness_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    verdict: Mapped[str] = mapped_column(String(24), nullable=False)
+    rank_no: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

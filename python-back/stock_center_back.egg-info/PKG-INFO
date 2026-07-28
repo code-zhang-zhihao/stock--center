@@ -18,6 +18,7 @@ Requires-Dist: pydantic-settings>=2.4.0
 Requires-Dist: redis>=5.0.0
 Requires-Dist: requests>=2.31.0
 Requires-Dist: sqlalchemy>=2.0.30
+Requires-Dist: tickflow[all]>=0.1.23
 Requires-Dist: uvicorn[standard]>=0.30.0
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"

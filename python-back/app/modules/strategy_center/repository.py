@@ -35,6 +35,8 @@ from app.modules.strategy_center.models import (
     StrategyBacktestTrade,
     StrategyCandidate,
     StrategyDefinition,
+    StrategyOptimizationRun,
+    StrategyOptimizationTrial,
     StrategyPaperTrade,
     StrategyPaperTradeLeg,
     StrategySignalEvent,
@@ -1171,6 +1173,133 @@ class StrategyCenterRepository:
                     select(StrategyBacktestRun)
                     .where(StrategyBacktestRun.strategy_id == strategy_id)
                     .order_by(StrategyBacktestRun.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+        )
+
+    async def get_completed_backtest_run(
+        self,
+        *,
+        strategy_id: int,
+        strategy_version_id: int,
+        run_code: str | None = None,
+    ) -> StrategyBacktestRun | None:
+        statement = select(StrategyBacktestRun).where(
+            StrategyBacktestRun.strategy_id == strategy_id,
+            StrategyBacktestRun.strategy_version_id == strategy_version_id,
+            StrategyBacktestRun.status == "completed",
+        )
+        if run_code:
+            statement = statement.where(StrategyBacktestRun.run_code == run_code)
+        else:
+            statement = statement.order_by(StrategyBacktestRun.finished_at.desc(), StrategyBacktestRun.id.desc()).limit(1)
+        return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def list_backtest_trades(self, *, backtest_run_id: int) -> list[StrategyBacktestTrade]:
+        return list(
+            (
+                await self.session.execute(
+                    select(StrategyBacktestTrade)
+                    .where(StrategyBacktestTrade.backtest_run_id == backtest_run_id)
+                    .order_by(StrategyBacktestTrade.signal_trade_date, StrategyBacktestTrade.id)
+                )
+            ).scalars().all()
+        )
+
+    async def max_backtest_trades_per_signal_date(self, *, backtest_run_id: int) -> int:
+        """Return the largest persisted candidate count for one signal date.
+
+        A subset replay is only defensible when the source baseline was not
+        clipped by ``selection.max_candidates``.  The caller uses this cheap
+        aggregate as a conservative guard before it evaluates threshold
+        variants from the persisted candidate snapshots.
+        """
+
+        daily_counts = (
+            select(
+                StrategyBacktestTrade.signal_trade_date.label("signal_trade_date"),
+                func.count(StrategyBacktestTrade.id).label("trade_count"),
+            )
+            .where(StrategyBacktestTrade.backtest_run_id == backtest_run_id)
+            .group_by(StrategyBacktestTrade.signal_trade_date)
+            .subquery()
+        )
+        value = (await self.session.execute(select(func.max(daily_counts.c.trade_count)))).scalar_one_or_none()
+        return int(value or 0)
+
+    async def create_optimization_run(
+        self,
+        *,
+        run_code: str,
+        strategy_id: int,
+        strategy_version_id: int,
+        baseline_backtest_run_id: int,
+        train_end_date: date,
+        search_space: dict,
+        requirements: dict,
+    ) -> StrategyOptimizationRun:
+        run = StrategyOptimizationRun(
+            run_code=run_code,
+            strategy_id=strategy_id,
+            strategy_version_id=strategy_version_id,
+            baseline_backtest_run_id=baseline_backtest_run_id,
+            status="running",
+            train_end_date=train_end_date,
+            search_space=search_space,
+            requirements=requirements,
+            started_at=datetime.now(timezone.utc),
+        )
+        self.session.add(run)
+        await self.session.flush()
+        return run
+
+    async def insert_optimization_trials(self, *, optimization_run_id: int, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        for offset in range(0, len(rows), 200):
+            await self.session.execute(
+                insert(StrategyOptimizationTrial)
+                .values(rows[offset : offset + 200])
+                .on_conflict_do_nothing(
+                    index_elements=[StrategyOptimizationTrial.optimization_run_id, StrategyOptimizationTrial.trial_no]
+                )
+            )
+        return len(rows)
+
+    async def complete_optimization_run(self, run: StrategyOptimizationRun, summary: dict) -> None:
+        run.status = "completed"
+        run.summary = summary
+        run.finished_at = datetime.now(timezone.utc)
+        run.updated_at = run.finished_at
+        await self.session.flush()
+
+    async def fail_optimization_run(self, run: StrategyOptimizationRun, message: str) -> None:
+        run.status = "failed"
+        run.error_message = message[:4000]
+        run.finished_at = datetime.now(timezone.utc)
+        run.updated_at = run.finished_at
+        await self.session.flush()
+
+    async def list_optimization_runs(self, *, strategy_id: int, limit: int = 20) -> list[StrategyOptimizationRun]:
+        return list(
+            (
+                await self.session.execute(
+                    select(StrategyOptimizationRun)
+                    .where(StrategyOptimizationRun.strategy_id == strategy_id)
+                    .order_by(StrategyOptimizationRun.created_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+        )
+
+    async def list_optimization_trials(self, *, optimization_run_id: int, limit: int = 50) -> list[StrategyOptimizationTrial]:
+        return list(
+            (
+                await self.session.execute(
+                    select(StrategyOptimizationTrial)
+                    .where(StrategyOptimizationTrial.optimization_run_id == optimization_run_id)
+                    .order_by(StrategyOptimizationTrial.rank_no.asc().nulls_last(), StrategyOptimizationTrial.trial_no)
                     .limit(limit)
                 )
             ).scalars().all()

@@ -74,6 +74,7 @@
 68. `68-market-emotion-baseline-performance.sql`：为 V2 基线校准的北向历史回填、窗口查询和运行进度补充性能索引/调度元数据。
 69. `69-strategy-research-foundation.sql`：新增策略研究定义、T 日候选和模拟交易审计表，以及由候选派生的动态策略股票池约定；不 seed 策略、不调度扫描、不调用行情源或券商。
 70. `70-strategy-evaluation-lifecycle.sql`：新增策略不可变版本、信号事件、模拟交易分笔和日频基线回测，seed 盘后候选与手动回测任务；不连接券商或真实下单。
+71. `71-strategy-parameter-optimization.sql`：新增参数寻优运行/试验审计表与仅手动的历史参数寻优任务；只保存训练/样本外验证结论，不改策略版本、不提升 paper、不调用 Provider 或 LLM。
 67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 68. `68-market-emotion-baseline-performance.sql`：新增历史市场级北向资金流回填任务，默认按 120 交易日窗口补最近 250 个已有日线交易日；V2 基线改为精确交易日 lookback、20 日持久化检查点与运行进度，并把该手动校准任务超时上限调为 1800 秒。
 
@@ -119,6 +120,8 @@ docs/sql/db-init.sql
 `69-strategy-research-foundation.sql` 必须在 `67` 之后由 `t_stock_pool` 与新策略表 owner 执行。它是策略定义、候选和纸面交易的基础表迁移，不写入策略、候选、股票池成员、调度定义或真实订单。部署后端、刷新前端后，策略中心才能创建草稿及其 `dynamic_rule='strategy_candidates'` 专属策略池；完整的 evaluator、T+1 确认和模拟成交执行器由后续 `70` 提供。
 
 `70-strategy-evaluation-lifecycle.sql` 必须紧接 `69` 执行。它为既有定义补 v1，建立 `t_strategy_version/t_strategy_signal_event/t_strategy_paper_trade_leg/t_strategy_backtest_run/t_strategy_backtest_trade`，并将候选的唯一键改为版本维度；已有 `enabled` 定义归一为 `research`。脚本同时 seed `evaluate_strategy_daily_candidates`（工作日 22:25）和 `run_strategy_backtest`（`cron_expr=null`，仅手动），并关联“策略”标签。它不删除已有候选、模拟交易、股票池成员或历史调度日志，也不连接券商。执行后部署后端/前端并 reload Scheduler；先在策略中心初始化内置策略、运行并人工审阅回测，再显式晋升某个版本至 `paper`。
+
+`71-strategy-parameter-optimization.sql` 必须在 `70` 后执行。它新增 `t_strategy_optimization_run/t_strategy_optimization_trial` 并 seed `optimize_strategy_parameters`（`cron_expr=null`，仅手动）。“历史参数寻优”只会对一条同版本、已完成且未达到每日候选上限的基线回测做**收紧条件**的可复放子集研究：按信号交易日顺序 70% 训练、30% 样本外验证，默认要求训练至少 300 笔/80 日、验证至少 120 笔/30 日，并同时检查双区间胜率、平均收益和漂移。它不会自动创建新版本、更改风控、提升 paper 或调用 LLM；通过候选仍须以新版本全量回测复验。执行后部署后端/前端并 reload Scheduler。
 
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 

@@ -19,8 +19,15 @@ from app.modules.strategy_center.models import (
     StrategyBacktestRun,
     StrategyBacktestTrade,
     StrategyDefinition,
+    StrategyOptimizationRun,
+    StrategyOptimizationTrial,
     StrategyPaperTrade,
     StrategyVersion,
+)
+from app.modules.strategy_center.optimization import (
+    build_trials,
+    optimization_summary,
+    requirements_from_payload,
 )
 from app.modules.strategy_center.repository import StrategyCenterRepository
 from app.modules.strategy_center.schemas import (
@@ -37,11 +44,13 @@ from app.modules.strategy_center.schemas import (
 # for every backtest batch.
 PRIOR_DAILY_RULE_LOOKBACK = 20
 BACKTEST_SIGNAL_DAYS_PER_BATCH = 5
-MINIMUM_PAPER_REVIEW_COMPLETED_TRADES = 30
+MINIMUM_PAPER_REVIEW_COMPLETED_TRADES = 300
 # A short smoke test can easily generate more than 30 independent signals in
 # a strong market.  It is useful for proving the pipeline, but it must not
 # unlock paper trading without a representative historical sample.
 MINIMUM_PAPER_REVIEW_SIGNAL_DATES = 120
+MINIMUM_PAPER_REVIEW_WIN_RATE_PCT = 50.0
+MINIMUM_PAPER_REVIEW_AVERAGE_RETURN_PCT = 0.0
 
 
 class StrategyCenterError(Exception):
@@ -56,13 +65,15 @@ def _qualifies_for_paper_review(summary: dict) -> bool:
     """Return whether a completed run is large enough for human review.
 
     This deliberately does *not* approve or promote a strategy.  It only
-    unlocks the explicit, human-operated paper promotion endpoint after both
-    a sufficiently broad historical interval and enough closed T+1 trades.
+    unlocks the explicit, human-operated paper promotion endpoint after a
+    sufficiently broad, profitable and stable-at-a-basic-level daily sample.
     """
 
     return (
         int(summary.get("signal_trade_date_count") or 0) >= MINIMUM_PAPER_REVIEW_SIGNAL_DATES
         and int(summary.get("completed_trade_count") or 0) >= MINIMUM_PAPER_REVIEW_COMPLETED_TRADES
+        and float(summary.get("win_rate_pct") or 0) >= MINIMUM_PAPER_REVIEW_WIN_RATE_PCT
+        and float(summary.get("average_net_return_pct") or 0) > MINIMUM_PAPER_REVIEW_AVERAGE_RETURN_PCT
     )
 
 
@@ -281,6 +292,159 @@ class StrategyCenterService:
         runs = await self.repository.list_backtest_runs(strategy_id=definition.id, limit=limit)
         return [self._read_backtest_run(run) for run in runs]
 
+    async def optimize_parameters(
+        self,
+        *,
+        strategy_code: str,
+        version_no: int,
+        baseline_run_code: str | None,
+        train_ratio: float,
+        max_trials: int,
+        progress_reporter=None,
+    ) -> dict:
+        """Run deterministic, chronological parameter research for one version.
+
+        It only writes optimisation audit facts.  The returned best trial is a
+        *proposal*, never an update to the immutable version and never a paper
+        promotion.
+        """
+
+        definition = await self._require_definition(strategy_code)
+        version = await self.repository.get_version(strategy_id=definition.id, version_no=version_no)
+        if version is None:
+            raise StrategyCenterError("strategy_version_not_found", f"策略版本不存在: {strategy_code} v{version_no}")
+        requirements = requirements_from_payload(train_ratio=train_ratio)
+        baseline = await self.repository.get_completed_backtest_run(
+            strategy_id=definition.id,
+            strategy_version_id=version.id,
+            run_code=baseline_run_code,
+        )
+        if baseline is None:
+            raise StrategyCenterError(
+                "strategy_optimization_baseline_required",
+                "参数寻优需要该版本一条已完成的日频基线回测；请先选择实际历史覆盖区间运行基线回测。",
+            )
+        live_selection_limit = _candidate_limit(version.rule_config)
+        baseline_parameters = baseline.parameter_snapshot or {}
+        try:
+            baseline_selection_limit = int(
+                baseline_parameters.get("baseline_candidate_limit")
+                or (baseline.summary or {}).get("baseline_candidate_limit")
+                or live_selection_limit
+            )
+        except (TypeError, ValueError):
+            baseline_selection_limit = live_selection_limit
+        peak_candidates_per_day = await self.repository.max_backtest_trades_per_signal_date(backtest_run_id=baseline.id)
+        if peak_candidates_per_day >= baseline_selection_limit:
+            raise StrategyCenterError(
+                "strategy_optimization_baseline_capped",
+                "该研究基线至少有一个交易日达到本次候选上限。收紧条件后可能出现未被原基线保留的股票，不能据此做子集寻优；请提高研究候选上限后重新跑基线。",
+                {
+                    "baseline_run_code": baseline.run_code,
+                    "live_selection_max_candidates": live_selection_limit,
+                    "baseline_candidate_limit": baseline_selection_limit,
+                    "peak_persisted_candidates_per_signal_date": peak_candidates_per_day,
+                },
+            )
+        if progress_reporter:
+            await progress_reporter(
+                {
+                    "stage": "loading_baseline_trades",
+                    "strategy_code": strategy_code,
+                    "version_no": version_no,
+                    "baseline_run_code": baseline.run_code,
+                }
+            )
+        trades = await self.repository.list_backtest_trades(backtest_run_id=baseline.id)
+        try:
+            train_end_date, trials, search_space = build_trials(
+                implementation_code=version.implementation_code,
+                baseline_trades=trades,
+                requirements=requirements,
+                max_trials=max_trials,
+                base_rule_config=version.rule_config or {},
+            )
+        except ValueError as exc:
+            raise StrategyCenterError("strategy_optimization_data_insufficient", str(exc)) from exc
+        if progress_reporter:
+            await progress_reporter(
+                {
+                    "stage": "scoring_parameter_trials",
+                    "strategy_code": strategy_code,
+                    "version_no": version_no,
+                    "trial_count": len(trials),
+                    "train_end_date": train_end_date.isoformat(),
+                }
+            )
+        summary = optimization_summary(
+            trials,
+            train_end_date=train_end_date,
+            requirements=requirements,
+            baseline_trade_count=len(trades),
+        )
+        summary["baseline_selection_guard"] = {
+            "live_selection_max_candidates": live_selection_limit,
+            "baseline_candidate_limit": baseline_selection_limit,
+            "peak_persisted_candidates_per_signal_date": peak_candidates_per_day,
+            "status": "not_capped",
+        }
+        run = await self.repository.create_optimization_run(
+            run_code=f"opt_{strategy_code}_{version_no}_{uuid4().hex[:16]}",
+            strategy_id=definition.id,
+            strategy_version_id=version.id,
+            baseline_backtest_run_id=baseline.id,
+            train_end_date=train_end_date,
+            search_space=search_space,
+            requirements=requirements.as_dict(),
+        )
+        try:
+            await self.repository.insert_optimization_trials(
+                optimization_run_id=run.id,
+                rows=[
+                    {
+                        "optimization_run_id": run.id,
+                        "trial_no": item.trial_no,
+                        "parameter_patch": item.parameter_patch,
+                        "train_summary": item.train_summary,
+                        "validation_summary": item.validation_summary,
+                        "robustness_summary": item.robustness_summary,
+                        "verdict": item.verdict,
+                        "rank_no": item.rank_no,
+                    }
+                    for item in trials
+                ],
+            )
+            await self.repository.complete_optimization_run(run, summary)
+            await self.repository.commit()
+        except Exception as exc:
+            await self.repository.fail_optimization_run(run, str(exc))
+            await self.repository.commit()
+            raise
+        if progress_reporter:
+            await progress_reporter(
+                {
+                    "stage": "optimization_completed",
+                    "strategy_code": strategy_code,
+                    "version_no": version_no,
+                    "optimization_run_code": run.run_code,
+                    "eligible_trial_count": summary["eligible_trial_count"],
+                }
+            )
+        return {
+            "run": self._read_optimization_run(run),
+            "trials": [self._read_optimization_trial(item) for item in trials[:20]],
+            "summary": summary,
+        }
+
+    async def optimizations(self, *, strategy_code: str, limit: int = 20, trial_limit: int = 20) -> list[dict]:
+        definition = await self._require_definition(strategy_code)
+        runs = await self.repository.list_optimization_runs(strategy_id=definition.id, limit=limit)
+        response: list[dict] = []
+        for run in runs:
+            trials = await self.repository.list_optimization_trials(optimization_run_id=run.id, limit=trial_limit)
+            response.append({"run": self._read_optimization_run(run), "trials": [self._read_optimization_trial(item) for item in trials]})
+        return response
+
     async def evaluate_daily_candidates(
         self,
         *,
@@ -372,6 +536,7 @@ class StrategyCenterService:
         end_date: date,
         fee_rate: float = 0.0005,
         slippage_bps: float = 10.0,
+        baseline_candidate_limit: int | None = None,
         progress_reporter=None,
     ) -> dict:
         definition = await self._require_definition(strategy_code)
@@ -386,6 +551,13 @@ class StrategyCenterService:
         signal_dates = await self.repository.open_trade_dates_between(start_date=start_date, end_date=end_date)
         if not signal_dates:
             raise StrategyCenterError("backtest_trade_dates_empty", "指定区间没有开市日。")
+        live_candidate_limit = _candidate_limit(version.rule_config)
+        candidate_limit = baseline_candidate_limit if baseline_candidate_limit is not None else live_candidate_limit
+        if candidate_limit < live_candidate_limit or candidate_limit > 1000:
+            raise StrategyCenterError(
+                "backtest_candidate_limit_invalid",
+                f"研究回测候选上限必须介于策略实际上限 {live_candidate_limit} 与 1000 之间。",
+            )
         run = await self.repository.create_backtest_run(
             run_code=f"bt_{strategy_code}_{version_no}_{uuid4().hex[:16]}",
             strategy_id=definition.id,
@@ -399,6 +571,8 @@ class StrategyCenterService:
                 "implementation_version": BUILTIN_STRATEGY_IMPLEMENTATION_VERSION,
                 "rule_config": version.rule_config or {},
                 "risk_config": version.risk_config or {},
+                "live_selection_max_candidates": live_candidate_limit,
+                "baseline_candidate_limit": candidate_limit,
                 "execution_assumptions": {
                     "model": "next_open_daily",
                     "entry": "T 日收盘产生信号，T+1 开盘按 open ± 滑点模拟；不宣称盘口成交。",
@@ -416,8 +590,23 @@ class StrategyCenterService:
                 signal_dates=signal_dates,
                 fee_rate=fee_rate,
                 slippage_bps=slippage_bps,
+                candidate_limit=candidate_limit,
                 progress_reporter=progress_reporter,
             )
+            peak_candidates_per_day = await self.repository.max_backtest_trades_per_signal_date(backtest_run_id=run.id)
+            result["summary"]["live_selection_max_candidates"] = live_candidate_limit
+            result["summary"]["baseline_candidate_limit"] = candidate_limit
+            result["summary"]["peak_persisted_candidates_per_signal_date"] = peak_candidates_per_day
+            result["summary"]["selection_complete_for_optimization"] = peak_candidates_per_day < candidate_limit
+            result["summary"]["paper_review_uses_actual_selection"] = candidate_limit == live_candidate_limit
+            result["summary"]["qualified_for_paper_review"] = bool(
+                _qualifies_for_paper_review(result["summary"])
+                and candidate_limit == live_candidate_limit
+            )
+            if candidate_limit != live_candidate_limit:
+                result["summary"]["paper_review_reason"] = "该运行使用了高于策略实际候选上限的研究样本，只能用于参数寻优，不能解锁 paper。"
+            elif not result["summary"]["qualified_for_paper_review"]:
+                result["summary"]["paper_review_reason"] = "未同时达到样本日、交易笔数、胜率和正平均收益的纸面审阅门槛。"
             await self.repository.complete_backtest_run(run, result["summary"])
             if _qualifies_for_paper_review(result["summary"]):
                 validation = dict(version.validation_summary or {})
@@ -443,7 +632,7 @@ class StrategyCenterService:
         if version.status != "backtest_ready" or not bool((version.validation_summary or {}).get("qualified_for_paper_review")):
             raise StrategyCenterError(
                 "strategy_backtest_required",
-                "只有覆盖至少 120 个有效信号交易日且完成至少 30 笔独立信号基线交易的 backtest_ready 版本可以进入 paper；这不是自动上线。",
+                "只有按实际候选上限覆盖至少 120 个有效信号交易日、完成至少 300 笔独立信号基线交易、胜率不少于 50% 且平均净收益为正的 backtest_ready 版本可以进入 paper；这不是自动上线。",
             )
         for other in await self.repository.list_versions(strategy_id=definition.id):
             if other.id != version.id and other.status == "paper":
@@ -547,6 +736,7 @@ class StrategyCenterService:
         signal_dates: list[date],
         fee_rate: float,
         slippage_bps: float,
+        candidate_limit: int,
         progress_reporter=None,
     ) -> dict:
         all_dates = await self.repository.open_trade_dates_ending_at(end_date=signal_dates[-1], limit=len(signal_dates) + 70)
@@ -605,7 +795,7 @@ class StrategyCenterService:
                     history_by_stock=history_by_stock,
                     eligible_stock_codes=eligible_by_date.get(signal_date, set()),
                 )
-                selected = matched[:_candidate_limit(version.rule_config)]
+                selected = matched[:candidate_limit]
                 signal_count += len(selected)
                 for candidate in selected:
                     trade = self._simulate_next_open_daily_trade(
@@ -671,6 +861,8 @@ class StrategyCenterService:
             "paper_review_requirements": {
                 "minimum_signal_trade_date_count": MINIMUM_PAPER_REVIEW_SIGNAL_DATES,
                 "minimum_completed_trade_count": MINIMUM_PAPER_REVIEW_COMPLETED_TRADES,
+                "minimum_win_rate_pct": MINIMUM_PAPER_REVIEW_WIN_RATE_PCT,
+                "minimum_average_net_return_pct_exclusive": MINIMUM_PAPER_REVIEW_AVERAGE_RETURN_PCT,
             },
             "qualified_for_paper_review": False,
             "limitations": [
@@ -680,7 +872,6 @@ class StrategyCenterService:
                 "缺少下一开市日开盘价或完整退出窗口的信号不计入已结束交易。",
             ],
         }
-        summary["qualified_for_paper_review"] = _qualifies_for_paper_review(summary)
         return {"summary": summary}
 
     @staticmethod
@@ -803,6 +994,38 @@ class StrategyCenterService:
             "started_at": run.started_at,
             "finished_at": run.finished_at,
             "error_message": run.error_message,
+        }
+
+    @staticmethod
+    def _read_optimization_run(run: StrategyOptimizationRun) -> dict:
+        return {
+            "run_code": run.run_code,
+            "strategy_version_id": run.strategy_version_id,
+            "baseline_backtest_run_id": run.baseline_backtest_run_id,
+            "status": run.status,
+            "train_end_date": run.train_end_date,
+            "search_space": run.search_space or {},
+            "requirements": run.requirements or {},
+            "summary": run.summary or {},
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "error_message": run.error_message,
+        }
+
+    @staticmethod
+    def _read_optimization_trial(trial: StrategyOptimizationTrial) -> dict:
+        return {
+            "trial_no": trial.trial_no,
+            "parameter_patch": trial.parameter_patch or {},
+            "train_summary": trial.train_summary or {},
+            "validation_summary": trial.validation_summary or {},
+            "robustness_summary": trial.robustness_summary or {},
+            "verdict": trial.verdict,
+            "rank_no": trial.rank_no,
+            # Fresh in-memory trial results are returned to the scheduler
+            # before they are re-read as ORM rows.  Persisted rows have this
+            # audit timestamp; in-memory values deliberately do not.
+            "created_at": getattr(trial, "created_at", None),
         }
 
     @staticmethod

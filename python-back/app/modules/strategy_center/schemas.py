@@ -49,6 +49,12 @@ class StrategyBacktestCreate(BaseModel):
     end_date: date
     fee_rate: float = Field(default=0.0005, ge=0, le=0.05)
     slippage_bps: float = Field(default=10, ge=0, le=1000)
+    baseline_candidate_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=1000,
+        description="仅研究回测的每日候选上限；大于策略实际候选上限时不具备 paper 审阅资格。",
+    )
 
 
 class StrategyDefinitionRead(BaseModel):

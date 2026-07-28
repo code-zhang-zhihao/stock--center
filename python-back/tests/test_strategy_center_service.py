@@ -138,6 +138,8 @@ def test_dashboard_states_that_no_execution_or_paper_trade_is_running() -> None:
 
 
 def test_paper_review_requires_broad_history_as_well_as_closed_trades() -> None:
-    assert not _qualifies_for_paper_review({"signal_trade_date_count": 10, "completed_trade_count": 299})
-    assert not _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 29})
-    assert _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 30})
+    assert not _qualifies_for_paper_review({"signal_trade_date_count": 10, "completed_trade_count": 500, "win_rate_pct": 60, "average_net_return_pct": 1})
+    assert not _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 299, "win_rate_pct": 60, "average_net_return_pct": 1})
+    assert not _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 300, "win_rate_pct": 49.9, "average_net_return_pct": 1})
+    assert not _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 300, "win_rate_pct": 50, "average_net_return_pct": 0})
+    assert _qualifies_for_paper_review({"signal_trade_date_count": 120, "completed_trade_count": 300, "win_rate_pct": 50, "average_net_return_pct": 0.01})

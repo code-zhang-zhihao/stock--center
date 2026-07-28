@@ -1,5 +1,5 @@
 import { requestData } from './client';
-import type { StrategyBacktestRun, StrategyCandidate, StrategyDashboard, StrategyDefinition, StrategyEntryMode, StrategyStatus, StrategyTemplate, StrategyVersion } from '@/types/strategy-center';
+import type { StrategyBacktestRun, StrategyCandidate, StrategyDashboard, StrategyDefinition, StrategyEntryMode, StrategyOptimizationReview, StrategyStatus, StrategyTemplate, StrategyVersion } from '@/types/strategy-center';
 
 export const strategyCenterApi = {
   dashboard: () => requestData<StrategyDashboard>({ method: 'GET', url: '/strategies/dashboard' }),
@@ -31,6 +31,7 @@ export const strategyCenterApi = {
   }),
   versions: (strategyCode: string) => requestData<StrategyVersion[]>({ method: 'GET', url: `/strategies/${encodeURIComponent(strategyCode)}/versions` }),
   backtests: (strategyCode: string) => requestData<StrategyBacktestRun[]>({ method: 'GET', url: `/strategies/${encodeURIComponent(strategyCode)}/backtests` }),
+  optimizations: (strategyCode: string) => requestData<StrategyOptimizationReview[]>({ method: 'GET', url: `/strategies/${encodeURIComponent(strategyCode)}/optimizations` }),
   createVersion: (strategyCode: string, payload: { implementation_code: string; rule_config?: Record<string, unknown>; risk_config?: Record<string, unknown> }) =>
     requestData<StrategyVersion>({ method: 'POST', url: `/strategies/${encodeURIComponent(strategyCode)}/versions`, data: payload }),
   promoteVersion: (strategyCode: string, versionNo: number) =>

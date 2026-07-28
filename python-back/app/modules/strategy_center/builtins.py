@@ -56,6 +56,24 @@ class EvaluationResult:
     skip_code: str | None = None
 
 
+@dataclass(frozen=True)
+class TunableParameterSpec:
+    """One versioned selector threshold that can be researched offline.
+
+    Values are deliberately constrained to *stricter* variants of the
+    baseline condition.  A historical optimisation can therefore filter an
+    already completed baseline without inventing candidates that were never
+    evaluated.  Wider/structurally different rules require a fresh baseline
+    version and are not presented as comparable optimisation trials.
+    """
+
+    key: str
+    label: str
+    source: str
+    comparator: str
+    candidates: tuple[float, ...]
+
+
 _SPECS: tuple[BuiltinStrategySpec, ...] = (
     BuiltinStrategySpec(
         "trend_breakout",
@@ -149,6 +167,74 @@ _SPECS: tuple[BuiltinStrategySpec, ...] = (
 
 _SPEC_BY_CODE = {item.implementation_code: item for item in _SPECS}
 
+_DEFAULT_SIGNAL_PARAMS: dict[str, dict[str, float | int]] = {
+    "trend_breakout": {"change_min": 2.0, "change_max": 9.5, "amount_ratio_min": 1.5, "close_position_min": 0.65},
+    "bullish_alignment": {"change_min": 1.0, "volume_ratio_min": 1.2},
+    "ma_golden_cross": {"change_min": 0.0, "volume_ratio_min": 1.2},
+    "volume_price_surge": {"change_min": 3.0, "change_max": 9.5, "volume_ratio_min": 1.8, "amount_ratio_min": 1.5, "close_position_min": 0.70},
+    "high_turnover_surge": {"change_min": 3.0, "change_max": 9.5, "turnover_rate_min": 8.0, "main_net_ratio_min": 0.0, "close_position_min": 0.65},
+    "low_volatility_leader": {"volatility_20d_max": 2.5, "change_min": 2.0, "volume_ratio_min": 1.3, "close_position_min": 0.65},
+    "pullback_ma20_bounce": {"ma20_touch_pct": 1.0, "volume_ratio_min": 1.0, "close_position_min": 0.60},
+    "n_day_low_reversal": {"n_day_touch_pct": 2.0, "change_min": 2.0, "volume_ratio_min": 1.2, "close_position_min": 0.70},
+    "theme_first_board_relay": {"max_heat_rank": 20},
+    "consecutive_limit_up_relay": {"board_count_min": 2, "board_count_max": 4, "max_heat_rank": 10},
+    "broken_board_recovery": {"change_min": 3.0, "volume_ratio_min": 1.5, "close_position_min": 0.72},
+}
+
+_TUNABLE_PARAMETERS: dict[str, tuple[TunableParameterSpec, ...]] = {
+    "trend_breakout": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (2.0, 3.0, 4.0, 5.0)),
+        TunableParameterSpec("signal.change_max", "当日涨幅上限", "daily_facts.change_pct", "lt", (9.5, 8.0, 7.0)),
+        TunableParameterSpec("signal.amount_ratio_min", "额比下限", "daily_facts.amount_ratio", "gte", (1.5, 2.0, 2.5)),
+        TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.65, 0.75, 0.85)),
+        TunableParameterSpec("market_gate.minimum_market_risk_on_score", "风险偏好分下限", "emotion.market_risk_on_score", "gte", (35.0, 45.0, 55.0, 65.0)),
+    ),
+    "bullish_alignment": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (1.0, 2.0, 3.0)),
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.2, 1.5, 2.0)),
+        TunableParameterSpec("market_gate.minimum_market_risk_on_score", "风险偏好分下限", "emotion.market_risk_on_score", "gte", (35.0, 45.0, 55.0, 65.0)),
+    ),
+    "ma_golden_cross": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (0.0, 1.0, 2.0)),
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.2, 1.5, 2.0)),
+        TunableParameterSpec("market_gate.minimum_market_risk_on_score", "风险偏好分下限", "emotion.market_risk_on_score", "gte", (35.0, 45.0, 55.0, 65.0)),
+    ),
+    "volume_price_surge": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (3.0, 4.0, 5.0)),
+        TunableParameterSpec("signal.change_max", "当日涨幅上限", "daily_facts.change_pct", "lt", (9.5, 8.0, 7.0)),
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.8, 2.2, 2.6)),
+        TunableParameterSpec("signal.amount_ratio_min", "额比下限", "daily_facts.amount_ratio", "gte", (1.5, 2.0, 2.5)),
+        TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.70, 0.80, 0.90)),
+    ),
+    "high_turnover_surge": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (3.0, 4.0, 5.0)),
+        TunableParameterSpec("signal.turnover_rate_min", "换手率下限", "daily_facts.turnover_rate", "gte", (8.0, 10.0, 12.0)),
+        TunableParameterSpec("signal.main_net_ratio_min", "主力净流入占比下限", "daily_facts.main_net_ratio", "gte", (0.0, 1.0, 2.0)),
+        TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.65, 0.75, 0.85)),
+    ),
+    "low_volatility_leader": (
+        TunableParameterSpec("signal.volatility_20d_max", "20日波动率上限", "daily_facts.volatility_20d", "lte", (2.5, 2.2, 2.0)),
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (2.0, 3.0, 4.0)),
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.3, 1.6, 2.0)),
+    ),
+    "pullback_ma20_bounce": (
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.0, 1.3, 1.6)),
+        TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.60, 0.70, 0.80)),
+    ),
+    "n_day_low_reversal": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (2.0, 3.0, 4.0)),
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.2, 1.5, 2.0)),
+        TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.70, 0.80, 0.90)),
+    ),
+    "theme_first_board_relay": (TunableParameterSpec("signal.max_heat_rank", "题材热度排名上限", "concept_context.best_heat_rank", "lte", (20.0, 15.0, 10.0)),),
+    "consecutive_limit_up_relay": (TunableParameterSpec("signal.max_heat_rank", "题材热度排名上限", "concept_context.best_heat_rank", "lte", (10.0, 7.0, 5.0)),),
+    "broken_board_recovery": (
+        TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (3.0, 4.0, 5.0)),
+        TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.5, 2.0, 2.5)),
+        TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.72, 0.80, 0.88)),
+    ),
+}
+
 
 def list_builtin_specs() -> list[BuiltinStrategySpec]:
     return list(_SPECS)
@@ -156,6 +242,21 @@ def list_builtin_specs() -> list[BuiltinStrategySpec]:
 
 def get_builtin_spec(implementation_code: str) -> BuiltinStrategySpec | None:
     return _SPEC_BY_CODE.get(str(implementation_code or "").strip())
+
+
+def list_tunable_parameters(implementation_code: str) -> list[dict[str, Any]]:
+    """Return the bounded, replayable search space for one implementation."""
+
+    return [
+        {
+            "key": item.key,
+            "label": item.label,
+            "source": item.source,
+            "comparator": item.comparator,
+            "candidates": list(item.candidates),
+        }
+        for item in _TUNABLE_PARAMETERS.get(implementation_code, ())
+    ]
 
 
 def default_rule_config(implementation_code: str) -> dict[str, Any]:
@@ -178,6 +279,7 @@ def default_rule_config(implementation_code: str) -> dict[str, Any]:
             "blocked_primary_stages": ["ice_point", "retreat"],
             "allow_when_emotion_unavailable": True,
         },
+        "signal": dict(_DEFAULT_SIGNAL_PARAMS[spec.implementation_code]),
         "selection": {"max_candidates": 30},
         "entry_confirmation": _default_entry_confirmation(spec.entry_mode),
     }
@@ -240,7 +342,7 @@ def evaluate_daily_candidate(
         return _skip(market_reason, context, implementation_code, rule, risk)
 
     matcher = _MATCHERS[spec.implementation_code]
-    matched, score, reasons = matcher(current, previous, history, context)
+    matched, score, reasons = matcher(current, previous, history, context, rule)
     # Rejected candidates are never persisted.  Do not allocate a full audit
     # snapshot/risk plan for every rejected stock in a historical batch.
     if not matched:
@@ -281,7 +383,7 @@ def resolve_strategy_configs(
     )
 
 
-def _trend_breakout(current, previous, history, context):
+def _trend_breakout(current, previous, history, context, rule):
     prior = history[:-1]
     prior_high = _max_num(prior[-20:], "high_price")
     close = _num(current, "close_price")
@@ -290,133 +392,163 @@ def _trend_breakout(current, previous, history, context):
     close_position = _num(current, "close_position")
     if None in (prior_high, close, change, amount_ratio, close_position):
         return _missing("trend_breakout_inputs")
-    matched = close >= prior_high and 2.0 <= change < 9.5 and amount_ratio >= 1.5 and close_position >= 0.65
+    change_min = _signal_number(rule, "change_min", 2.0)
+    change_max = _signal_number(rule, "change_max", 9.5)
+    amount_min = _signal_number(rule, "amount_ratio_min", 1.5)
+    close_min = _signal_number(rule, "close_position_min", 0.65)
+    matched = close >= prior_high and change_min <= change < change_max and amount_ratio >= amount_min and close_position >= close_min
     score = min(100.0, 45 + min((close / prior_high - 1) * 1000, 20) + min(amount_ratio * 12, 20) + close_position * 18)
     return matched, score, _reasons(
         ("breakout_close", close >= prior_high, f"收盘 {close:.2f} / 前 20 日高点 {prior_high:.2f}"),
-        ("breakout_change", 2.0 <= change < 9.5, f"涨跌幅 {change:.2f}%"),
-        ("breakout_amount", amount_ratio >= 1.5, f"额比 {amount_ratio:.2f}"),
-        ("breakout_close_position", close_position >= 0.65, f"收盘位置 {close_position:.2f}"),
+        ("breakout_change", change_min <= change < change_max, f"涨跌幅 {change:.2f}% / 区间 [{change_min:.2f}, {change_max:.2f})"),
+        ("breakout_amount", amount_ratio >= amount_min, f"额比 {amount_ratio:.2f} / 下限 {amount_min:.2f}"),
+        ("breakout_close_position", close_position >= close_min, f"收盘位置 {close_position:.2f} / 下限 {close_min:.2f}"),
     )
 
 
-def _bullish_alignment(current, previous, history, context):
+def _bullish_alignment(current, previous, history, context, rule):
     close, ma5, ma10, ma20, ma60, volume_ratio, change = _nums(
         current, "close_price", "ma5", "ma10", "ma20", "ma60", "volume_ratio", "change_pct"
     )
     if None in (close, ma5, ma10, ma20, ma60, volume_ratio, change):
         return _missing("bullish_alignment_inputs")
     alignment = close > ma5 > ma10 > ma20 > ma60
-    matched = alignment and change >= 1.0 and volume_ratio >= 1.2
+    change_min = _signal_number(rule, "change_min", 1.0)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.2)
+    matched = alignment and change >= change_min and volume_ratio >= volume_min
     score = min(100.0, 40 + _pct_gap(close, ma60) * 2 + min(volume_ratio * 12, 20) + min(change * 3, 20))
     return matched, score, _reasons(
         ("bullish_alignment", alignment, "close > MA5 > MA10 > MA20 > MA60"),
-        ("bullish_change", change >= 1.0, f"涨跌幅 {change:.2f}%"),
-        ("bullish_volume", volume_ratio >= 1.2, f"量比 {volume_ratio:.2f}"),
+        ("bullish_change", change >= change_min, f"涨跌幅 {change:.2f}% / 下限 {change_min:.2f}"),
+        ("bullish_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
     )
 
 
-def _ma_golden_cross(current, previous, history, context):
+def _ma_golden_cross(current, previous, history, context, rule):
     ma5, ma10, volume_ratio, change = _nums(current, "ma5", "ma10", "volume_ratio", "change_pct")
     prev_ma5, prev_ma10 = _nums(previous, "ma5", "ma10")
     if None in (ma5, ma10, prev_ma5, prev_ma10, volume_ratio, change):
         return _missing("ma_golden_cross_inputs")
     crossed = prev_ma5 <= prev_ma10 and ma5 > ma10
-    matched = crossed and change > 0 and volume_ratio >= 1.2
+    change_min = _signal_number(rule, "change_min", 0.0)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.2)
+    matched = crossed and change > change_min and volume_ratio >= volume_min
     score = min(100.0, 55 + min(_pct_gap(ma5, ma10) * 10, 20) + min(volume_ratio * 10, 15) + min(change * 2, 10))
     return matched, score, _reasons(
         ("golden_cross", crossed, f"昨日 MA5/MA10 {prev_ma5:.2f}/{prev_ma10:.2f}，今日 {ma5:.2f}/{ma10:.2f}"),
-        ("golden_cross_change", change > 0, f"涨跌幅 {change:.2f}%"),
-        ("golden_cross_volume", volume_ratio >= 1.2, f"量比 {volume_ratio:.2f}"),
+        ("golden_cross_change", change > change_min, f"涨跌幅 {change:.2f}% / 下限 {change_min:.2f}"),
+        ("golden_cross_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
     )
 
 
-def _volume_price_surge(current, previous, history, context):
+def _volume_price_surge(current, previous, history, context, rule):
     change, volume_ratio, amount_ratio, close_position = _nums(
         current, "change_pct", "volume_ratio", "amount_ratio", "close_position"
     )
     if None in (change, volume_ratio, amount_ratio, close_position):
         return _missing("volume_price_surge_inputs")
-    matched = 3.0 <= change < 9.5 and volume_ratio >= 1.8 and amount_ratio >= 1.5 and close_position >= 0.70
+    change_min = _signal_number(rule, "change_min", 3.0)
+    change_max = _signal_number(rule, "change_max", 9.5)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.8)
+    amount_min = _signal_number(rule, "amount_ratio_min", 1.5)
+    close_min = _signal_number(rule, "close_position_min", 0.70)
+    matched = change_min <= change < change_max and volume_ratio >= volume_min and amount_ratio >= amount_min and close_position >= close_min
     score = min(100.0, 35 + change * 4 + min(volume_ratio * 12, 25) + min(amount_ratio * 8, 15) + close_position * 15)
     return matched, score, _reasons(
-        ("surge_change", 3.0 <= change < 9.5, f"涨跌幅 {change:.2f}%"),
-        ("surge_volume", volume_ratio >= 1.8, f"量比 {volume_ratio:.2f}"),
-        ("surge_amount", amount_ratio >= 1.5, f"额比 {amount_ratio:.2f}"),
-        ("surge_close_position", close_position >= 0.70, f"收盘位置 {close_position:.2f}"),
+        ("surge_change", change_min <= change < change_max, f"涨跌幅 {change:.2f}% / 区间 [{change_min:.2f}, {change_max:.2f})"),
+        ("surge_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
+        ("surge_amount", amount_ratio >= amount_min, f"额比 {amount_ratio:.2f} / 下限 {amount_min:.2f}"),
+        ("surge_close_position", close_position >= close_min, f"收盘位置 {close_position:.2f} / 下限 {close_min:.2f}"),
     )
 
 
-def _high_turnover_surge(current, previous, history, context):
+def _high_turnover_surge(current, previous, history, context, rule):
     change, turnover, close_position, main_inflow, main_ratio = _nums(
         current, "change_pct", "turnover_rate", "close_position", "main_net_inflow", "main_net_ratio"
     )
     if None in (change, turnover, close_position, main_inflow, main_ratio):
         return _missing("high_turnover_surge_inputs")
-    matched = 3.0 <= change < 9.5 and turnover >= 8.0 and main_inflow > 0 and main_ratio > 0 and close_position >= 0.65
+    change_min = _signal_number(rule, "change_min", 3.0)
+    change_max = _signal_number(rule, "change_max", 9.5)
+    turnover_min = _signal_number(rule, "turnover_rate_min", 8.0)
+    main_ratio_min = _signal_number(rule, "main_net_ratio_min", 0.0)
+    close_min = _signal_number(rule, "close_position_min", 0.65)
+    matched = change_min <= change < change_max and turnover >= turnover_min and main_inflow > 0 and main_ratio > main_ratio_min and close_position >= close_min
     score = min(100.0, 30 + change * 3 + min(turnover * 2.5, 25) + min(main_ratio * 3, 20) + close_position * 15)
     return matched, score, _reasons(
-        ("turnover_change", 3.0 <= change < 9.5, f"涨跌幅 {change:.2f}%"),
-        ("turnover_rate", turnover >= 8.0, f"换手率 {turnover:.2f}%"),
-        ("turnover_main_flow", main_inflow > 0 and main_ratio > 0, f"主力净流入 {main_inflow:.0f}，占比 {main_ratio:.2f}%"),
-        ("turnover_close_position", close_position >= 0.65, f"收盘位置 {close_position:.2f}"),
+        ("turnover_change", change_min <= change < change_max, f"涨跌幅 {change:.2f}% / 区间 [{change_min:.2f}, {change_max:.2f})"),
+        ("turnover_rate", turnover >= turnover_min, f"换手率 {turnover:.2f}% / 下限 {turnover_min:.2f}"),
+        ("turnover_main_flow", main_inflow > 0 and main_ratio > main_ratio_min, f"主力净流入 {main_inflow:.0f}，占比 {main_ratio:.2f}% / 下限 {main_ratio_min:.2f}"),
+        ("turnover_close_position", close_position >= close_min, f"收盘位置 {close_position:.2f} / 下限 {close_min:.2f}"),
     )
 
 
-def _low_volatility_leader(current, previous, history, context):
+def _low_volatility_leader(current, previous, history, context, rule):
     close, ma20, volatility, volume_ratio, close_position, change = _nums(
         current, "close_price", "ma20", "volatility_20d", "volume_ratio", "close_position", "change_pct"
     )
     if None in (close, ma20, volatility, volume_ratio, close_position, change):
         return _missing("low_volatility_leader_inputs")
-    matched = close > ma20 and volatility <= 2.5 and change >= 2.0 and volume_ratio >= 1.3 and close_position >= 0.65
+    volatility_max = _signal_number(rule, "volatility_20d_max", 2.5)
+    change_min = _signal_number(rule, "change_min", 2.0)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.3)
+    close_min = _signal_number(rule, "close_position_min", 0.65)
+    matched = close > ma20 and volatility <= volatility_max and change >= change_min and volume_ratio >= volume_min and close_position >= close_min
     score = min(100.0, 45 + _pct_gap(close, ma20) * 4 + max(0, 20 - volatility * 6) + min(volume_ratio * 8, 15) + min(change * 2, 12))
     return matched, score, _reasons(
         ("low_vol_trend", close > ma20, f"收盘 {close:.2f} / MA20 {ma20:.2f}"),
-        ("low_volatility", volatility <= 2.5, f"20 日波动率 {volatility:.2f}%"),
-        ("low_vol_change", change >= 2.0, f"涨跌幅 {change:.2f}%"),
-        ("low_vol_volume", volume_ratio >= 1.3, f"量比 {volume_ratio:.2f}"),
+        ("low_volatility", volatility <= volatility_max, f"20 日波动率 {volatility:.2f}% / 上限 {volatility_max:.2f}"),
+        ("low_vol_change", change >= change_min, f"涨跌幅 {change:.2f}% / 下限 {change_min:.2f}"),
+        ("low_vol_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
     )
 
 
-def _pullback_ma20_bounce(current, previous, history, context):
+def _pullback_ma20_bounce(current, previous, history, context, rule):
     low, close, open_price, ma5, ma10, ma20, volume_ratio, close_position = _nums(
         current, "low_price", "close_price", "open_price", "ma5", "ma10", "ma20", "volume_ratio", "close_position"
     )
     if None in (low, close, open_price, ma5, ma10, ma20, volume_ratio, close_position):
         return _missing("pullback_ma20_bounce_inputs")
-    touched = low <= ma20 * 1.01
+    touch_pct = _signal_number(rule, "ma20_touch_pct", 1.0)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.0)
+    close_min = _signal_number(rule, "close_position_min", 0.60)
+    touched = low <= ma20 * (1 + touch_pct / 100)
     recovered = close >= ma20 and close > open_price
     trend_intact = ma5 >= ma10 >= ma20
-    matched = touched and recovered and trend_intact and volume_ratio >= 1.0 and close_position >= 0.60
+    matched = touched and recovered and trend_intact and volume_ratio >= volume_min and close_position >= close_min
     score = min(100.0, 45 + (10 if touched else 0) + (15 if recovered else 0) + min(volume_ratio * 8, 15) + close_position * 15)
     return matched, score, _reasons(
-        ("ma20_touch", touched, f"最低 {low:.2f} / MA20 {ma20:.2f}"),
+        ("ma20_touch", touched, f"最低 {low:.2f} / MA20 {ma20:.2f}，允许偏离 {touch_pct:.2f}%"),
         ("ma20_recovery", recovered, f"收盘 {close:.2f} / 开盘 {open_price:.2f}"),
         ("ma20_trend", trend_intact, "MA5 ≥ MA10 ≥ MA20"),
-        ("ma20_volume", volume_ratio >= 1.0, f"量比 {volume_ratio:.2f}"),
+        ("ma20_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
+        ("ma20_close_position", close_position >= close_min, f"收盘位置 {close_position:.2f} / 下限 {close_min:.2f}"),
     )
 
 
-def _n_day_low_reversal(current, previous, history, context):
+def _n_day_low_reversal(current, previous, history, context, rule):
     prior_low = _min_num(history[:-1][-20:], "low_price")
     low, close, open_price, change, close_position, volume_ratio = _nums(
         current, "low_price", "close_price", "open_price", "change_pct", "close_position", "volume_ratio"
     )
     if None in (prior_low, low, close, open_price, change, close_position, volume_ratio):
         return _missing("n_day_low_reversal_inputs")
-    touched = low <= prior_low * 1.02
-    reversal = close > open_price and change >= 2.0 and close_position >= 0.70
-    matched = touched and reversal and volume_ratio >= 1.2
+    touch_pct = _signal_number(rule, "n_day_touch_pct", 2.0)
+    change_min = _signal_number(rule, "change_min", 2.0)
+    close_min = _signal_number(rule, "close_position_min", 0.70)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.2)
+    touched = low <= prior_low * (1 + touch_pct / 100)
+    reversal = close > open_price and change >= change_min and close_position >= close_min
+    matched = touched and reversal and volume_ratio >= volume_min
     score = min(100.0, 40 + (15 if touched else 0) + min(change * 4, 25) + min(volume_ratio * 10, 15) + close_position * 12)
     return matched, score, _reasons(
-        ("low_reversal_touch", touched, f"最低 {low:.2f} / 前 20 日低点 {prior_low:.2f}"),
-        ("low_reversal_price", reversal, f"开收 {open_price:.2f}/{close:.2f}，涨跌幅 {change:.2f}%"),
-        ("low_reversal_volume", volume_ratio >= 1.2, f"量比 {volume_ratio:.2f}"),
+        ("low_reversal_touch", touched, f"最低 {low:.2f} / 前 20 日低点 {prior_low:.2f}，允许偏离 {touch_pct:.2f}%"),
+        ("low_reversal_price", reversal, f"开收 {open_price:.2f}/{close:.2f}，涨跌幅 {change:.2f}% / 下限 {change_min:.2f}"),
+        ("low_reversal_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
     )
 
 
-def _theme_first_board_relay(current, previous, history, context):
+def _theme_first_board_relay(current, previous, history, context, rule):
     event = context.get("limit_event") or {}
     evidence = context.get("limit_evidence") or {}
     concepts = list(context.get("concept_context") or [])
@@ -425,17 +557,18 @@ def _theme_first_board_relay(current, previous, history, context):
     open_count = _int(event.get("open_count"))
     best_rank = _best_heat_rank(concepts)
     natural = is_limit_up and (open_count is None or open_count > 0)
-    matched = natural and board_count == 1 and best_rank is not None and best_rank <= 20
+    max_heat_rank = int(_signal_number(rule, "max_heat_rank", 20))
+    matched = natural and board_count == 1 and best_rank is not None and best_rank <= max_heat_rank
     score = min(100.0, 55 + (20 if natural else 0) + max(0, 20 - (best_rank or 99)) + (5 if board_count == 1 else 0))
     return matched, score, _reasons(
         ("first_board_limit_up", is_limit_up, "当日涨停事实"),
         ("first_board_natural", natural, f"开板次数 {open_count if open_count is not None else '缺失'}"),
         ("first_board_count", board_count == 1, f"连板高度 {board_count if board_count is not None else '缺失'}"),
-        ("first_board_theme", best_rank is not None and best_rank <= 20, f"最佳概念热度排名 {best_rank if best_rank is not None else '缺失'}"),
+        ("first_board_theme", best_rank is not None and best_rank <= max_heat_rank, f"最佳概念热度排名 {best_rank if best_rank is not None else '缺失'} / 上限 {max_heat_rank}"),
     )
 
 
-def _consecutive_limit_up_relay(current, previous, history, context):
+def _consecutive_limit_up_relay(current, previous, history, context, rule):
     event = context.get("limit_event") or {}
     evidence = context.get("limit_evidence") or {}
     concepts = list(context.get("concept_context") or [])
@@ -444,33 +577,39 @@ def _consecutive_limit_up_relay(current, previous, history, context):
     open_count = _int(event.get("open_count"))
     best_rank = _best_heat_rank(concepts)
     natural = is_limit_up and (open_count is None or open_count > 0)
-    matched = natural and board_count is not None and 2 <= board_count <= 4 and best_rank is not None and best_rank <= 10
+    board_min = int(_signal_number(rule, "board_count_min", 2))
+    board_max = int(_signal_number(rule, "board_count_max", 4))
+    max_heat_rank = int(_signal_number(rule, "max_heat_rank", 10))
+    matched = natural and board_count is not None and board_min <= board_count <= board_max and best_rank is not None and best_rank <= max_heat_rank
     score = min(100.0, 50 + (board_count or 0) * 8 + max(0, 18 - (best_rank or 99)) + (12 if natural else 0))
     return matched, score, _reasons(
         ("relay_limit_up", is_limit_up, "当日涨停事实"),
         ("relay_natural", natural, f"开板次数 {open_count if open_count is not None else '缺失'}"),
-        ("relay_board_count", board_count is not None and 2 <= board_count <= 4, f"连板高度 {board_count if board_count is not None else '缺失'}"),
-        ("relay_theme", best_rank is not None and best_rank <= 10, f"最佳概念热度排名 {best_rank if best_rank is not None else '缺失'}"),
+        ("relay_board_count", board_count is not None and board_min <= board_count <= board_max, f"连板高度 {board_count if board_count is not None else '缺失'} / 区间 [{board_min}, {board_max}]"),
+        ("relay_theme", best_rank is not None and best_rank <= max_heat_rank, f"最佳概念热度排名 {best_rank if best_rank is not None else '缺失'} / 上限 {max_heat_rank}"),
     )
 
 
-def _broken_board_recovery(current, previous, history, context):
+def _broken_board_recovery(current, previous, history, context, rule):
     event = context.get("limit_event") or {}
     close_position, volume_ratio, change = _nums(current, "close_position", "volume_ratio", "change_pct")
     is_break = str(event.get("event_type") or "") == "limit_break"
     if None in (close_position, volume_ratio, change):
         return _missing("broken_board_recovery_inputs")
-    matched = is_break and change >= 3.0 and close_position >= 0.72 and volume_ratio >= 1.5
+    change_min = _signal_number(rule, "change_min", 3.0)
+    close_min = _signal_number(rule, "close_position_min", 0.72)
+    volume_min = _signal_number(rule, "volume_ratio_min", 1.5)
+    matched = is_break and change >= change_min and close_position >= close_min and volume_ratio >= volume_min
     score = min(100.0, 35 + (25 if is_break else 0) + min(change * 3, 20) + min(volume_ratio * 8, 12) + close_position * 12)
     return matched, score, _reasons(
         ("broken_board_event", is_break, "当日炸板事实"),
-        ("broken_board_change", change >= 3.0, f"涨跌幅 {change:.2f}%"),
-        ("broken_board_close", close_position >= 0.72, f"收盘位置 {close_position:.2f}"),
-        ("broken_board_volume", volume_ratio >= 1.5, f"量比 {volume_ratio:.2f}"),
+        ("broken_board_change", change >= change_min, f"涨跌幅 {change:.2f}% / 下限 {change_min:.2f}"),
+        ("broken_board_close", close_position >= close_min, f"收盘位置 {close_position:.2f} / 下限 {close_min:.2f}"),
+        ("broken_board_volume", volume_ratio >= volume_min, f"量比 {volume_ratio:.2f} / 下限 {volume_min:.2f}"),
     )
 
 
-_MATCHERS: dict[str, Callable[[dict, dict, list[dict], dict], tuple[bool, float | None, list[dict[str, Any]]]]] = {
+_MATCHERS: dict[str, Callable[[dict, dict, list[dict], dict, dict], tuple[bool, float | None, list[dict[str, Any]]]]] = {
     "trend_breakout": _trend_breakout,
     "bullish_alignment": _bullish_alignment,
     "ma_golden_cross": _ma_golden_cross,
@@ -483,6 +622,11 @@ _MATCHERS: dict[str, Callable[[dict, dict, list[dict], dict], tuple[bool, float 
     "consecutive_limit_up_relay": _consecutive_limit_up_relay,
     "broken_board_recovery": _broken_board_recovery,
 }
+
+
+def _signal_number(rule: dict[str, Any], key: str, fallback: float) -> float:
+    value = _num(rule.get("signal") or {}, key)
+    return value if value is not None else fallback
 
 
 def _check_universe(context: dict[str, Any], current: dict[str, Any], rule: dict[str, Any]) -> str | None:

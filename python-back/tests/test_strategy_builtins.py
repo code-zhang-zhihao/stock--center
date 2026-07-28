@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from app.modules.strategy_center.builtins import evaluate_daily_candidate, list_builtin_specs, resolve_strategy_configs
+from app.modules.strategy_center.builtins import evaluate_daily_candidate, list_builtin_specs, list_tunable_parameters, resolve_strategy_configs
 from app.modules.strategy_center.repository import _backtest_prefilter_conditions
 from app.modules.strategy_center.service import StrategyCenterService, _history_by_stock
 
@@ -112,6 +112,19 @@ def test_resolved_configs_preserve_single_stock_evaluator_result():
         resolved_risk_config=risk,
     )
     assert batched == direct
+
+
+def test_tunable_rule_parameters_change_the_evaluator_without_dynamic_code():
+    context = _base_context()
+    strict = evaluate_daily_candidate(
+        "trend_breakout",
+        context,
+        rule_config={"signal": {"amount_ratio_min": 2.1}},
+    )
+    assert strict.matched is False
+    assert any(item["code"] == "breakout_amount" and not item["passed"] for item in strict.reasons)
+    parameters = list_tunable_parameters("trend_breakout")
+    assert {item["key"] for item in parameters} >= {"signal.amount_ratio_min", "market_gate.minimum_market_risk_on_score"}
 
 
 def test_theme_relay_requires_limit_evidence_and_hot_concept_context():
