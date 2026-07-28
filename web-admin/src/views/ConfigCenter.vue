@@ -201,9 +201,6 @@
         <n-form-item label="名称">
           <n-input v-model:value="valueEditForm.value_name" />
         </n-form-item>
-        <n-form-item label="状态">
-          <n-select v-model:value="valueEditForm.status" :options="valueStatusOptions" />
-        </n-form-item>
         <n-form-item :label="`替换 ${secretInputLabel}`">
           <n-input v-model:value="valueEditForm.secret" type="password" show-password-on="click" placeholder="留空则不修改" />
         </n-form-item>
@@ -313,7 +310,6 @@ const valueForm = reactive({
 const valueEditId = ref<number | null>(null);
 const valueEditForm = reactive({
   value_name: '',
-  status: 'active',
   secret: '',
   endpoint_url: '',
   priority: 100,
@@ -322,7 +318,6 @@ const valueEditForm = reactive({
   description: '',
 });
 
-const valueStatusOptions = ['active', 'cooldown', 'invalid', 'disabled'].map((value) => ({ label: value, value }));
 const valueKindOptions = computed(() => {
   if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'redis_cache') return [{ label: 'redis_url', value: 'redis_url' }];
   if (activeCategory.value === 'market_data' && selectedItem.value?.config.config_code === 'tickflow') return [{ label: 'api_key', value: 'api_key' }];
@@ -418,10 +413,20 @@ const valueColumns = computed<DataTableColumns<ConfigValue>>(() => {
     key: 'actions',
     width: 250,
     render(row) {
+      const enabled = isValueEnabled(row);
       return h(NSpace, { size: 6 }, () => [
         h(NButton, { size: 'tiny', secondary: true, onClick: () => openValueEdit(row) }, { default: () => '编辑' }),
         h(NButton, { size: 'tiny', secondary: true, onClick: () => testValue(row) }, { default: () => '测试' }),
-        h(NButton, { size: 'tiny', secondary: true, type: 'warning', onClick: () => disableValue(row) }, { default: () => '停用' }),
+        h(
+          NButton,
+          {
+            size: 'tiny',
+            secondary: true,
+            type: enabled ? 'warning' : 'success',
+            onClick: () => (enabled ? disableValue(row) : enableValue(row)),
+          },
+          { default: () => (enabled ? '停用' : '启用') },
+        ),
         h(NButton, { size: 'tiny', secondary: true, type: 'error', onClick: () => deleteValue(row) }, { default: () => '删除' }),
       ]);
     },
@@ -608,7 +613,7 @@ async function saveValue() {
       endpoint_url: isEndpointValueConfig.value ? (valueForm.endpoint_url.trim() || null) : undefined,
       priority: valueForm.priority,
       weight: valueForm.weight,
-      status: 'active',
+      status: valueForm.is_enabled ? 'active' : 'disabled',
       is_enabled: valueForm.is_enabled,
       description: valueForm.description || null,
       metadata: {},
@@ -628,7 +633,6 @@ async function saveValue() {
 function openValueEdit(row: ConfigValue) {
   valueEditId.value = row.id;
   valueEditForm.value_name = row.value_name;
-  valueEditForm.status = row.status;
   valueEditForm.secret = '';
   valueEditForm.endpoint_url = row.endpoint_url || '';
   valueEditForm.priority = row.priority;
@@ -644,7 +648,7 @@ async function saveValueEdit() {
   try {
     await configApi.updateValue(valueEditId.value, {
       value_name: valueEditForm.value_name,
-      status: valueEditForm.status,
+      status: valueEditForm.is_enabled ? 'active' : 'disabled',
       ...(valueEditForm.secret.trim() ? { secret: valueEditForm.secret.trim() } : {}),
       ...(isEndpointValueConfig.value ? { endpoint_url: valueEditForm.endpoint_url.trim() || null } : {}),
       priority: valueEditForm.priority,
@@ -662,6 +666,28 @@ async function saveValueEdit() {
   } finally {
     savingValue.value = false;
   }
+}
+
+function isValueEnabled(row: ConfigValue): boolean {
+  return row.status === 'active' && row.is_enabled;
+}
+
+function enableValue(row: ConfigValue) {
+  dialog.success({
+    title: '启用敏感值',
+    content: `确认启用 "${row.value_name}"？它会重新加入运行时凭据池。`,
+    positiveText: '启用',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      await configApi.updateValue(row.id, {
+        status: 'active',
+        is_enabled: true,
+        cooldown_until: null,
+      });
+      await reloadActive();
+      message.success('敏感值已启用');
+    },
+  });
 }
 
 function disableValue(row: ConfigValue) {

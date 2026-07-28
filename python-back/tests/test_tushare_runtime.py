@@ -84,6 +84,95 @@ def test_rate_limited_tushare_token_enters_cooldown_then_falls_back() -> None:
     asyncio.run(run())
 
 
+def test_empty_response_falls_back_to_next_token() -> None:
+    async def run() -> None:
+        repository = FakeRepository()
+        factory = TushareProviderFactory(repository)
+        endpoints: list[str] = []
+
+        async def operation(provider):
+            endpoints.append(provider.api_url)
+            return SimpleNamespace(records=[] if provider.token == "first-token" else [{"ts_code": "000001.SZ"}])
+
+        result = await factory.call(
+            "daily_market_close_daily_basic",
+            operation,
+        )
+
+        assert result.records == [{"ts_code": "000001.SZ"}]
+        assert endpoints == ["http://first.example.test", "http://second.example.test"]
+        assert repository.used == [2]
+        failed_calls = [row for row in repository.calls if row["status"] == "failed"]
+        assert failed_calls[0]["error_code"] == "tushare_empty_response"
+        assert "first-token" not in str(repository.calls)
+
+    asyncio.run(run())
+
+
+def test_empty_response_can_opt_out_of_token_fallback() -> None:
+    async def run() -> None:
+        repository = FakeRepository()
+        factory = TushareProviderFactory(repository)
+        calls: list[str] = []
+
+        async def operation(provider):
+            calls.append(provider.token)
+            return SimpleNamespace(records=[])
+
+        result = await factory.call(
+            "daily_market_close_stock_suspend",
+            operation,
+            fallback_on_empty_response=False,
+        )
+
+        assert result.records == []
+        assert calls == ["first-token"]
+        assert repository.used == [1]
+
+    asyncio.run(run())
+
+
+def test_all_tokens_empty_returns_the_last_empty_response() -> None:
+    async def run() -> None:
+        repository = FakeRepository()
+        factory = TushareProviderFactory(repository)
+        calls: list[str] = []
+
+        async def operation(provider):
+            calls.append(provider.token)
+            return SimpleNamespace(records=[])
+
+        result = await factory.call("daily_market_close_daily_basic", operation)
+
+        assert result.records == []
+        assert calls == ["first-token", "second-token"]
+        assert repository.used == [2]
+        failed_calls = [row for row in repository.calls if row["status"] == "failed"]
+        assert [row["error_code"] for row in failed_calls] == ["tushare_empty_response"]
+
+    asyncio.run(run())
+
+
+def test_empty_mapped_row_collection_falls_back_to_next_token() -> None:
+    async def run() -> None:
+        repository = FakeRepository()
+        factory = TushareProviderFactory(repository)
+        calls: list[str] = []
+
+        async def operation(provider):
+            calls.append(provider.token)
+            rows = [] if provider.token == "first-token" else [{"stock_code": "000001"}]
+            return rows, [{"raw": True}]
+
+        result = await factory.call("stock_basic", operation)
+
+        assert result[0] == [{"stock_code": "000001"}]
+        assert calls == ["first-token", "second-token"]
+        assert repository.used == [2]
+
+    asyncio.run(run())
+
+
 def test_token_endpoint_falls_back_to_config_default_when_override_is_empty() -> None:
     repository = FakeRepository()
     repository.values[0].endpoint_url = None

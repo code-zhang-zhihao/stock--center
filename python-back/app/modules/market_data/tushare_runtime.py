@@ -50,6 +50,7 @@ class TushareProviderFactory:
         *,
         request_summary: dict | None = None,
         execution_mode: Literal["interactive", "scheduler"] = "interactive",
+        fallback_on_empty_response: bool = True,
     ) -> T:
         config, options, values = await self._load_candidates()
         request_summary = json_safe(request_summary or {})
@@ -96,6 +97,23 @@ class TushareProviderFactory:
                     await self._record_failure(config, value, capability, wrapped, elapsed, request_summary, attempt)
                     errors.append(f"{value.fingerprint}: {exc}")
                     break
+                if fallback_on_empty_response and len(candidates) > 1 and self._response_has_no_records(result):
+                    elapsed = int((perf_counter() - started) * 1000)
+                    empty_response = TushareTransportError(
+                        "Tushare endpoint returned an empty response",
+                        kind="empty_response",
+                    )
+                    await self._record_failure(
+                        config,
+                        value,
+                        capability,
+                        empty_response,
+                        elapsed,
+                        request_summary,
+                        attempt,
+                    )
+                    errors.append(f"{value.fingerprint}: {empty_response}")
+                    break
                 elapsed = int((perf_counter() - started) * 1000)
                 await self.repository.mark_value_used(value.id)
                 await self.repository.record_call(
@@ -118,6 +136,26 @@ class TushareProviderFactory:
                 return result
             candidates = [item for item in candidates if item[0].id != value.id]
         raise TushareRuntimeError("Tushare all configured tokens failed: " + "; ".join(errors))
+
+    @staticmethod
+    def _response_has_no_records(result: T) -> bool:
+        records = getattr(result, "records", None)
+        if records is not None:
+            return not records
+        rows = getattr(result, "rows", None)
+        if rows is not None:
+            return not rows
+        if isinstance(result, tuple) and result:
+            return TushareProviderFactory._payload_has_no_records(result[0])
+        return TushareProviderFactory._payload_has_no_records(result)
+
+    @staticmethod
+    def _payload_has_no_records(payload: object) -> bool:
+        if payload is None:
+            return True
+        if isinstance(payload, dict):
+            return not payload or all(TushareProviderFactory._payload_has_no_records(value) for value in payload.values())
+        return isinstance(payload, (list, tuple, set)) and not payload
 
     async def probe_value(self, value_id: int) -> TushareProbeResult:
         value = await self.repository.get_value(value_id)
