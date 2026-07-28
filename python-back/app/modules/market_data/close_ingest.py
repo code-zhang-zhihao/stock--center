@@ -59,6 +59,11 @@ class DailyMarketCloseIngestRequest(BaseModel):
     sync_index_bars: bool = True
     sync_index_daily_basic: bool = True
     sync_north_hold: bool = False
+    # Scheduler defaults opt in through migration 67.  Keeping request-level
+    # defaults off makes ad-hoc/narrow repair payloads explicit and prevents a
+    # surprise Provider call when callers construct this model directly.
+    sync_market_north_flow: bool = False
+    sync_delayed_external_confirmations: bool = False
     sync_market_stats: bool = True
     sync_sector_bars: bool = True
     sync_sector_moneyflow: bool = True
@@ -93,6 +98,8 @@ class DailyMarketCloseIngestResult(BaseModel):
     index_bar_rows: int = 0
     index_daily_basic_rows: int = 0
     north_hold_rows: int = 0
+    market_north_flow_rows: int = 0
+    delayed_external_confirmation_rows: int = 0
     market_stat_rows: int = 0
     sector_bar_rows: int = 0
     sector_moneyflow_rows: int = 0
@@ -711,6 +718,24 @@ class DailyMarketCloseIngestService:
                 ),
             },
             {
+                "label": "market north flow",
+                "enabled": payload.sync_market_north_flow,
+                "target": "market_north_flow_rows",
+                "mode": "single_date",
+                "range_start_date": trade_date,
+                "range_end_date": trade_date,
+                "operation": lambda service: service._sync_market_north_flow(trade_date),
+            },
+            {
+                "label": "delayed external confirmations",
+                "enabled": payload.sync_delayed_external_confirmations,
+                "target": "delayed_external_confirmation_rows",
+                "mode": "recent_open_dates",
+                "range_start_date": None,
+                "range_end_date": trade_date,
+                "operation": lambda service: service._sync_delayed_external_confirmations(trade_date, universe_set),
+            },
+            {
                 "label": "sector moneyflow",
                 "enabled": payload.sync_sector_moneyflow,
                 "target": "sector_moneyflow_rows",
@@ -766,6 +791,13 @@ class DailyMarketCloseIngestService:
             ):
                 block_result["status"] = "deferred"
                 block_result["reason"] = "daily_info_not_published"
+            if (
+                label == "market north flow"
+                and block_result.get("status") == "success"
+                and int(block_result.get("rows") or 0) == 0
+            ):
+                block_result["status"] = "deferred"
+                block_result["reason"] = "moneyflow_hsgt_not_published"
             if (
                 label == "sector bars"
                 and block_result.get("status") == "success"
@@ -1368,6 +1400,144 @@ class DailyMarketCloseIngestService:
                 )
         await self._capture_raw_summary("daily_market_close_north_hold", trade_date, {"api_name": "hk_hold", "used_date": used_date.isoformat(), "row_count": len(records)}, len(rows), normalized_table="t_stock_north_hold_daily")
         return await self.repository.upsert_north_hold_rows(rows)
+
+    async def _sync_market_north_flow(self, trade_date: date) -> int:
+        """Persist the market-level northbound flow published by Tushare.
+
+        Provider values intentionally retain their provider unit.  The unit is
+        stored beside the source data rather than guessing a conversion during
+        a market-emotion calculation.
+        """
+        response = await self._tushare_response(
+            "moneyflow_hsgt",
+            {"start_date": trade_date, "end_date": trade_date},
+            capability="daily_market_close_market_north_flow",
+        )
+        rows: list[dict] = []
+        for record in response.records:
+            row_date = parse_date(record.get("trade_date"))
+            if row_date != trade_date:
+                continue
+            rows.append(
+                {
+                    "trade_date": row_date,
+                    "source": "tushare:moneyflow_hsgt",
+                    "hgt": safe_float(record.get("hgt")),
+                    "sgt": safe_float(record.get("sgt")),
+                    "north_money": safe_float(record.get("north_money")),
+                    "ggt_ss": safe_float(record.get("ggt_ss")),
+                    "ggt_sz": safe_float(record.get("ggt_sz")),
+                    "south_money": safe_float(record.get("south_money")),
+                    "metadata_json": {
+                        "provider": "tushare",
+                        "api_name": "moneyflow_hsgt",
+                        "value_unit": "provider_reported",
+                        "raw": record,
+                    },
+                }
+            )
+        await self._capture_raw_summary(
+            "daily_market_close_market_north_flow",
+            trade_date,
+            response.raw_payload,
+            len(rows),
+            normalized_table="t_market_north_flow_daily",
+            status="captured" if rows else "failed",
+            error_code=None if rows else "moneyflow_hsgt_not_published",
+            error_message=None if rows else "moneyflow_hsgt 未返回目标交易日数据",
+        )
+        return await self.repository.upsert_market_north_flow_rows(rows)
+
+    async def _sync_delayed_external_confirmations(self, trade_date: date, universe: set[str]) -> int:
+        """Fill the last five published days of delayed north-hold and margin facts.
+
+        These facts are intentionally not a same-day completion condition.  A
+        provider may publish them one or more trade days later; saving the
+        actual ``trade_date`` makes that lag visible to the V2 report.
+        """
+        dates = sorted(await self.repository.recent_open_trade_dates(up_to=trade_date, limit=5))
+        north_rows: list[dict] = []
+        margin_rows: list[dict] = []
+        for observed_date in dates:
+            hold_response = await self._tushare_response(
+                "hk_hold",
+                {"trade_date": observed_date},
+                capability="daily_market_close_delayed_north_hold",
+            )
+            mapped_hold: list[dict] = []
+            for record in hold_response.records:
+                stock_code = normalize_symbol(str(record.get("ts_code") or record.get("code") or ""))
+                row_date = parse_date(record.get("trade_date"))
+                if not stock_code or row_date is None or stock_code not in universe:
+                    continue
+                mapped_hold.append(
+                    {
+                        "stock_code": stock_code,
+                        "stock_name": record.get("name"),
+                        "trade_date": row_date,
+                        "exchange": str(record.get("exchange") or record.get("market") or "ALL"),
+                        "source": "tushare:hk_hold",
+                        "hold_volume": safe_float(record.get("vol") or record.get("hold_vol")),
+                        "hold_ratio": safe_float(record.get("ratio") or record.get("hold_ratio")),
+                        "hold_market_value": safe_float(record.get("amount") or record.get("hold_amount")),
+                        "hold_volume_change": safe_float(record.get("vol_change") or record.get("hold_vol_chg")),
+                        "metadata_json": {"provider": "tushare", "api_name": "hk_hold", "raw": record},
+                    }
+                )
+            north_rows.extend(mapped_hold)
+            await self._capture_raw_summary(
+                "daily_market_close_delayed_north_hold",
+                observed_date,
+                hold_response.raw_payload,
+                len(mapped_hold),
+                normalized_table="t_stock_north_hold_daily",
+                status="captured" if mapped_hold else "failed",
+                error_code=None if mapped_hold else "hk_hold_not_published",
+                error_message=None if mapped_hold else "hk_hold 未返回该披露日数据",
+            )
+
+            margin_records: list[dict] = []
+            for exchange in ("SSE", "SZSE"):
+                response = await self._tushare_response(
+                    "margin",
+                    {"trade_date": observed_date, "exchange_id": exchange},
+                    capability="daily_market_close_delayed_margin",
+                )
+                margin_records.extend(response.records)
+            mapped_margin: list[dict] = []
+            for record in margin_records:
+                row_date = parse_date(record.get("trade_date"))
+                if row_date is None:
+                    continue
+                exchange = str(record.get("exchange_id") or record.get("exchange") or "UNKNOWN").upper()
+                mapped_margin.append(
+                    {
+                        "trade_date": row_date,
+                        "exchange": exchange,
+                        "source": "tushare:margin",
+                        "rzye": safe_float(record.get("rzye")),
+                        "rz_mre": safe_float(record.get("rzmre") or record.get("rz_mre")),
+                        "rzche": safe_float(record.get("rzche")),
+                        "rqye": safe_float(record.get("rqye")),
+                        "rq_mcl": safe_float(record.get("rqmcl") or record.get("rq_mcl")),
+                        "rzrqye": safe_float(record.get("rzrqye")),
+                        "metadata_json": {"provider": "tushare", "api_name": "margin", "raw": record},
+                    }
+                )
+            margin_rows.extend(mapped_margin)
+            await self._capture_raw_summary(
+                "daily_market_close_delayed_margin",
+                observed_date,
+                {"api_name": "margin", "exchanges": ["SSE", "SZSE"], "records": margin_records},
+                len(mapped_margin),
+                normalized_table="t_margin_summary_daily",
+                status="captured" if mapped_margin else "failed",
+                error_code=None if mapped_margin else "margin_not_published",
+                error_message=None if mapped_margin else "margin 未返回该披露日数据",
+            )
+        north_upserted = await self.repository.upsert_north_hold_rows(north_rows)
+        margin_upserted = await self.repository.upsert_margin_summary_rows(margin_rows)
+        return north_upserted + margin_upserted
 
     async def _sync_market_stats(self, trade_date: date, *, start_date: date | None = None, end_date: date | None = None) -> int:
         request_start_date = start_date or trade_date

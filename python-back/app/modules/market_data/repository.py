@@ -16,9 +16,11 @@ from app.modules.market_data.models import (
     LhbSeatDetail,
     MarketUniverse,
     MarketUniverseMember,
+    MarketNorthFlowDaily,
     LimitEventDaily,
     MarketDailyStat,
     MinuteBar,
+    MarginSummaryDaily,
     ProviderRawRecord,
     QuoteSnapshot,
     SectorBasic,
@@ -1115,6 +1117,20 @@ class MarketDataRepository:
             StockNorthHoldDaily,
             rows,
             conflict_attrs=["stock_code", "trade_date", "exchange"],
+        )
+
+    async def upsert_market_north_flow_rows(self, rows: list[dict]) -> int:
+        return await self.upsert_rows(
+            MarketNorthFlowDaily,
+            rows,
+            conflict_attrs=["trade_date", "source"],
+        )
+
+    async def upsert_margin_summary_rows(self, rows: list[dict]) -> int:
+        return await self.upsert_rows(
+            MarginSummaryDaily,
+            rows,
+            conflict_attrs=["trade_date", "exchange", "source"],
         )
 
     async def upsert_sector_bar_rows(self, rows: list[dict]) -> int:

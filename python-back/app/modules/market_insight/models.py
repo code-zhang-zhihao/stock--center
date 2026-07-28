@@ -46,6 +46,63 @@ class MarketSentimentDaily(Base):
     )
 
 
+class MarketEmotionModel(Base):
+    """Administrator-managed, immutable-on-publish V2 emotion model definition."""
+
+    __tablename__ = "t_market_emotion_model"
+    __table_args__ = (UniqueConstraint("model_code", name="uq_t_market_emotion_model_code"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    model_code: Mapped[str] = mapped_column(String(80), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    percentile_window_days: Mapped[int] = mapped_column(BigInteger, nullable=False, default=120)
+    minimum_history_days: Mapped[int] = mapped_column(BigInteger, nullable=False, default=60)
+    baseline_trade_days: Mapped[int] = mapped_column(BigInteger, nullable=False, default=250)
+    parameter_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    calibration_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class MarketEmotionDaily(Base):
+    """One V2 dual-score observation retaining every scoring input and decision."""
+
+    __tablename__ = "t_market_emotion_daily"
+    __table_args__ = (
+        UniqueConstraint("trade_date", "model_code", name="uq_t_market_emotion_daily_business"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    model_code: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    short_term_score: Mapped[float | None] = mapped_column(Float)
+    market_risk_on_score: Mapped[float | None] = mapped_column(Float)
+    primary_stage_code: Mapped[str | None] = mapped_column(String(40))
+    auxiliary_state_code: Mapped[str | None] = mapped_column(String(40))
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    scorecards: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    stage_evidence: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    coverage: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    parameter_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    external_confirmations: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class MarketSectorHeatDaily(Base):
     """Versioned post-close heat facts for Tushare concept sectors."""
 

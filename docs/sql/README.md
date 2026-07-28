@@ -70,6 +70,7 @@
 64. `64-daily-close-late-facts-enrichment.sql`：将已执行旧四级流水线的涨跌停/炸板、停复牌和板块日线从 18:00 核心任务迁到 21:30 增强任务，只更新调度描述、默认 payload 和 metadata。
 65. `65-market-daily-sentiment.sql`：创建版本化 `t_market_sentiment_daily`，并 seed 22:15 的 `calculate_market_daily_sentiment` 每日任务；评分只读取 canonical 日线、涨跌停事件和交易日历，数据不足时记录 `pending`，不调用外部 Provider 或 LLM。
 66. `66-market-daily-review-facts.sql`：创建 `t_market_sector_heat_daily/t_market_limit_up_evidence_daily`，扩展同一 22:15 任务为每日市场报告事实；概念热度直接聚合成分股事实，不依赖可能延迟的 `ths_daily`，龙虎榜与公告只保存关联证据，绝不写成涨停因果结论。脚本会把历史 `ths_daily` 空响应的错误 `captured` Raw 标记改为合法的 `failed`，并保留专用错误码。
+67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 
 ## 产品化初始化规划
 

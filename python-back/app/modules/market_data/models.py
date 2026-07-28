@@ -721,6 +721,26 @@ class StockNorthHoldDaily(Base):
     updated_at = updated_at_column()
 
 
+class MarketNorthFlowDaily(Base):
+    """Canonical daily Stock Connect aggregate flow from Tushare moneyflow_hsgt."""
+
+    __tablename__ = "t_market_north_flow_daily"
+    __table_args__ = (UniqueConstraint("trade_date", "source", name="uq_t_market_north_flow_daily_business"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    hgt: Mapped[float | None]
+    sgt: Mapped[float | None]
+    north_money: Mapped[float | None]
+    ggt_ss: Mapped[float | None]
+    ggt_sz: Mapped[float | None]
+    south_money: Mapped[float | None]
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    created_at = created_at_column()
+    updated_at = updated_at_column()
+
+
 class SectorFactorDaily(Base):
     __tablename__ = "t_sector_factor_daily"
     __table_args__ = (UniqueConstraint("sector_code", "trade_date", name="uq_t_sector_factor_daily_business"),)

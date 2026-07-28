@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import Date, and_, cast, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
@@ -9,16 +9,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.modules.market_data.models import (
     Announcement,
     DailyBar,
+    IndexBar,
     LhbEvent,
     LimitEventDaily,
+    MarginSummaryDaily,
+    MarketNorthFlowDaily,
     ProviderRawRecord,
     SectorBasic,
     SectorComponent,
     Stock,
+    StockDailyBasic,
+    StockFactorDaily,
     StockFundFlowDaily,
+    StockNorthHoldDaily,
     TradeCalendar,
 )
-from app.modules.market_insight.models import MarketLimitUpEvidenceDaily, MarketSectorHeatDaily, MarketSentimentDaily
+from app.modules.market_insight.models import (
+    MarketEmotionDaily,
+    MarketEmotionModel,
+    MarketLimitUpEvidenceDaily,
+    MarketSectorHeatDaily,
+    MarketSentimentDaily,
+)
 
 
 def _active_stock_filters() -> tuple:
@@ -649,6 +661,375 @@ class MarketInsightRepository:
             "sector_heat_count": int(sector_count.scalar_one() or 0),
             "limit_up_evidence_count": int(evidence_count.scalar_one() or 0),
         }
+
+    # V2 emotion model persistence -------------------------------------------------
+
+    async def list_emotion_models(self) -> list[MarketEmotionModel]:
+        rows = await self.session.execute(select(MarketEmotionModel).order_by(MarketEmotionModel.updated_at.desc()))
+        return list(rows.scalars().all())
+
+    async def get_emotion_model(self, model_code: str) -> MarketEmotionModel | None:
+        return (
+            await self.session.execute(select(MarketEmotionModel).where(MarketEmotionModel.model_code == model_code))
+        ).scalar_one_or_none()
+
+    async def active_emotion_model(self) -> MarketEmotionModel | None:
+        return (
+            await self.session.execute(
+                select(MarketEmotionModel)
+                .where(MarketEmotionModel.status == "active")
+                .order_by(MarketEmotionModel.published_at.desc().nulls_last(), MarketEmotionModel.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    async def create_emotion_model(self, row: dict) -> MarketEmotionModel:
+        model = MarketEmotionModel(**row)
+        self.session.add(model)
+        await self.session.flush()
+        return model
+
+    async def update_emotion_model(self, model: MarketEmotionModel, values: dict) -> MarketEmotionModel:
+        for key, value in values.items():
+            setattr(model, key, value)
+        await self.session.flush()
+        return model
+
+    async def activate_emotion_model(self, model: MarketEmotionModel) -> MarketEmotionModel:
+        active_models = await self.session.execute(
+            select(MarketEmotionModel).where(
+                MarketEmotionModel.status == "active",
+                MarketEmotionModel.model_code != model.model_code,
+            )
+        )
+        for active in active_models.scalars().all():
+            active.status = "archived"
+        model.status = "active"
+        model.published_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return model
+
+    async def emotion_rows_before(self, *, model_code: str, trade_date: date, limit: int) -> list[MarketEmotionDaily]:
+        rows = await self.session.execute(
+            select(MarketEmotionDaily)
+            .where(
+                MarketEmotionDaily.model_code == model_code,
+                MarketEmotionDaily.trade_date < trade_date,
+                MarketEmotionDaily.status.in_(("ready", "degraded")),
+            )
+            .order_by(MarketEmotionDaily.trade_date.desc())
+            .limit(limit)
+        )
+        return list(reversed(rows.scalars().all()))
+
+    async def upsert_emotion_daily_rows(self, rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        for offset in range(0, len(rows), 100):
+            statement = insert(MarketEmotionDaily).values(rows[offset : offset + 100])
+            await self.session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[MarketEmotionDaily.trade_date, MarketEmotionDaily.model_code],
+                    set_={
+                        "status": statement.excluded.status,
+                        "short_term_score": statement.excluded.short_term_score,
+                        "market_risk_on_score": statement.excluded.market_risk_on_score,
+                        "primary_stage_code": statement.excluded.primary_stage_code,
+                        "auxiliary_state_code": statement.excluded.auxiliary_state_code,
+                        "metrics": statement.excluded.metrics,
+                        "scorecards": statement.excluded.scorecards,
+                        "stage_evidence": statement.excluded.stage_evidence,
+                        "coverage": statement.excluded.coverage,
+                        "parameter_snapshot": statement.excluded.parameter_snapshot,
+                        "external_confirmations": statement.excluded.external_confirmations,
+                        "calculated_at": func.now(),
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+        return len(rows)
+
+    async def emotion_daily(self, *, model_code: str, trade_date: date | None = None) -> MarketEmotionDaily | None:
+        statement = select(MarketEmotionDaily).where(MarketEmotionDaily.model_code == model_code)
+        if trade_date is not None:
+            statement = statement.where(MarketEmotionDaily.trade_date == trade_date)
+        return (
+            await self.session.execute(statement.order_by(MarketEmotionDaily.trade_date.desc()).limit(1))
+        ).scalar_one_or_none()
+
+    async def emotion_history(self, *, model_code: str, limit: int = 60) -> list[MarketEmotionDaily]:
+        rows = await self.session.execute(
+            select(MarketEmotionDaily)
+            .where(MarketEmotionDaily.model_code == model_code)
+            .order_by(MarketEmotionDaily.trade_date.desc())
+            .limit(limit)
+        )
+        return list(reversed(rows.scalars().all()))
+
+    async def v2_market_metrics(self, trade_dates: list[date]) -> dict[date, dict]:
+        """Aggregate V2 inputs from a listing-day-aware eligible universe.
+
+        The sixth and twentieth open dates are correlated lookups against the
+        CN trade calendar.  This keeps the "exclude first five trading days"
+        rule exact without running a full-history row-number window for every
+        daily calculation.  Only a short pre-window is read for the 20-day
+        high/low window.
+        """
+        if not trade_dates:
+            return {}
+        min_date = min(trade_dates)
+        max_date = max(trade_dates)
+        sixth_open_date = self._open_date_after_listing(offset=5)
+        twentieth_open_date = self._open_date_after_listing(offset=19)
+        ranked_bars = (
+            select(
+                DailyBar.stock_code.label("stock_code"),
+                DailyBar.trade_date.label("trade_date"),
+                DailyBar.open_price.label("open_price"),
+                DailyBar.high_price.label("high_price"),
+                DailyBar.low_price.label("low_price"),
+                DailyBar.close_price.label("close_price"),
+                DailyBar.change_pct.label("change_pct"),
+                DailyBar.amount_yuan.label("amount_yuan"),
+                twentieth_open_date.label("twentieth_open_date"),
+                func.max(DailyBar.close_price)
+                .over(partition_by=DailyBar.stock_code, order_by=DailyBar.trade_date, rows=(-19, 0))
+                .label("high_20"),
+                func.min(DailyBar.close_price)
+                .over(partition_by=DailyBar.stock_code, order_by=DailyBar.trade_date, rows=(-19, 0))
+                .label("low_20"),
+            )
+            .join(Stock, Stock.stock_code == DailyBar.stock_code)
+            .where(
+                DailyBar.trade_date >= min_date - timedelta(days=60),
+                DailyBar.trade_date <= max_date,
+                Stock.list_date.is_not(None),
+                DailyBar.trade_date >= sixth_open_date,
+                *_active_stock_filters(),
+            )
+            .cte("v2_ranked_bars")
+        )
+        rows = await self.session.execute(
+            select(
+                ranked_bars.c.trade_date.label("trade_date"),
+                func.count().label("daily_bar_count"),
+                func.count().filter(ranked_bars.c.change_pct > 0).label("up_count"),
+                func.count().filter(ranked_bars.c.change_pct < 0).label("down_count"),
+                func.count().filter(ranked_bars.c.change_pct == 0).label("flat_count"),
+                func.count().filter(ranked_bars.c.change_pct >= 5).label("wide_up_count"),
+                func.count().filter(ranked_bars.c.change_pct <= -5).label("wide_down_count"),
+                func.avg(ranked_bars.c.change_pct).label("average_change_pct"),
+                func.percentile_cont(0.5).within_group(ranked_bars.c.change_pct.asc()).label("median_change_pct"),
+                func.sum(ranked_bars.c.amount_yuan).label("total_amount_yuan"),
+                func.sum(StockFundFlowDaily.main_net_inflow).label("main_net_inflow"),
+                func.avg(StockFundFlowDaily.main_net_ratio).label("main_net_ratio"),
+                func.count().filter(ranked_bars.c.close_price >= StockFactorDaily.ma20).label("above_ma20_count"),
+                func.count().filter(ranked_bars.c.close_price >= StockFactorDaily.ma60).label("above_ma60_count"),
+                func.count(StockFactorDaily.id).label("factor_count"),
+                func.count().filter(ranked_bars.c.trade_date >= ranked_bars.c.twentieth_open_date).label("twenty_day_stock_count"),
+                func.count().filter(
+                    and_(ranked_bars.c.trade_date >= ranked_bars.c.twentieth_open_date, ranked_bars.c.close_price >= ranked_bars.c.high_20)
+                ).label("new_high_20_count"),
+                func.count().filter(
+                    and_(ranked_bars.c.trade_date >= ranked_bars.c.twentieth_open_date, ranked_bars.c.close_price <= ranked_bars.c.low_20)
+                ).label("new_low_20_count"),
+                func.avg(StockFactorDaily.volatility_20d).label("volatility_20d"),
+                func.avg(StockFactorDaily.amount_ratio).label("amount_ratio"),
+                func.avg(StockDailyBasic.turnover_rate).label("turnover_rate"),
+            )
+            .select_from(ranked_bars)
+            .outerjoin(
+                StockFundFlowDaily,
+                and_(
+                    StockFundFlowDaily.stock_code == ranked_bars.c.stock_code,
+                    StockFundFlowDaily.trade_date == ranked_bars.c.trade_date,
+                ),
+            )
+            .outerjoin(
+                StockFactorDaily,
+                and_(
+                    StockFactorDaily.stock_code == ranked_bars.c.stock_code,
+                    StockFactorDaily.trade_date == ranked_bars.c.trade_date,
+                    StockFactorDaily.source == "system:daily_close",
+                ),
+            )
+            .outerjoin(
+                StockDailyBasic,
+                and_(
+                    StockDailyBasic.stock_code == ranked_bars.c.stock_code,
+                    StockDailyBasic.trade_date == ranked_bars.c.trade_date,
+                ),
+            )
+            .where(ranked_bars.c.trade_date.in_(trade_dates))
+            .group_by(ranked_bars.c.trade_date)
+        )
+        return {
+            row.trade_date: {
+                "daily_bar_count": int(row.daily_bar_count or 0),
+                "up_count": int(row.up_count or 0),
+                "down_count": int(row.down_count or 0),
+                "flat_count": int(row.flat_count or 0),
+                "wide_up_count": int(row.wide_up_count or 0),
+                "wide_down_count": int(row.wide_down_count or 0),
+                "average_change_pct": _float_or_none(row.average_change_pct),
+                "median_change_pct": _float_or_none(row.median_change_pct),
+                "total_amount_yuan": _float_or_none(row.total_amount_yuan),
+                "main_net_inflow": _float_or_none(row.main_net_inflow),
+                "main_net_ratio": _float_or_none(row.main_net_ratio),
+                "above_ma20_count": int(row.above_ma20_count or 0),
+                "above_ma60_count": int(row.above_ma60_count or 0),
+                "factor_count": int(row.factor_count or 0),
+                "twenty_day_stock_count": int(row.twenty_day_stock_count or 0),
+                "new_high_20_count": int(row.new_high_20_count or 0),
+                "new_low_20_count": int(row.new_low_20_count or 0),
+                "volatility_20d": _float_or_none(row.volatility_20d),
+                "amount_ratio": _float_or_none(row.amount_ratio),
+                "turnover_rate": _float_or_none(row.turnover_rate),
+            }
+            for row in rows
+        }
+
+    async def v2_limit_event_rows(self, trade_dates: list[date]) -> dict[date, list[dict]]:
+        if not trade_dates:
+            return {}
+        sixth_open_date = self._open_date_after_listing(offset=5)
+        rows = await self.session.execute(
+            select(
+                LimitEventDaily.trade_date,
+                LimitEventDaily.stock_code,
+                LimitEventDaily.event_type,
+                LimitEventDaily.limit_price,
+                LimitEventDaily.open_count,
+                DailyBar.open_price,
+                DailyBar.close_price,
+            )
+            .join(Stock, Stock.stock_code == LimitEventDaily.stock_code)
+            .join(
+                DailyBar,
+                and_(
+                    DailyBar.stock_code == LimitEventDaily.stock_code,
+                    DailyBar.trade_date == LimitEventDaily.trade_date,
+                ),
+            )
+            .where(
+                LimitEventDaily.trade_date.in_(trade_dates),
+                LimitEventDaily.event_type.in_(("limit_up", "limit_down", "limit_break")),
+                Stock.list_date.is_not(None),
+                LimitEventDaily.trade_date >= sixth_open_date,
+                *_active_stock_filters(),
+            )
+        )
+        result: dict[date, list[dict]] = {}
+        for row in rows:
+            result.setdefault(row.trade_date, []).append(
+                {
+                    "stock_code": str(row.stock_code),
+                    "event_type": str(row.event_type),
+                    "limit_price": _float_or_none(row.limit_price),
+                    "open_count": int(row.open_count) if row.open_count is not None else None,
+                    "open_price": _float_or_none(row.open_price),
+                    "close_price": _float_or_none(row.close_price),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _open_date_after_listing(*, offset: int):
+        return (
+            select(TradeCalendar.trade_date)
+            .where(
+                TradeCalendar.market == "CN",
+                TradeCalendar.is_open.is_(True),
+                TradeCalendar.trade_date >= Stock.list_date,
+            )
+            .order_by(TradeCalendar.trade_date)
+            .offset(offset)
+            .limit(1)
+            .correlate(Stock)
+            .scalar_subquery()
+        )
+
+    async def v2_index_metrics(self, trade_dates: list[date]) -> dict[date, dict]:
+        if not trade_dates:
+            return {}
+        rows = await self.session.execute(
+            select(
+                IndexBar.trade_date,
+                func.count(IndexBar.id).label("index_count"),
+                func.avg(IndexBar.change_pct).label("average_change_pct"),
+                func.avg((IndexBar.high_price - IndexBar.low_price) / func.nullif(IndexBar.close_price, 0) * 100).label("amplitude_pct"),
+            )
+            .where(IndexBar.trade_date.in_(trade_dates))
+            .group_by(IndexBar.trade_date)
+        )
+        return {
+            row.trade_date: {
+                "index_count": int(row.index_count or 0),
+                "core_index_change_pct": _float_or_none(row.average_change_pct),
+                "index_amplitude_pct": _float_or_none(row.amplitude_pct),
+            }
+            for row in rows
+        }
+
+    async def v2_north_flows(self, trade_dates: list[date]) -> dict[date, dict]:
+        if not trade_dates:
+            return {}
+        rows = await self.session.execute(
+            select(MarketNorthFlowDaily).where(MarketNorthFlowDaily.trade_date.in_(trade_dates))
+        )
+        return {
+            row.trade_date: {
+                "north_money": _float_or_none(row.north_money),
+                "source": row.source,
+                "value_unit": (row.metadata_json or {}).get("value_unit", "provider_reported"),
+            }
+            for row in rows.scalars().all()
+        }
+
+    async def v2_theme_metrics(self, trade_dates: list[date]) -> dict[date, list[dict]]:
+        if not trade_dates:
+            return {}
+        rows = await self.session.execute(
+            select(MarketSectorHeatDaily)
+            .where(
+                MarketSectorHeatDaily.trade_date.in_(trade_dates),
+                MarketSectorHeatDaily.calculation_version == "v1",
+                MarketSectorHeatDaily.status == "ready",
+            )
+            .order_by(MarketSectorHeatDaily.trade_date, MarketSectorHeatDaily.heat_rank.asc().nulls_last())
+        )
+        result: dict[date, list[dict]] = {}
+        for row in rows.scalars().all():
+            result.setdefault(row.trade_date, []).append(
+                {
+                    "sector_code": row.sector_code,
+                    "heat_score": _float_or_none(row.heat_score),
+                    "heat_rank": int(row.heat_rank) if row.heat_rank is not None else None,
+                    "limit_up_stock_count": int((row.metrics or {}).get("limit_up_stock_count") or 0),
+                    "priced_component_count": int((row.metrics or {}).get("priced_component_count") or 0),
+                    "average_change_pct": _float_or_none((row.metrics or {}).get("average_change_pct")),
+                }
+            )
+        return result
+
+    async def v2_external_confirmations(self, *, up_to: date) -> dict:
+        latest_hold = (
+            await self.session.execute(
+                select(func.max(StockNorthHoldDaily.trade_date)).where(StockNorthHoldDaily.trade_date <= up_to)
+            )
+        ).scalar_one_or_none()
+        latest_margin = (
+            await self.session.execute(
+                select(func.max(MarginSummaryDaily.trade_date)).where(MarginSummaryDaily.trade_date <= up_to)
+            )
+        ).scalar_one_or_none()
+        payload: dict = {"north_hold_latest_trade_date": latest_hold, "margin_latest_trade_date": latest_margin}
+        if latest_margin is not None:
+            total = await self.session.execute(
+                select(func.sum(MarginSummaryDaily.rzrqye)).where(MarginSummaryDaily.trade_date == latest_margin)
+            )
+            payload["margin_rzrqye"] = _float_or_none(total.scalar_one_or_none())
+        return payload
 
     async def commit(self) -> None:
         await self.session.commit()
