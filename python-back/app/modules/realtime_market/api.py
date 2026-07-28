@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import date
 
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
@@ -40,9 +41,9 @@ async def market_events(limit: int = Query(default=80, ge=1, le=120)):
 
 
 @router.get("/post-close-structure")
-async def post_close_structure():
+async def post_close_structure(trade_date: date | None = Query(default=None)):
     """Completed daily limit-event facts for the market overview page."""
-    return ApiResponse.ok(await realtime_market_service.post_close_structure())
+    return ApiResponse.ok(await realtime_market_service.post_close_structure(trade_date=trade_date))
 
 
 @router.get("/quotes")

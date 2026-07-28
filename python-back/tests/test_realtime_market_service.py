@@ -1,6 +1,7 @@
 import asyncio
 from datetime import date, datetime, time, timezone
 
+import app.modules.realtime_market.service as realtime_market_service_module
 from app.modules.realtime_market.schemas import RealtimeBlockMeta, RealtimeSettings
 from app.modules.realtime_market.service import RealtimeMarketService
 from app.modules.market_data.providers import MootdxProvider
@@ -244,6 +245,46 @@ def test_post_close_structure_does_not_treat_unfinished_zero_event_date_as_zero_
     assert structure["available"] is False
     assert structure["reason"] == "limit_event_ingest_incomplete"
     assert structure["summary"] is None
+
+
+def test_post_close_structure_reads_an_explicit_report_date_without_replacing_latest_cache(monkeypatch):
+    selected_date = date(2026, 7, 23)
+    service = RealtimeMarketService()
+    service._post_close_structure = {"available": True, "trade_date": "2026-07-24", "summary": {"limit_up_count": 1}}
+    requested_dates: list[date | None] = []
+
+    class SessionContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Repository:
+        def __init__(self, session):
+            self.session = session
+
+        async def latest_post_close_limit_events(self, *, trade_date=None):
+            requested_dates.append(trade_date)
+            return {
+                "trade_date": trade_date,
+                "trade_dates": [trade_date],
+                "active_count": 2,
+                "daily_bar_count": 2,
+                "limit_event_complete": True,
+                "completion_capabilities": ["daily_market_close_stock_limit"],
+                "events": [],
+            }
+
+    monkeypatch.setattr(realtime_market_service_module, "get_sessionmaker", lambda: lambda: SessionContext())
+    monkeypatch.setattr(realtime_market_service_module, "RealtimeMarketRepository", Repository)
+
+    structure = asyncio.run(service.post_close_structure(trade_date=selected_date))
+
+    assert requested_dates == [selected_date]
+    assert structure["available"] is True
+    assert structure["trade_date"] == "2026-07-23"
+    assert service._post_close_structure["trade_date"] == "2026-07-24"
 
 
 def test_concept_strength_exposes_explainable_heat_and_intraday_rank_delta():

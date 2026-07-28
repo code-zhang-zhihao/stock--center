@@ -234,36 +234,44 @@ class RealtimeMarketService:
             "items": self._market_events[-limit:],
         }
 
-    async def post_close_structure(self) -> dict:
+    async def post_close_structure(self, *, trade_date: date | None = None) -> dict:
         """Return completed daily limit-event facts for the market dashboard.
 
         This path is intentionally read-only and does not depend on a live
         Quote round.  It is the factual input for later emotion/report logic,
         not an emotion score or a trading signal by itself.
         """
+        # Historical reports are user-selected and are read directly.  Keeping
+        # the small live/latest cache separate prevents a historical lookup
+        # from evicting the dashboard's newest fact snapshot.
+        if trade_date is not None:
+            return await self._load_post_close_structure(trade_date=trade_date)
         if clock.monotonic() - self._post_close_structure_loaded_clock < self._post_close_structure_cache_seconds():
             return self._post_close_structure
         async with self._post_close_structure_lock:
             if clock.monotonic() - self._post_close_structure_loaded_clock < self._post_close_structure_cache_seconds():
                 return self._post_close_structure
-            try:
-                sessionmaker = get_sessionmaker()
-                async with sessionmaker() as session:
-                    repository = RealtimeMarketRepository(session)
-                    raw = await repository.latest_post_close_limit_events()
-                self._post_close_structure = self._build_post_close_structure(raw)
-            except Exception as exc:
-                logger.exception("post-close market structure load failed")
-                self._post_close_structure = {
-                    "available": False,
-                    "reason": "post_close_structure_load_failed",
-                    "trade_date": None,
-                    "summary": None,
-                    "ladders": [],
-                    "limit_breaks": [],
-                }
+            self._post_close_structure = await self._load_post_close_structure()
             self._post_close_structure_loaded_clock = clock.monotonic()
             return self._post_close_structure
+
+    async def _load_post_close_structure(self, *, trade_date: date | None = None) -> dict:
+        try:
+            sessionmaker = get_sessionmaker()
+            async with sessionmaker() as session:
+                repository = RealtimeMarketRepository(session)
+                raw = await repository.latest_post_close_limit_events(trade_date=trade_date)
+            return self._build_post_close_structure(raw)
+        except Exception:
+            logger.exception("post-close market structure load failed")
+            return {
+                "available": False,
+                "reason": "post_close_structure_load_failed",
+                "trade_date": trade_date.isoformat() if trade_date else None,
+                "summary": None,
+                "ladders": [],
+                "limit_breaks": [],
+            }
 
     def _post_close_structure_cache_seconds(self) -> int:
         return POST_CLOSE_STRUCTURE_CACHE_SECONDS if self._post_close_structure.get("available") else POST_CLOSE_STRUCTURE_PENDING_CACHE_SECONDS

@@ -13,7 +13,11 @@ export const realtimeMarketApi = {
   marketOverview: () => requestData<RealtimeMarketOverview>({ method: 'GET', url: '/realtime/market-overview' }),
   marketTimeline: (limit = 180) => requestData<RealtimeMarketTimeline>({ method: 'GET', url: '/realtime/market-timeline', params: { limit } }),
   marketEvents: (limit = 80) => requestData<RealtimeMarketEvents>({ method: 'GET', url: '/realtime/market-events', params: { limit } }),
-  postCloseStructure: () => requestData<PostCloseMarketStructure>({ method: 'GET', url: '/realtime/post-close-structure' }),
+  postCloseStructure: (params?: { trade_date?: string }) => requestData<PostCloseMarketStructure>({
+    method: 'GET',
+    url: '/realtime/post-close-structure',
+    params,
+  }),
   sectors: (sectorType: 'concept' | 'industry', limit = 100) => requestData<RealtimeSectorList>({
     method: 'GET',
     url: '/realtime/sectors',

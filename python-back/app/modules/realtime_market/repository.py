@@ -71,8 +71,13 @@ class RealtimeMarketRepository:
             for stock_code, ma5, ma20, ma60 in rows.all()
         }
 
-    async def latest_post_close_limit_events(self, *, lookback_trade_days: int = 20) -> dict:
-        """Read the completed limit-event facts needed by the post-close board ladder.
+    async def latest_post_close_limit_events(
+        self,
+        *,
+        trade_date: date | None = None,
+        lookback_trade_days: int = 20,
+    ) -> dict:
+        """Read one trading day's completed limit-event facts for the board ladder.
 
         The caller receives the provider completion evidence separately from
         event rows.  This is important because a legitimate zero-row
@@ -84,11 +89,13 @@ class RealtimeMarketRepository:
             Stock.is_st.is_(False),
             Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
         )
-        # This must remain an index-friendly date lookup.  Joining the entire
-        # history to the active stock universe before ``max(trade_date)``
-        # forces a costly scan on a large daily-bar table.  We validate active
-        # daily-bar coverage separately below, using the chosen newest date.
-        target_date = (await self.session.execute(select(func.max(DailyBar.trade_date)))).scalar_one_or_none()
+        # The default must remain an index-friendly latest-date lookup.  An
+        # explicit date is used by the historical post-close report: all of
+        # its cards must read the same persisted trading-day facts rather than
+        # independently choosing their own newest available date.
+        target_date = trade_date
+        if target_date is None:
+            target_date = (await self.session.execute(select(func.max(DailyBar.trade_date)))).scalar_one_or_none()
         if target_date is None:
             return {
                 "trade_date": None,
