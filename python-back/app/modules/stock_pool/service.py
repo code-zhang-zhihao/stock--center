@@ -104,8 +104,17 @@ class StockPoolService:
 
     async def list_members(self, *, pool_code: str, keyword: str | None, page: int, page_size: int) -> dict:
         pool = await self._require_pool(pool_code)
-        if pool.is_dynamic:
+        if pool.is_dynamic and pool.dynamic_rule == "active_a_share":
             items, total = await self.repository.list_dynamic_active_members(keyword=keyword, page=page, page_size=page_size)
+        elif pool.is_dynamic and pool.dynamic_rule == "strategy_candidates":
+            items, total = await self.repository.list_strategy_candidate_members(
+                pool_id=pool.id,
+                keyword=keyword,
+                page=page,
+                page_size=page_size,
+            )
+        elif pool.is_dynamic:
+            raise StockPoolError("dynamic_stock_pool_rule_unknown", f"未知动态股票池规则: {pool.dynamic_rule or '-'}")
         else:
             items, total = await self.repository.list_members(pool_id=pool.id, keyword=keyword, page=page, page_size=page_size)
         return {"items": items, "total": total, "page": page, "page_size": page_size}
@@ -144,11 +153,18 @@ class StockPoolService:
 
     async def member_detail(self, *, pool_code: str, stock_code: str) -> dict:
         pool = await self._require_pool(pool_code)
-        detail = (
-            await self.repository.get_dynamic_member_detail(pool_code=pool.pool_code, stock_code=stock_code)
-            if pool.is_dynamic
-            else await self.repository.get_member_detail(pool_id=pool.id, pool_code=pool.pool_code, stock_code=stock_code)
-        )
+        if pool.is_dynamic and pool.dynamic_rule == "active_a_share":
+            detail = await self.repository.get_dynamic_member_detail(pool_code=pool.pool_code, stock_code=stock_code)
+        elif pool.is_dynamic and pool.dynamic_rule == "strategy_candidates":
+            detail = await self.repository.get_strategy_candidate_member_detail(
+                pool_id=pool.id,
+                pool_code=pool.pool_code,
+                stock_code=stock_code,
+            )
+        elif pool.is_dynamic:
+            raise StockPoolError("dynamic_stock_pool_rule_unknown", f"未知动态股票池规则: {pool.dynamic_rule or '-'}")
+        else:
+            detail = await self.repository.get_member_detail(pool_id=pool.id, pool_code=pool.pool_code, stock_code=stock_code)
         if detail is None:
             raise StockPoolError("stock_pool_member_not_found", f"股票池成员不存在: {pool_code}/{stock_code}")
         return detail

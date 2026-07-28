@@ -20,6 +20,7 @@ from app.modules.realtime_market.service import realtime_market_service
 from app.modules.scheduler_center.api import router as scheduler_router
 from app.modules.scheduler_center.runtime import scheduler_runtime
 from app.modules.stock_pool.api import router as stock_pool_router
+from app.modules.strategy_center.api import router as strategy_center_router
 
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ def create_app() -> FastAPI:
     app.include_router(market_insight_router, prefix="/api/v1/market-insights", tags=["market-insights"])
     app.include_router(scheduler_router, prefix="/api/v1/scheduler", tags=["scheduler"])
     app.include_router(stock_pool_router, prefix="/api/v1/stock-pools", tags=["stock-pools"])
+    app.include_router(strategy_center_router, prefix="/api/v1/strategies", tags=["strategies"])
     app.include_router(data_assets_router, prefix="/api/v1/data-assets", tags=["data-assets"])
     app.include_router(realtime_market_router, prefix="/api/v1/realtime", tags=["realtime-market"])
 

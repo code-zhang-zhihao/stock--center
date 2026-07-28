@@ -35,7 +35,7 @@
 </template>
 
 <script setup lang="ts">
-import { Activity, BrainCircuit, CalendarClock, Database, FileText, Gauge, Layers3, LineChart, ListChecks, Settings, ShieldCheck } from 'lucide-vue-next';
+import { Activity, BrainCircuit, CalendarClock, Database, FileText, Gauge, Layers3, LineChart, ListChecks, Settings, ShieldCheck, Target } from 'lucide-vue-next';
 import { useRoute } from 'vue-router';
 
 const route = useRoute();
@@ -44,12 +44,13 @@ const navItems = [
   { path: '/settings/search', matchPrefix: '/settings', label: '系统设置中心', icon: Settings },
   { path: '/data-center', matchPrefix: '/data-center', label: '数据中心', icon: Database },
   { path: '/market-overview', matchPrefix: '/market-overview', label: '实时市场总览', icon: Gauge },
-  { path: '/post-close-market', matchPrefix: '/post-close-market', label: '盘后市场复盘', icon: FileText },
+  { path: '/post-close-market', matchPrefix: '/post-close-market', label: '每日盘后报告', icon: FileText },
   { path: '/emotion-models', matchPrefix: '/emotion-models', label: '情绪模型', icon: BrainCircuit },
   { path: '/scheduler', matchPrefix: '/scheduler', label: '调度任务', icon: CalendarClock },
   { path: '/sector-dashboard', matchPrefix: '/sector-dashboard', label: '板块资金大屏', icon: Activity },
   { path: '/sectors', matchPrefix: '/sectors', label: '板块中心', icon: Layers3 },
   { path: '/stock-pools', matchPrefix: '/stock-pools', label: '股票池', icon: ListChecks },
+  { path: '/strategies', matchPrefix: '/strategies', label: '策略中心', icon: Target },
   { path: '/market', matchPrefix: '/market', label: '个股行情', icon: LineChart },
 ];
 

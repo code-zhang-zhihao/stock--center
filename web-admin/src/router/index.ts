@@ -11,6 +11,7 @@ import SectorDashboard from '@/views/SectorDashboard.vue';
 import SectorDetail from '@/views/SectorDetail.vue';
 import StockPoolCenter from '@/views/StockPoolCenter.vue';
 import StockMarketWorkbench from '@/views/StockMarketWorkbench.vue';
+import StrategyCenter from '@/views/StrategyCenter.vue';
 
 const router = createRouter({
   history: createWebHistory(),
@@ -30,6 +31,7 @@ const router = createRouter({
         { path: 'sectors', name: 'sector-center', component: SectorCenter },
         { path: 'sectors/:sectorCode', name: 'sector-detail', component: SectorDetail },
         { path: 'stock-pools', name: 'stock-pool-center', component: StockPoolCenter },
+        { path: 'strategies', name: 'strategy-center', component: StrategyCenter },
         { path: 'market', name: 'stock-market-workbench', component: StockMarketWorkbench },
         { path: 'config/:domain?', redirect: (to) => `/settings/${to.params.domain || 'search'}` },
       ],

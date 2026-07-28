@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import MarketUniverse, MarketUniverseMember, SectorBasic, SectorComponent, Stock
 from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
+from app.modules.strategy_center.models import StrategyCandidate, StrategyDefinition
 
 
 class StockPoolRepository:
@@ -25,6 +26,8 @@ class StockPoolRepository:
             resolved_count = int(member_count)
             if pool.is_dynamic and pool.dynamic_rule == "active_a_share":
                 resolved_count = int(await self.session.scalar(select(func.count()).select_from(Stock).where(Stock.status == "active")) or 0)
+            elif pool.is_dynamic and pool.dynamic_rule == "strategy_candidates":
+                resolved_count = await self.strategy_candidate_member_count(pool_id=pool.id)
             rows.append({"pool": pool, "policy": policy, "member_count": resolved_count})
         return rows
 
@@ -126,6 +129,88 @@ class StockPoolRepository:
                 select(Stock.stock_code, Stock.stock_name, Stock.updated_at.label("created_at"))
                 .where(*filters)
                 .order_by(Stock.stock_code)
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).mappings().all()
+        return [dict(row) for row in rows], total
+
+    async def strategy_candidate_member_count(self, *, pool_id: int) -> int:
+        return int(
+            await self.session.scalar(
+                select(func.count(func.distinct(StrategyCandidate.stock_code)))
+                .join(StrategyDefinition, StrategyDefinition.id == StrategyCandidate.strategy_id)
+                .where(
+                    StrategyDefinition.pool_id == pool_id,
+                    StrategyDefinition.status != "archived",
+                    StrategyCandidate.candidate_status.in_(("pending_confirmation", "watching")),
+                )
+            )
+            or 0
+        )
+
+    async def list_strategy_candidate_members(
+        self,
+        *,
+        pool_id: int,
+        keyword: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[dict], int]:
+        latest_per_stock = (
+            select(
+                StrategyCandidate.strategy_id,
+                StrategyCandidate.stock_code,
+                func.max(StrategyCandidate.signal_trade_date).label("signal_trade_date"),
+            )
+            .join(StrategyDefinition, StrategyDefinition.id == StrategyCandidate.strategy_id)
+            .where(
+                StrategyDefinition.pool_id == pool_id,
+                StrategyDefinition.status != "archived",
+                StrategyCandidate.candidate_status.in_(("pending_confirmation", "watching")),
+            )
+            .group_by(StrategyCandidate.strategy_id, StrategyCandidate.stock_code)
+            .subquery()
+        )
+        filters = []
+        if keyword:
+            like = f"%{keyword}%"
+            filters.append(or_(StrategyCandidate.stock_code.ilike(like), Stock.stock_name.ilike(like)))
+        total = int(
+            await self.session.scalar(
+                select(func.count())
+                .select_from(latest_per_stock)
+                .join(
+                    StrategyCandidate,
+                    and_(
+                        StrategyCandidate.strategy_id == latest_per_stock.c.strategy_id,
+                        StrategyCandidate.stock_code == latest_per_stock.c.stock_code,
+                        StrategyCandidate.signal_trade_date == latest_per_stock.c.signal_trade_date,
+                    ),
+                )
+                .outerjoin(Stock, Stock.stock_code == StrategyCandidate.stock_code)
+                .where(*filters)
+            )
+            or 0
+        )
+        rows = (
+            await self.session.execute(
+                select(
+                    StrategyCandidate.stock_code,
+                    Stock.stock_name,
+                    StrategyCandidate.created_at,
+                )
+                .join(
+                    latest_per_stock,
+                    and_(
+                        StrategyCandidate.strategy_id == latest_per_stock.c.strategy_id,
+                        StrategyCandidate.stock_code == latest_per_stock.c.stock_code,
+                        StrategyCandidate.signal_trade_date == latest_per_stock.c.signal_trade_date,
+                    ),
+                )
+                .outerjoin(Stock, Stock.stock_code == StrategyCandidate.stock_code)
+                .where(*filters)
+                .order_by(StrategyCandidate.signal_trade_date.desc(), StrategyCandidate.rank_no.asc().nulls_last(), StrategyCandidate.stock_code)
                 .offset((page - 1) * page_size)
                 .limit(page_size)
             )
@@ -276,6 +361,22 @@ class StockPoolRepository:
             "industries": [dict(row) for row in sector_rows if row["sector_type"] == "industry"],
         }
 
+    async def get_strategy_candidate_member_detail(self, *, pool_id: int, pool_code: str, stock_code: str) -> dict | None:
+        exists = await self.session.scalar(
+            select(StrategyCandidate.id)
+            .join(StrategyDefinition, StrategyDefinition.id == StrategyCandidate.strategy_id)
+            .where(
+                StrategyDefinition.pool_id == pool_id,
+                StrategyDefinition.status != "archived",
+                StrategyCandidate.stock_code == stock_code,
+                StrategyCandidate.candidate_status.in_(("pending_confirmation", "watching")),
+            )
+            .limit(1)
+        )
+        if exists is None:
+            return None
+        return await self.get_dynamic_member_detail(pool_code=pool_code, stock_code=stock_code)
+
     async def stock_profile(self, stock_code: str) -> dict | None:
         """Unified membership profile; categories remain intentionally separate."""
         stock = (await self.session.execute(select(Stock).where(Stock.stock_code == stock_code))).scalar_one_or_none()
@@ -353,7 +454,11 @@ class StockPoolRepository:
             for row in await self.list_pools():
                 pool = row["pool"]
                 policy = row["policy"]
-                category = "system" if pool.is_system else ("strategy" if pool.pool_type == "strategy" else "user")
+                # A strategy-owned dynamic pool is system-managed so users
+                # cannot mix manual members into its candidate set, but it is
+                # still a strategy pool in the catalogue rather than a generic
+                # system pool.
+                category = "strategy" if pool.pool_type == "strategy" else ("system" if pool.is_system else "user")
                 if scope not in {None, category}:
                     continue
                 items.append(

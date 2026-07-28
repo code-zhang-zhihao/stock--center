@@ -70,6 +70,9 @@
 64. `64-daily-close-late-facts-enrichment.sql`：将已执行旧四级流水线的涨跌停/炸板、停复牌和板块日线从 18:00 核心任务迁到 21:30 增强任务，只更新调度描述、默认 payload 和 metadata。
 65. `65-market-daily-sentiment.sql`：创建版本化 `t_market_sentiment_daily`，并 seed 22:15 的 `calculate_market_daily_sentiment` 每日任务；评分只读取 canonical 日线、涨跌停事件和交易日历，数据不足时记录 `pending`，不调用外部 Provider 或 LLM。
 66. `66-market-daily-review-facts.sql`：创建 `t_market_sector_heat_daily/t_market_limit_up_evidence_daily`，扩展同一 22:15 任务为每日市场报告事实；概念热度直接聚合成分股事实，不依赖可能延迟的 `ths_daily`，龙虎榜与公告只保存关联证据，绝不写成涨停因果结论。脚本会把历史 `ths_daily` 空响应的错误 `captured` Raw 标记改为合法的 `failed`，并保留专用错误码。
+67. `67-market-emotion-v2.sql`：新增可配置的 V2 双分情绪模型、每日评分事实与市场级北向资金流，支持 250 个交易日基线校准；V1 兼容情绪与原报告事实保留。
+68. `68-market-emotion-baseline-performance.sql`：为 V2 基线校准的北向历史回填、窗口查询和运行进度补充性能索引/调度元数据。
+69. `69-strategy-research-foundation.sql`：新增策略研究定义、T 日候选和模拟交易审计表，以及由候选派生的动态策略股票池约定；不 seed 策略、不调度扫描、不调用行情源或券商。
 67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 68. `68-market-emotion-baseline-performance.sql`：新增历史市场级北向资金流回填任务，默认按 120 交易日窗口补最近 250 个已有日线交易日；V2 基线改为精确交易日 lookback、20 日持久化检查点与运行进度，并把该手动校准任务超时上限调为 1800 秒。
 
@@ -111,6 +114,8 @@ docs/sql/db-init.sql
 `65-market-daily-sentiment.sql` 需要在 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 之后执行，以便自动挂载“每日”标签；即使标签表不存在，建表和任务 seed 仍会完成。它只新增 Derived 表 `t_market_sentiment_daily` 和一个每日任务，不改写 `t_daily_bar/t_limit_event_daily` 等 canonical 事实，也不删除历史数据。任务在 22:15 读取已完成事实；日线 active universe 覆盖率低于 95% 或 `limit_list_d` 的 Raw 完成标记缺失时，写入 `pending` 而不是生成分数。部署代码、执行本 SQL 后需 reload Scheduler；如需先建立历史阶段基线，可在调度中心手动运行 `calculate_market_daily_sentiment` 并同时传入 `start_date`、`end_date` 和固定 `calculation_version=v1`。
 
 `66-market-daily-review-facts.sql` 必须在 `65` 之后执行，并在部署后端后 reload Scheduler。它新增两张 Derived 表并把既有 `calculate_market_daily_sentiment` 的展示名称更新为“生成每日市场报告事实”，不会新增第二个定时任务。任务默认在生成情绪后继续生成概念热度、热点龙头和涨停关联证据；若只需大范围回填历史情绪基线，可传 `include_report_facts=false`。概念热度只读取 `t_daily_bar/t_stock_fund_flow_daily/t_limit_event_daily/t_sector_component`，因此不受 `ths_daily` 晚发布影响；当前公告没有每日全市场同步完成标记，报告只能显示已入库公告并明确标注完整性未知。脚本会把 `t_sector_bar` 的历史零行 `ths_daily` Raw 记录从 `captured` 修正为 `failed`，保留原始审计行、`ths_daily_empty_or_not_published` 错误码与错误说明。
+
+`69-strategy-research-foundation.sql` 必须在 `67` 之后由 `t_stock_pool` 与新策略表 owner 执行。脚本只创建 `t_strategy_definition/t_strategy_candidate/t_strategy_paper_trade`、索引、约束和注释，不写入策略、候选、股票池成员、调度定义或真实订单。部署后端、刷新前端后，策略中心才能创建草稿及其 `dynamic_rule='strategy_candidates'` 专属策略池；在 evaluator、T+1 确认和模拟成交执行器上线前，后端会拒绝 `status=enabled`。
 
 `59-scheduler-job-tags-and-retire-obsolete-jobs.sql` 创建 `t_scheduler_tag/t_scheduler_job_tag`，为当前任务 seed `历史/每日/主数据/策略` 展示标签。它会删除 `scheduler_noop`、`daily_market_close_ingest`、`sync_tushare_a_share_topic` 三条任务定义；三者的 `t_scheduler_job_run` 历史运行日志不删除。执行后部署后端和前端，并 reload Scheduler。
 
