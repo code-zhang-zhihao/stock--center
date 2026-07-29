@@ -61,6 +61,31 @@ class FakeRepository:
         self.committed += 1
 
 
+def test_cancelled_backtest_uses_terminal_cleanup_path() -> None:
+    class CancellationRepository(FakeRepository):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancelled_run = None
+            self.cancelled_message = None
+
+        async def cancel_backtest_run(self, run, message):
+            self.cancelled_run = run
+            self.cancelled_message = message
+            run.status = "cancelled"
+            return 0
+
+    async def run() -> None:
+        repository = CancellationRepository()
+        service = StrategyCenterService(repository)
+        backtest = SimpleNamespace(id=42, status="running")
+        await service._cancel_backtest_run(backtest, "cancelled for test")
+        assert repository.cancelled_run is backtest
+        assert repository.cancelled_message == "cancelled for test"
+        assert repository.committed == 1
+
+    asyncio.run(run())
+
+
 def test_create_strategy_creates_a_dedicated_dynamic_pool_name() -> None:
     async def run() -> None:
         repository = FakeRepository()

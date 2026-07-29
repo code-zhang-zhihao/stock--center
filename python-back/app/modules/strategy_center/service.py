@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timezone
 from statistics import mean, median
 from uuid import uuid4
@@ -619,10 +620,26 @@ class StrategyCenterService:
                 await self.repository.update_version(version, {"status": "backtest_ready", "validation_summary": validation})
             await self.repository.commit()
             return {"run": self._read_backtest_run(run), **result}
+        except asyncio.CancelledError:
+            # The scheduler can cancel a long running study between its
+            # committed batches.  Keep a terminal audit row, but remove those
+            # partial rows so no later optimisation can mistake them for a
+            # complete historical baseline.
+            await asyncio.shield(
+                self._cancel_backtest_run(
+                    run,
+                    "回测任务已取消；已丢弃未完成运行产生的部分交易样本。",
+                )
+            )
+            raise
         except Exception as exc:
             await self.repository.fail_backtest_run(run, str(exc))
             await self.repository.commit()
             raise
+
+    async def _cancel_backtest_run(self, run: StrategyBacktestRun, message: str) -> None:
+        await self.repository.cancel_backtest_run(run, message)
+        await self.repository.commit()
 
     async def promote_version_to_paper(self, strategy_code: str, version_no: int) -> dict:
         definition = await self._require_definition(strategy_code)

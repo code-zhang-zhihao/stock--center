@@ -6,7 +6,7 @@ from hashlib import sha256
 import json
 from typing import Iterable
 
-from sqlalchemy import Integer, and_, cast, func, or_, select, tuple_, update
+from sqlalchemy import Integer, and_, cast, delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import aggregate_order_by, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,11 @@ from app.modules.strategy_center.models import (
 class StrategyCenterRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        # Event strategies evaluate many five-day batches.  Cache the stable
+        # concept membership snapshot for that one research/session scope so
+        # adding hot-concept context does not repeatedly join every board to
+        # every candidate stock.
+        self._concept_memberships_cache: dict[str, list[tuple[str, str, date | None, date | None]]] | None = None
 
     async def list_definitions(self) -> list[dict]:
         rows = await self.session.execute(
@@ -898,41 +903,76 @@ class StrategyCenterRepository:
         trade_dates: list[date],
         stock_codes: set[str],
     ) -> None:
-        rows = await self.session.execute(
+        if not contexts or not trade_dates or not stock_codes:
+            return
+        heat_rows = await self.session.execute(
             select(
                 MarketSectorHeatDaily.trade_date,
-                SectorComponent.stock_code,
-                SectorBasic.sector_code,
-                SectorBasic.sector_name,
+                MarketSectorHeatDaily.sector_code,
+                MarketSectorHeatDaily.sector_name,
                 MarketSectorHeatDaily.heat_rank,
                 MarketSectorHeatDaily.heat_score,
                 MarketSectorHeatDaily.metrics,
             )
-            .select_from(MarketSectorHeatDaily)
-            .join(SectorBasic, SectorBasic.sector_code == MarketSectorHeatDaily.sector_code)
-            .join(SectorComponent, SectorComponent.sector_code == SectorBasic.sector_code)
             .where(
                 MarketSectorHeatDaily.trade_date.in_(trade_dates),
                 MarketSectorHeatDaily.calculation_version == MARKET_SENTIMENT_CALCULATION_VERSION,
                 MarketSectorHeatDaily.status == "ready",
-                SectorBasic.sector_type == "concept",
-                SectorComponent.stock_code.in_(stock_codes),
-                or_(SectorComponent.start_date.is_(None), SectorComponent.start_date <= MarketSectorHeatDaily.trade_date),
-                or_(SectorComponent.end_date.is_(None), SectorComponent.end_date >= MarketSectorHeatDaily.trade_date),
             )
         )
-        for row in rows.mappings().all():
-            context = contexts.get(row["trade_date"], {}).get(str(row["stock_code"]))
-            if context is not None:
-                context["concept_context"].append(
-                    {
-                        "sector_code": row["sector_code"],
-                        "sector_name": row["sector_name"],
-                        "heat_rank": _int_or_none(row["heat_rank"]),
-                        "heat_score": _number(row["heat_score"]),
-                        "metrics": dict(row["metrics"] or {}),
-                    }
-                )
+        heat_by_date_sector = {
+            (row["trade_date"], str(row["sector_code"])): {
+                "sector_code": str(row["sector_code"]),
+                "sector_name": row["sector_name"],
+                "heat_rank": _int_or_none(row["heat_rank"]),
+                "heat_score": _number(row["heat_score"]),
+                "metrics": dict(row["metrics"] or {}),
+            }
+            for row in heat_rows.mappings().all()
+        }
+        if not heat_by_date_sector:
+            return
+        memberships = await self._concept_memberships()
+        for trade_date, stock_contexts in contexts.items():
+            for stock_code in stock_contexts:
+                if stock_code not in stock_codes:
+                    continue
+                context = stock_contexts[stock_code]
+                seen_sector_codes: set[str] = set()
+                for sector_code, _sector_name, start_date, end_date in memberships.get(stock_code) or []:
+                    if sector_code in seen_sector_codes:
+                        continue
+                    if start_date is not None and start_date > trade_date:
+                        continue
+                    if end_date is not None and end_date < trade_date:
+                        continue
+                    heat = heat_by_date_sector.get((trade_date, sector_code))
+                    if heat is None:
+                        continue
+                    seen_sector_codes.add(sector_code)
+                    context["concept_context"].append(dict(heat))
+
+    async def _concept_memberships(self) -> dict[str, list[tuple[str, str, date | None, date | None]]]:
+        if self._concept_memberships_cache is not None:
+            return self._concept_memberships_cache
+        rows = await self.session.execute(
+            select(
+                SectorComponent.stock_code,
+                SectorBasic.sector_code,
+                SectorBasic.sector_name,
+                SectorComponent.start_date,
+                SectorComponent.end_date,
+            )
+            .join(SectorBasic, SectorBasic.sector_code == SectorComponent.sector_code)
+            .where(SectorBasic.sector_type == "concept", SectorBasic.source.like("tushare:%"))
+        )
+        memberships: dict[str, list[tuple[str, str, date | None, date | None]]] = defaultdict(list)
+        for row in rows:
+            memberships[str(row.stock_code)].append(
+                (str(row.sector_code), str(row.sector_name), row.start_date, row.end_date)
+            )
+        self._concept_memberships_cache = dict(memberships)
+        return self._concept_memberships_cache
 
     async def list_candidates(
         self,
@@ -1165,6 +1205,29 @@ class StrategyCenterRepository:
         run.finished_at = datetime.now(timezone.utc)
         run.updated_at = run.finished_at
         await self.session.flush()
+
+    async def cancel_backtest_run(self, run: StrategyBacktestRun, message: str) -> int:
+        """Discard an interrupted run's partial trades and retain its audit row.
+
+        A cancelled baseline must never look like a usable research sample.  The
+        backtest persists completed batches for bounded transactions, so clear
+        those rows before finalising the run as ``cancelled``.
+        """
+
+        deleted = await self.session.execute(
+            delete(StrategyBacktestTrade).where(StrategyBacktestTrade.backtest_run_id == run.id)
+        )
+        run.status = "cancelled"
+        run.error_message = message[:4000]
+        run.summary = {
+            **dict(run.summary or {}),
+            "cancelled": True,
+            "discarded_partial_trade_count": int(deleted.rowcount or 0),
+        }
+        run.finished_at = datetime.now(timezone.utc)
+        run.updated_at = run.finished_at
+        await self.session.flush()
+        return int(deleted.rowcount or 0)
 
     async def list_backtest_runs(self, *, strategy_id: int, limit: int = 50) -> list[StrategyBacktestRun]:
         return list(

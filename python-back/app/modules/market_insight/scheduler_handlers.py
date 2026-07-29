@@ -11,6 +11,9 @@ from app.modules.scheduler_center.handlers import JobExecutionContext, job_handl
 from app.modules.scheduler_center.schemas import JobResult
 
 
+REPORT_FACT_TRADE_DATES_PER_BATCH = 10
+
+
 class CalculateMarketDailySentimentHandler:
     """Calculate only from already persisted daily facts; never calls a Provider."""
 
@@ -106,13 +109,44 @@ class CalculateMarketDailySentimentHandler:
             )
             review_summary = None
             if bool(payload.get("include_report_facts", True)):
-                review_summary = (
-                    await MarketDailyReviewService(repository).calculate(
-                        trade_dates=result.requested_trade_dates,
-                        sentiment_rows=result.results,
+                # The concept component expansion is intentionally bounded.
+                # A historical request can span hundreds of sessions; passing
+                # that whole range to one aggregate makes the associated
+                # review facts timeout before strategy research can use them.
+                review_service = MarketDailyReviewService(repository)
+                rows_by_date = {item["trade_date"]: item for item in result.results}
+                review_summary = {
+                    "calculation_version": result.calculation_version,
+                    "requested_trade_dates": [item.isoformat() for item in result.requested_trade_dates],
+                    "sector_heat_rows": 0,
+                    "limit_up_evidence_rows": 0,
+                    "ready_trade_dates": 0,
+                    "pending_trade_dates": 0,
+                    "batch_size": REPORT_FACT_TRADE_DATES_PER_BATCH,
+                    "batch_count": 0,
+                }
+                requested_dates = result.requested_trade_dates
+                for offset in range(0, len(requested_dates), REPORT_FACT_TRADE_DATES_PER_BATCH):
+                    batch_dates = requested_dates[offset : offset + REPORT_FACT_TRADE_DATES_PER_BATCH]
+                    batch = await review_service.calculate(
+                        trade_dates=batch_dates,
+                        sentiment_rows=[rows_by_date[item] for item in batch_dates if item in rows_by_date],
                         calculation_version=result.calculation_version,
                     )
-                ).summary()
+                    batch_summary = batch.summary()
+                    review_summary["sector_heat_rows"] += batch_summary["sector_heat_rows"]
+                    review_summary["limit_up_evidence_rows"] += batch_summary["limit_up_evidence_rows"]
+                    review_summary["ready_trade_dates"] += batch_summary["ready_trade_dates"]
+                    review_summary["pending_trade_dates"] += batch_summary["pending_trade_dates"]
+                    review_summary["batch_count"] += 1
+                    await context.report_progress(
+                        {
+                            "stage": "calculating_daily_review_facts",
+                            "completed_trade_date_count": min(offset + len(batch_dates), len(requested_dates)),
+                            "total_trade_date_count": len(requested_dates),
+                            "batch_size": REPORT_FACT_TRADE_DATES_PER_BATCH,
+                        }
+                    )
             emotion_summary = None
             if bool(payload.get("include_v2_emotion", True)):
                 # The absence of an enabled V2 model is normal before an admin

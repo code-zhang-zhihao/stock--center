@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
+from statistics import median
 
 from sqlalchemy import Date, and_, bindparam, cast, func, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, insert
@@ -59,6 +61,11 @@ def _active_stock_filters() -> tuple:
 class MarketInsightRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        # A review backfill processes many adjacent trade dates in one
+        # repository/session.  Concept membership changes slowly, so keep the
+        # source-filtered membership snapshot in that bounded request scope
+        # rather than repeatedly joining it to every date's full A-share bar.
+        self._concept_memberships_cache: dict[str, list[tuple[str, str, date | None, date | None]]] | None = None
 
     async def latest_daily_bar_trade_date(self) -> date | None:
         return (await self.session.execute(select(func.max(DailyBar.trade_date)))).scalar_one_or_none()
@@ -316,34 +323,32 @@ class MarketInsightRepository:
         ``ths_daily`` is deliberately not an input here.  Its publication can
         lag the individual-stock daily facts, whereas a post-close concept
         review needs to remain reproducible from the settled stock universe.
+
+        A direct SQL three-way aggregation is deceptively expensive on this
+        schema: PostgreSQL can start with every concept board and rescan the
+        full active-stock universe once per board.  Expand a small,
+        source-filtered membership cache against the already-filtered daily
+        facts instead.  It preserves historical membership validity, removes
+        duplicate source snapshots per stock/board, and keeps a 20-day
+        historical review batch bounded in application memory.
         """
         if not trade_dates:
             return {}
-        rows = await self.session.execute(
-            select(
-                DailyBar.trade_date.label("trade_date"),
-                SectorBasic.sector_code.label("sector_code"),
-                SectorBasic.sector_name.label("sector_name"),
-                func.count(func.distinct(DailyBar.stock_code)).label("priced_component_count"),
-                func.count(func.distinct(DailyBar.stock_code)).filter(DailyBar.change_pct > 0).label("rising_stock_count"),
-                func.count(func.distinct(DailyBar.stock_code)).filter(DailyBar.change_pct < 0).label("falling_stock_count"),
-                func.avg(DailyBar.change_pct).label("average_change_pct"),
-                func.percentile_cont(0.5).within_group(DailyBar.change_pct.asc()).label("median_change_pct"),
-                func.count(func.distinct(LimitEventDaily.stock_code)).label("limit_up_stock_count"),
-                func.count(func.distinct(StockFundFlowDaily.stock_code)).label("fund_flow_stock_count"),
-                func.sum(StockFundFlowDaily.main_net_inflow).label("main_net_inflow"),
-            )
+        memberships = await self._concept_memberships()
+        if not memberships:
+            return {}
+        daily_statement = select(
+            DailyBar.trade_date,
+            DailyBar.stock_code,
+            DailyBar.change_pct,
+            StockFundFlowDaily.stock_code.label("fund_flow_stock_code"),
+            StockFundFlowDaily.main_net_inflow,
+            LimitEventDaily.stock_code.label("limit_up_stock_code"),
+        )
+        daily_rows = await self.session.execute(
+            daily_statement
             .select_from(DailyBar)
             .join(Stock, Stock.stock_code == DailyBar.stock_code)
-            .join(
-                SectorComponent,
-                and_(
-                    SectorComponent.stock_code == DailyBar.stock_code,
-                    or_(SectorComponent.start_date.is_(None), SectorComponent.start_date <= DailyBar.trade_date),
-                    or_(SectorComponent.end_date.is_(None), SectorComponent.end_date >= DailyBar.trade_date),
-                ),
-            )
-            .join(SectorBasic, SectorBasic.sector_code == SectorComponent.sector_code)
             .outerjoin(
                 StockFundFlowDaily,
                 and_(
@@ -359,40 +364,109 @@ class MarketInsightRepository:
                     LimitEventDaily.event_type == "limit_up",
                 ),
             )
-            .where(
-                DailyBar.trade_date.in_(trade_dates),
-                SectorBasic.sector_type == "concept",
-                SectorBasic.source.like("tushare:%"),
-                *_active_stock_filters(),
-            )
-            .group_by(DailyBar.trade_date, SectorBasic.sector_code, SectorBasic.sector_name)
+            .where(DailyBar.trade_date.in_(trade_dates), *_active_stock_filters())
         )
+        aggregates: dict[tuple[date, str], dict] = {}
+        for row in daily_rows.mappings():
+            trade_date = row["trade_date"]
+            stock_code = str(row["stock_code"])
+            stock_memberships = memberships.get(stock_code) or []
+            if not stock_memberships:
+                continue
+            change_pct = _float_or_none(row["change_pct"])
+            main_net_inflow = _float_or_none(row["main_net_inflow"])
+            has_limit_up = row["limit_up_stock_code"] is not None
+            has_fund_flow = row["fund_flow_stock_code"] is not None
+            seen_sector_codes: set[str] = set()
+            for sector_code, sector_name, start_date, end_date in stock_memberships:
+                if sector_code in seen_sector_codes:
+                    continue
+                if start_date is not None and start_date > trade_date:
+                    continue
+                if end_date is not None and end_date < trade_date:
+                    continue
+                seen_sector_codes.add(sector_code)
+                aggregate = aggregates.setdefault(
+                    (trade_date, sector_code),
+                    {
+                        "sector_name": sector_name,
+                        "priced_component_count": 0,
+                        "rising_stock_count": 0,
+                        "falling_stock_count": 0,
+                        "changes": [],
+                        "limit_up_stock_count": 0,
+                        "fund_flow_stock_count": 0,
+                        "main_net_inflow": 0.0,
+                        "has_main_net_inflow": False,
+                    },
+                )
+                aggregate["priced_component_count"] += 1
+                if change_pct is not None:
+                    aggregate["changes"].append(change_pct)
+                    if change_pct > 0:
+                        aggregate["rising_stock_count"] += 1
+                    elif change_pct < 0:
+                        aggregate["falling_stock_count"] += 1
+                if has_limit_up:
+                    aggregate["limit_up_stock_count"] += 1
+                if has_fund_flow:
+                    aggregate["fund_flow_stock_count"] += 1
+                if main_net_inflow is not None:
+                    aggregate["main_net_inflow"] += main_net_inflow
+                    aggregate["has_main_net_inflow"] = True
+
         result: dict[date, list[dict]] = {}
-        for row in rows:
-            result.setdefault(row.trade_date, []).append(
+        for (trade_date, sector_code), aggregate in sorted(aggregates.items()):
+            changes = aggregate["changes"]
+            result.setdefault(trade_date, []).append(
                 {
-                    "sector_code": str(row.sector_code),
-                    "sector_name": str(row.sector_name),
-                    "priced_component_count": int(row.priced_component_count or 0),
-                    "rising_stock_count": int(row.rising_stock_count or 0),
-                    "falling_stock_count": int(row.falling_stock_count or 0),
-                    "average_change_pct": _float_or_none(row.average_change_pct),
-                    "median_change_pct": _float_or_none(row.median_change_pct),
-                    "limit_up_stock_count": int(row.limit_up_stock_count or 0),
-                    "fund_flow_stock_count": int(row.fund_flow_stock_count or 0),
-                    "main_net_inflow": _float_or_none(row.main_net_inflow),
+                    "sector_code": sector_code,
+                    "sector_name": aggregate["sector_name"],
+                    "priced_component_count": aggregate["priced_component_count"],
+                    "rising_stock_count": aggregate["rising_stock_count"],
+                    "falling_stock_count": aggregate["falling_stock_count"],
+                    "average_change_pct": sum(changes) / len(changes) if changes else None,
+                    "median_change_pct": float(median(changes)) if changes else None,
+                    "limit_up_stock_count": aggregate["limit_up_stock_count"],
+                    "fund_flow_stock_count": aggregate["fund_flow_stock_count"],
+                    "main_net_inflow": aggregate["main_net_inflow"] if aggregate["has_main_net_inflow"] else None,
                 }
             )
         return result
 
+    async def _concept_memberships(self) -> dict[str, list[tuple[str, str, date | None, date | None]]]:
+        if self._concept_memberships_cache is not None:
+            return self._concept_memberships_cache
+        rows = await self.session.execute(
+            select(
+                SectorComponent.stock_code,
+                SectorBasic.sector_code,
+                SectorBasic.sector_name,
+                SectorComponent.start_date,
+                SectorComponent.end_date,
+            )
+            .join(SectorBasic, SectorBasic.sector_code == SectorComponent.sector_code)
+            .where(SectorBasic.sector_type == "concept", SectorBasic.source.like("tushare:%"))
+        )
+        memberships: dict[str, list[tuple[str, str, date | None, date | None]]] = defaultdict(list)
+        for row in rows:
+            memberships[str(row.stock_code)].append(
+                (str(row.sector_code), str(row.sector_name), row.start_date, row.end_date)
+            )
+        self._concept_memberships_cache = dict(memberships)
+        return self._concept_memberships_cache
+
     async def concept_leader_candidates(self, *, trade_dates: list[date], sector_codes: list[str]) -> dict[tuple[date, str], list[dict]]:
         if not trade_dates or not sector_codes:
+            return {}
+        target_sector_codes = {str(item) for item in sector_codes}
+        memberships = await self._concept_memberships()
+        if not memberships:
             return {}
         rows = await self.session.execute(
             select(
                 DailyBar.trade_date.label("trade_date"),
-                SectorComponent.sector_code.label("sector_code"),
-                Stock.stock_code.label("stock_code"),
+                DailyBar.stock_code.label("stock_code"),
                 Stock.stock_name.label("stock_name"),
                 DailyBar.change_pct.label("change_pct"),
                 DailyBar.close_price.label("close_price"),
@@ -402,14 +476,6 @@ class MarketInsightRepository:
             )
             .select_from(DailyBar)
             .join(Stock, Stock.stock_code == DailyBar.stock_code)
-            .join(
-                SectorComponent,
-                and_(
-                    SectorComponent.stock_code == DailyBar.stock_code,
-                    or_(SectorComponent.start_date.is_(None), SectorComponent.start_date <= DailyBar.trade_date),
-                    or_(SectorComponent.end_date.is_(None), SectorComponent.end_date >= DailyBar.trade_date),
-                ),
-            )
             .outerjoin(
                 StockFundFlowDaily,
                 and_(
@@ -425,26 +491,32 @@ class MarketInsightRepository:
                     LimitEventDaily.event_type == "limit_up",
                 ),
             )
-            .where(
-                DailyBar.trade_date.in_(trade_dates),
-                SectorComponent.sector_code.in_(sector_codes),
-                *_active_stock_filters(),
-            )
-            .distinct()
+            .where(DailyBar.trade_date.in_(trade_dates), *_active_stock_filters())
         )
         result: dict[tuple[date, str], list[dict]] = {}
-        for row in rows:
-            result.setdefault((row.trade_date, str(row.sector_code)), []).append(
-                {
-                    "stock_code": str(row.stock_code),
-                    "stock_name": str(row.stock_name),
-                    "change_pct": _float_or_none(row.change_pct),
-                    "close_price": _float_or_none(row.close_price),
-                    "amount_yuan": _float_or_none(row.amount_yuan),
-                    "main_net_inflow": _float_or_none(row.main_net_inflow),
-                    "is_limit_up": row.limit_up_stock_code is not None,
-                }
-            )
+        for row in rows.mappings():
+            trade_date = row["trade_date"]
+            stock_code = str(row["stock_code"])
+            seen_sector_codes: set[str] = set()
+            for sector_code, _sector_name, start_date, end_date in memberships.get(stock_code) or []:
+                if sector_code not in target_sector_codes or sector_code in seen_sector_codes:
+                    continue
+                if start_date is not None and start_date > trade_date:
+                    continue
+                if end_date is not None and end_date < trade_date:
+                    continue
+                seen_sector_codes.add(sector_code)
+                result.setdefault((trade_date, sector_code), []).append(
+                    {
+                        "stock_code": stock_code,
+                        "stock_name": str(row["stock_name"]),
+                        "change_pct": _float_or_none(row["change_pct"]),
+                        "close_price": _float_or_none(row["close_price"]),
+                        "amount_yuan": _float_or_none(row["amount_yuan"]),
+                        "main_net_inflow": _float_or_none(row["main_net_inflow"]),
+                        "is_limit_up": row["limit_up_stock_code"] is not None,
+                    }
+                )
         return result
 
     async def limit_up_market_rows(self, trade_dates: list[date]) -> dict[tuple[date, str], dict]:
