@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import date, datetime, timezone
 from hashlib import sha256
 import json
+from types import SimpleNamespace
 from typing import Iterable
 
 from sqlalchemy import Integer, and_, cast, delete, func, or_, select, tuple_, update
@@ -1259,16 +1260,31 @@ class StrategyCenterRepository:
             statement = statement.order_by(StrategyBacktestRun.finished_at.desc(), StrategyBacktestRun.id.desc()).limit(1)
         return (await self.session.execute(statement)).scalar_one_or_none()
 
-    async def list_backtest_trades(self, *, backtest_run_id: int) -> list[StrategyBacktestTrade]:
-        return list(
-            (
-                await self.session.execute(
-                    select(StrategyBacktestTrade)
-                    .where(StrategyBacktestTrade.backtest_run_id == backtest_run_id)
-                    .order_by(StrategyBacktestTrade.signal_trade_date, StrategyBacktestTrade.id)
-                )
-            ).scalars().all()
+    async def list_backtest_trades(self, *, backtest_run_id: int) -> list[SimpleNamespace]:
+        """Load only the frozen facts required for parameter replay.
+
+        Optimisation never reads entry/exit prices or execution snapshots.  A
+        full ORM load for a high-frequency baseline needlessly transfers those
+        JSONB payloads once per tuning round and can dominate its runtime.
+        """
+
+        rows = await self.session.execute(
+            select(
+                StrategyBacktestTrade.signal_trade_date,
+                StrategyBacktestTrade.net_return_pct,
+                StrategyBacktestTrade.candidate_snapshot,
+            )
+            .where(StrategyBacktestTrade.backtest_run_id == backtest_run_id)
+            .order_by(StrategyBacktestTrade.signal_trade_date, StrategyBacktestTrade.id)
         )
+        return [
+            SimpleNamespace(
+                signal_trade_date=row.signal_trade_date,
+                net_return_pct=row.net_return_pct,
+                candidate_snapshot=row.candidate_snapshot or {},
+            )
+            for row in rows
+        ]
 
     async def max_backtest_trades_per_signal_date(self, *, backtest_run_id: int) -> int:
         """Return the largest persisted candidate count for one signal date.
