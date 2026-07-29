@@ -240,9 +240,16 @@ def _trial_matches(snapshot: dict[str, Any], patch: dict[str, Any], specs: list[
             continue
         # A historical baseline with unavailable emotion has intentionally
         # allowed that day; adding a score threshold must not rewrite the old
-        # evaluator semantics retroactively.
-        if spec.key.startswith("market_gate.") and str((snapshot.get("emotion") or {}).get("status") or "") != "ready":
-            continue
+        # evaluator semantics retroactively.  A newly versioned rule may opt
+        # into V2's ``degraded`` score, whose core facts are complete while
+        # optional confirmations are delayed.
+        if spec.key.startswith("market_gate."):
+            emotion_status = str((snapshot.get("emotion") or {}).get("status") or "")
+            market_gate = ((snapshot.get("rule_config") or {}).get("market_gate") or {})
+            if emotion_status != "ready" and not (
+                emotion_status == "degraded" and bool(market_gate.get("accept_degraded_score", False))
+            ):
+                continue
         actual = _snapshot_value(snapshot, spec.source)
         if actual is None:
             return False

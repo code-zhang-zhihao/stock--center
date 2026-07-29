@@ -853,20 +853,21 @@ class StrategyCenterService:
                         "total_signal_date_count": len(signal_dates),
                     }
                 )
-        persisted_rows = await self.repository.session.execute(
-            # Pull only the completed rows for this new run to summarize.  It
-            # is intentionally not a cross-run aggregation.
-            select(StrategyBacktestTrade).where(StrategyBacktestTrade.backtest_run_id == run.id)
+        persisted_returns = await self.repository.session.scalars(
+            # Do not hydrate candidate/execution JSON snapshots merely to
+            # calculate a run summary.  High-frequency research baselines can
+            # contain tens of thousands of rows, where that transfer dominates
+            # the final commit despite only net return being needed here.
+            select(StrategyBacktestTrade.net_return_pct).where(StrategyBacktestTrade.backtest_run_id == run.id)
         )
-        trades = list(persisted_rows.scalars().all())
-        returns = [float(item.net_return_pct) for item in trades]
-        wins = [item for item in returns if item > 0]
+        returns = [float(value) for value in persisted_returns.all()]
+        wins = [value for value in returns if value > 0]
         summary = {
             "execution_model": "next_open_daily",
             "signal_trade_date_count": len(signal_dates),
             "signal_count": signal_count,
-            "completed_trade_count": len(trades),
-            "not_materialized_count": max(signal_count - len(trades), 0),
+            "completed_trade_count": len(returns),
+            "not_materialized_count": max(signal_count - len(returns), 0),
             "win_count": len(wins),
             "win_rate_pct": round(len(wins) / len(trades) * 100, 4) if trades else None,
             "average_net_return_pct": round(mean(returns), 6) if returns else None,

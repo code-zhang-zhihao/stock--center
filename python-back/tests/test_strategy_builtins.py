@@ -141,6 +141,37 @@ def test_theme_relay_requires_limit_evidence_and_hot_concept_context():
     assert any(item["code"] == "first_board_theme" and not item["passed"] for item in rejected.reasons)
 
 
+def test_theme_relay_version_can_require_verified_turnover_and_degraded_emotion_score():
+    context = _base_context()
+    context["emotion"] = {"status": "degraded", "market_risk_on_score": 50, "primary_stage_code": "active"}
+    context["limit_event"] = {"event_type": "limit_up", "open_count": 1}
+    context["limit_evidence"] = {"board_count": 1}
+    context["concept_context"] = [{"sector_code": "ths_concept_x", "heat_rank": 5}]
+    strict_rule = {
+        "market_gate": {"minimum_market_risk_on_score": 45, "accept_degraded_score": True},
+        "signal": {"max_heat_rank": 5, "minimum_open_count": 2},
+    }
+    context["emotion"]["market_risk_on_score"] = 40
+    risk_rejected = evaluate_daily_candidate("theme_first_board_relay", context, rule_config=strict_rule)
+    assert risk_rejected.skip_code == "market_risk_on_below_threshold"
+    context["emotion"]["market_risk_on_score"] = 50
+    rejected = evaluate_daily_candidate("theme_first_board_relay", context, rule_config=strict_rule)
+    assert rejected.matched is False
+    assert any(item["code"] == "first_board_natural" and not item["passed"] for item in rejected.reasons)
+
+    context["limit_event"]["open_count"] = 2
+    accepted = evaluate_daily_candidate("theme_first_board_relay", context, rule_config=strict_rule)
+    assert accepted.matched is True
+
+
+def test_theme_relay_v1_keeps_missing_open_count_compatible():
+    context = _base_context()
+    context["limit_event"] = {"event_type": "limit_up"}
+    context["limit_evidence"] = {"board_count": 1}
+    context["concept_context"] = [{"sector_code": "ths_concept_x", "heat_rank": 3}]
+    assert evaluate_daily_candidate("theme_first_board_relay", context).matched is True
+
+
 def test_daily_baseline_never_sells_on_the_same_entry_date():
     d0, d1, d2, d3 = (date(2026, 7, day) for day in range(1, 5))
     contexts = {

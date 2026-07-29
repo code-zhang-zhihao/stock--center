@@ -18,7 +18,7 @@ from math import isfinite
 from typing import Any, Callable
 
 
-BUILTIN_STRATEGY_IMPLEMENTATION_VERSION = "2026.07.28.1"
+BUILTIN_STRATEGY_IMPLEMENTATION_VERSION = "2026.07.29.1"
 
 
 @dataclass(frozen=True)
@@ -226,7 +226,11 @@ _TUNABLE_PARAMETERS: dict[str, tuple[TunableParameterSpec, ...]] = {
         TunableParameterSpec("signal.volume_ratio_min", "量比下限", "daily_facts.volume_ratio", "gte", (1.2, 1.5, 2.0)),
         TunableParameterSpec("signal.close_position_min", "收盘位置下限", "daily_facts.close_position", "gte", (0.70, 0.80, 0.90)),
     ),
-    "theme_first_board_relay": (TunableParameterSpec("signal.max_heat_rank", "题材热度排名上限", "concept_context.best_heat_rank", "lte", (20.0, 15.0, 10.0)),),
+    "theme_first_board_relay": (
+        TunableParameterSpec("signal.max_heat_rank", "题材热度排名上限", "concept_context.best_heat_rank", "lte", (20.0, 15.0, 10.0, 7.0, 5.0, 3.0)),
+        TunableParameterSpec("signal.minimum_open_count", "换手开板次数下限", "limit_event.open_count", "gte", (1.0, 2.0, 3.0, 5.0, 8.0)),
+        TunableParameterSpec("market_gate.minimum_market_risk_on_score", "风险偏好分下限", "emotion.market_risk_on_score", "gte", (35.0, 45.0, 55.0, 65.0)),
+    ),
     "consecutive_limit_up_relay": (TunableParameterSpec("signal.max_heat_rank", "题材热度排名上限", "concept_context.best_heat_rank", "lte", (10.0, 7.0, 5.0)),),
     "broken_board_recovery": (
         TunableParameterSpec("signal.change_min", "当日涨幅下限", "daily_facts.change_pct", "gte", (3.0, 4.0, 5.0)),
@@ -556,13 +560,25 @@ def _theme_first_board_relay(current, previous, history, context, rule):
     board_count = _int(evidence.get("board_count"))
     open_count = _int(event.get("open_count"))
     best_rank = _best_heat_rank(concepts)
-    natural = is_limit_up and (open_count is None or open_count > 0)
+    # Keep the historical V1 contract when the parameter is absent: older
+    # versions treated an unavailable open count as a non-blocking fact.  New
+    # versions can explicitly require verified turnover of a given intensity.
+    minimum_open_count = _num(rule.get("signal") or {}, "minimum_open_count")
+    if minimum_open_count is None:
+        natural = is_limit_up and (open_count is None or open_count > 0)
+    else:
+        natural = is_limit_up and open_count is not None and open_count >= int(minimum_open_count)
     max_heat_rank = int(_signal_number(rule, "max_heat_rank", 20))
     matched = natural and board_count == 1 and best_rank is not None and best_rank <= max_heat_rank
     score = min(100.0, 55 + (20 if natural else 0) + max(0, 20 - (best_rank or 99)) + (5 if board_count == 1 else 0))
     return matched, score, _reasons(
         ("first_board_limit_up", is_limit_up, "当日涨停事实"),
-        ("first_board_natural", natural, f"开板次数 {open_count if open_count is not None else '缺失'}"),
+        (
+            "first_board_natural",
+            natural,
+            f"开板次数 {open_count if open_count is not None else '缺失'}"
+            + (" / 不少于 " + str(int(minimum_open_count)) if minimum_open_count is not None else ""),
+        ),
         ("first_board_count", board_count == 1, f"连板高度 {board_count if board_count is not None else '缺失'}"),
         ("first_board_theme", best_rank is not None and best_rank <= max_heat_rank, f"最佳概念热度排名 {best_rank if best_rank is not None else '缺失'} / 上限 {max_heat_rank}"),
     )
@@ -657,7 +673,9 @@ def _check_market_gate(emotion: dict[str, Any], rule: dict[str, Any]) -> str | N
     if not bool(gate.get("enabled", True)):
         return None
     status = str(emotion.get("status") or "")
-    if status != "ready":
+    accepts_degraded_score = bool(gate.get("accept_degraded_score", False))
+    score_is_usable = status == "ready" or (status == "degraded" and accepts_degraded_score)
+    if not score_is_usable:
         return None if bool(gate.get("allow_when_emotion_unavailable", True)) else "market_emotion_unavailable"
     stage = str(emotion.get("primary_stage_code") or "")
     if stage in set(gate.get("blocked_primary_stages") or []):
