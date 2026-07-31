@@ -15,11 +15,9 @@ from app.modules.market_data.models import (
     Stock,
     StockChipPerfDaily,
     StockDailyBasic,
-    StockFactorDaily,
     StockFactorMinute,
     StockFundFlowDaily,
     StockTechnicalFactorDaily,
-    TechnicalIndicatorSnapshot,
 )
 from app.modules.market_data.providers import AkShareProvider, MootdxProvider, json_safe, normalize_symbol
 from app.modules.market_data.repository import MarketDataRepository
@@ -76,18 +74,15 @@ class StockAnalysisService:
 
         latest_daily_basic = await self._latest_row(StockDailyBasic, [StockDailyBasic.stock_code == code], StockDailyBasic.trade_date.desc())
         latest_daily_bar = await self._latest_row(DailyBar, [DailyBar.stock_code == code], DailyBar.trade_date.desc())
-        latest_snapshot = await self._latest_row(
-            TechnicalIndicatorSnapshot,
-            [TechnicalIndicatorSnapshot.stock_code == code],
-            TechnicalIndicatorSnapshot.snapshot_time.desc(),
-        )
+        computed_snapshots = await self.repository.computed_technical_snapshots(stock_code=code, limit=1)
+        latest_snapshot = computed_snapshots[0] if computed_snapshots else None
         sectors = await self._stock_sectors(code)
 
         return {
             "stock": self._stock(stock),
             "daily_basic": self._row(latest_daily_basic),
             "latest_daily_bar": self._row(latest_daily_bar),
-            "technical_snapshot": self._row(latest_snapshot),
+            "technical_snapshot": self._mapping(latest_snapshot),
             "sectors": sectors,
         }
 
@@ -185,13 +180,9 @@ class StockAnalysisService:
 
     async def factors(self, stock_code: str, *, trade_date: date | None, lookback: int = 60) -> dict:
         code = normalize_symbol(stock_code)
-        daily_filters = [StockFactorDaily.stock_code == code]
-        snapshot_filters = [TechnicalIndicatorSnapshot.stock_code == code]
         technical_filters = [StockTechnicalFactorDaily.stock_code == code]
         chip_filters = [StockChipPerfDaily.stock_code == code]
         if trade_date is not None:
-            daily_filters.append(StockFactorDaily.trade_date <= trade_date)
-            snapshot_filters.append(func.date(TechnicalIndicatorSnapshot.snapshot_time) <= trade_date)
             technical_filters.append(StockTechnicalFactorDaily.trade_date <= trade_date)
             chip_filters.append(StockChipPerfDaily.trade_date <= trade_date)
 
@@ -205,7 +196,11 @@ class StockAnalysisService:
         if minute_trade_date is not None:
             minute_filters.append(StockFactorMinute.trade_date == minute_trade_date)
 
-        daily = await self.repository.list_rows(StockFactorDaily, filters=daily_filters, order_by=[StockFactorDaily.trade_date.desc()], limit=lookback)
+        daily = await self.repository.list_active_daily_factors(
+            stock_code=code,
+            end_date=trade_date,
+            limit=lookback,
+        )
         minute = await self.repository.list_rows(
             StockFactorMinute,
             filters=minute_filters,
@@ -215,20 +210,24 @@ class StockAnalysisService:
         # The workbench only consumes the latest snapshot and enhanced-factor
         # documents. Keeping their full JSON history in this response made a
         # single-stock page request unnecessarily large and slow.
-        snapshots = await self.repository.list_rows(TechnicalIndicatorSnapshot, filters=snapshot_filters, order_by=[TechnicalIndicatorSnapshot.snapshot_time.desc()], limit=1)
+        snapshots = await self.repository.computed_technical_snapshots(
+            stock_code=code,
+            end_date=trade_date,
+            limit=1,
+        )
         technical = await self.repository.list_rows(StockTechnicalFactorDaily, filters=technical_filters, order_by=[StockTechnicalFactorDaily.trade_date.desc()], limit=1)
         chip = await self.repository.list_rows(StockChipPerfDaily, filters=chip_filters, order_by=[StockChipPerfDaily.trade_date.desc()], limit=1)
 
-        latest_daily = self._row(daily[0]) if daily else None
+        latest_daily = self._mapping(daily[0]) if daily else None
         latest_technical = self._row(technical[0]) if technical else None
         latest_chip = self._row(chip[0]) if chip else None
-        latest_snapshot = self._row(snapshots[0]) if snapshots else None
+        latest_snapshot = self._mapping(snapshots[0]) if snapshots else None
         return {
             "stock_code": code,
-            "daily_factors": [self._row(row) for row in reversed(daily)],
+            "daily_factors": [self._mapping(row) for row in reversed(daily)],
             "minute_factors": [self._row(row) for row in reversed(minute)],
             "minute_factor_trade_date": minute_trade_date.isoformat() if minute_trade_date else None,
-            "technical_snapshots": [self._row(row) for row in reversed(snapshots)],
+            "technical_snapshots": [self._mapping(row) for row in reversed(snapshots)],
             "technical_factors": [self._row(row) for row in reversed(technical)],
             "chip_perf": [self._row(row) for row in reversed(chip)],
             "latest": {
@@ -337,3 +336,9 @@ class StockAnalysisService:
         for attr in row.__mapper__.column_attrs:
             result[attr.key] = json_safe(getattr(row, attr.key))
         return result
+
+    @staticmethod
+    def _mapping(row: dict | None) -> dict | None:
+        if row is None:
+            return None
+        return {key: json_safe(value) for key, value in dict(row).items()}

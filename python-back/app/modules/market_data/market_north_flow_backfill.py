@@ -147,11 +147,12 @@ class MarketNorthFlowBackfillService:
                     returned_dates = {row["trade_date"] for row in rows}
                     missing_dates = [item for item in window_dates if item not in returned_dates]
                     upserted = await repository.upsert_market_north_flow_rows(rows)
-                    await repository.insert_raw(
+                    await repository.insert_ingest_audit(
                         {
                             "trace_id": uuid4().hex,
                             "provider_code": "tushare",
                             "capability": NORTH_FLOW_HISTORY_CAPABILITY,
+                            "trade_date": window_end,
                             "request_params": {
                                 "api_name": "moneyflow_hsgt",
                                 "start_date": window_start.isoformat(),
@@ -159,16 +160,12 @@ class MarketNorthFlowBackfillService:
                                 "window_trade_date_count": len(window_dates),
                                 "only_missing": payload.only_missing,
                             },
-                            "record_key": f"{window_start.isoformat()}:{window_end.isoformat()}",
-                            "payload": response.raw_payload,
-                            "payload_summary": {
-                                "provider_row_count": len(response.records),
-                                "mapped_row_count": len(rows),
-                                "missing_trade_dates": [item.isoformat() for item in missing_dates],
-                            },
+                            "requested_fields": [],
+                            "response_row_count": len(response.records),
+                            "normalized_row_count": len(rows),
                             "normalized_table": "t_market_north_flow_daily",
-                            "normalized_pk": f"{window_start.isoformat()}:{window_end.isoformat()}",
-                            "status": "captured",
+                            "schema_version": "canonical_v2",
+                            "status": "captured" if rows else "complete_zero",
                         }
                     )
                     await session.commit()

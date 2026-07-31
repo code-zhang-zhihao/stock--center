@@ -300,6 +300,11 @@ export interface StockDailyFactor {
   volatility_20d: number | null;
   close_position: number | null;
   features: Record<string, unknown>;
+  factor_set_version: string;
+  price_basis: 'bfq' | 'qfq' | 'hfq';
+  factor_status: 'ready' | 'partial' | 'failed';
+  source_map: Record<string, string>;
+  missing_factors: string[];
 }
 
 export interface StockMinuteFactor {

@@ -41,7 +41,9 @@ def test_core_and_enrichment_do_not_repeat_minute_or_full_daily_factor_work() ->
     assert core["sync_stock_limit_status"] is False
     assert core["sync_sector_bars"] is False
     assert enrichment["calculate_daily_factors"] is False
-    assert enrichment["merge_external_technical_factors"] is True
+    assert enrichment["merge_external_technical_factors"] is False
+    assert enrichment["assemble_daily_factors_v2"] is True
+    assert core["calculate_technical_snapshot"] is False
     assert enrichment["calculate_sector_factors"] is True
     assert enrichment["sync_stock_limit_status"] is True
     assert enrichment["sync_sector_bars"] is True
@@ -117,7 +119,10 @@ def test_readiness_marks_late_events_and_sector_bars_as_enhancement() -> None:
                 "daily_bar": 100,
                 "daily_basic": 100,
                 "stock_moneyflow": 100,
+                "adjust_factor": 100,
                 "daily_factor": 100,
+                "daily_factor_v2": 100,
+                "daily_factor_v2_ready": 100,
                 "technical_snapshot": 100,
                 "stock_technical": 0,
                 "index_bar": 7,
@@ -132,6 +137,9 @@ def test_readiness_marks_late_events_and_sector_bars_as_enhancement() -> None:
                 "raw_capabilities": set(),
             }
 
+        async def active_stock_factor_set(self):
+            return "stock_daily_v1"
+
     service = object.__new__(DailyMarketCloseIngestService)
     service.repository = Repository()
 
@@ -143,7 +151,7 @@ def test_readiness_marks_late_events_and_sector_bars_as_enhancement() -> None:
     assert readiness["block_status"]["sector_bars"]["status"] == "missing"
 
 
-def test_large_raw_payload_is_compacted_but_small_events_remain_complete() -> None:
+def test_provider_payload_compaction_never_keeps_response_rows() -> None:
     large = {
         "code": 0,
         "data": {
@@ -155,11 +163,13 @@ def test_large_raw_payload_is_compacted_but_small_events_remain_complete() -> No
 
     assert compact["row_count"] == 501
     assert len(compact["sha256"]) == 64
-    assert len(compact["sample_first_last"]) == 2
     assert "data" not in compact
+    assert "items" not in compact
 
     small = {"data": {"items": [["000001.SZ", "20260724"]]}}
-    assert DailyMarketCloseIngestService._compact_raw_payload(small, row_count=1) is small
+    small_compact = DailyMarketCloseIngestService._compact_raw_payload(small, row_count=1)
+    assert small_compact["row_count"] == 1
+    assert "data" not in small_compact
 
 
 def test_sector_daily_uses_three_batches_plus_one_missing_retry() -> None:

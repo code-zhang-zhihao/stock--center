@@ -18,7 +18,7 @@ from app.modules.market_data.models import (
     SectorComponent,
     Stock,
     StockDailyBasic,
-    StockFactorDaily,
+    StockFactorDailyActive as StockFactorDaily,
     StockFundFlowDaily,
     TradeCalendar,
 )

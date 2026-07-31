@@ -245,7 +245,7 @@ class MarketSentimentService:
             "daily_bar_table": "t_daily_bar",
             "limit_event_table": "t_limit_event_daily",
             "trade_calendar_table": "t_trade_calendar",
-            "completion_table": "t_provider_raw_record",
+            "completion_table": "t_provider_ingest_audit",
             "universe_definition": "t_stock.status=active AND is_st=false AND exchange in (SH,SZ,SSE,SZSE)",
         }
         base = {

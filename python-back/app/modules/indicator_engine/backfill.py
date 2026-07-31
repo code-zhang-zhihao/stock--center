@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
 
@@ -96,8 +96,16 @@ class FactorBackfillService:
     async def backfill_stock_daily_pipeline(self, payload: FactorBackfillRequest) -> StockFactorPipelineResult:
         end_date = payload.end_date or await self._resolve_latest_trade_date()
         resolved_payload = payload.model_copy(update={"end_date": end_date})
-        daily = await self.backfill_daily(resolved_payload)
-        technical_snapshots = await self.backfill_technical_snapshots(resolved_payload)
+        daily = await self.backfill_standard_daily_v2(resolved_payload)
+        technical_snapshots = FactorBackfillResult(
+            factor_kind="technical_snapshot_dynamic",
+            pool_code=payload.pool_code,
+            start_date=daily.start_date,
+            end_date=daily.end_date,
+            stock_count=daily.stock_count,
+            ingest_mode=payload.ingest_mode,
+            warnings=["技术快照已改为 API 动态生成，本任务不再写入物理快照表。"],
+        )
         return StockFactorPipelineResult(
             pool_code=payload.pool_code,
             start_date=daily.start_date,
@@ -111,6 +119,97 @@ class FactorBackfillService:
             failed_trade_dates=daily.failed_trade_dates + technical_snapshots.failed_trade_dates,
             warnings=[*daily.warnings, *technical_snapshots.warnings],
         )
+
+    async def backfill_standard_daily_v2(self, payload: FactorBackfillRequest) -> FactorBackfillResult:
+        """Backfill the typed QFQ serving table, one date and one stock shard at a time."""
+        end_date = payload.end_date or await self._resolve_latest_trade_date()
+        trade_dates = await self._resolve_trade_dates(payload.start_date, end_date)
+        stock_codes = await self._resolve_stock_codes(payload.pool_code)
+        if payload.max_stocks:
+            stock_codes = stock_codes[: payload.max_stocks]
+        if not stock_codes:
+            raise FactorBackfillError("empty_stock_pool", f"股票池没有可回填因子的沪深 active 股票: {payload.pool_code}")
+
+        result = FactorBackfillResult(
+            factor_kind="daily_v2",
+            pool_code=payload.pool_code,
+            start_date=payload.start_date,
+            end_date=end_date,
+            trade_date_count=len(trade_dates),
+            stock_count=len(stock_codes),
+            ingest_mode=payload.ingest_mode,
+            factor_window_trade_days=payload.factor_window_trade_days,
+        )
+        baseline_history_start = payload.start_date - timedelta(days=550)
+        logger.info(
+            "factor daily V2 backfill started: pool=%s dates=%s stocks=%s history_start=%s chunk=%s only_missing=%s",
+            payload.pool_code,
+            len(trade_dates),
+            len(stock_codes),
+            baseline_history_start,
+            payload.sql_stock_chunk_size,
+            payload.only_missing,
+        )
+        for trade_date in trade_dates:
+            date_rows = 0
+            attempted = 0
+            try:
+                async with self.sessionmaker() as session:
+                    repository = IndicatorRepository(session)
+                    for offset in range(0, len(stock_codes), payload.sql_stock_chunk_size):
+                        codes = stock_codes[offset : offset + payload.sql_stock_chunk_size]
+                        if payload.ingest_mode == "append_safe" and payload.only_missing:
+                            ready_codes = await repository.existing_stock_daily_v2_ready_codes(
+                                codes,
+                                trade_date=trade_date,
+                            )
+                            codes = [code for code in codes if code not in ready_codes]
+                        if not codes:
+                            continue
+                        attempted += len(codes)
+                        date_rows += await repository.assemble_stock_daily_factors_v2(
+                            codes,
+                            trade_date=trade_date,
+                            history_start=trade_date - timedelta(days=550),
+                        )
+                        await session.commit()
+                if attempted == 0:
+                    result.skipped_trade_dates += 1
+                    status = "skipped"
+                    reason = "ready_rows_already_present"
+                else:
+                    result.processed_trade_dates += 1
+                    result.daily_factor_rows += date_rows
+                    status = "success"
+                    reason = None
+                result.date_summaries.append(
+                    {
+                        "trade_date": trade_date.isoformat(),
+                        "status": status,
+                        "attempted_stocks": attempted,
+                        "daily_factor_v2_rows": date_rows,
+                        **({"reason": reason} if reason else {}),
+                    }
+                )
+            except Exception as exc:
+                result.failed_trade_dates += 1
+                if len(result.errors) < 30:
+                    result.errors.append(
+                        {"trade_date": trade_date.isoformat(), "error": f"{type(exc).__name__}: {exc}"}
+                    )
+                logger.exception("factor daily V2 backfill date failed: trade_date=%s", trade_date)
+                if payload.fail_fast:
+                    raise
+        if result.failed_trade_dates:
+            result.warnings.append(f"{result.failed_trade_dates} 个交易日组装失败，可使用 append_safe 续跑。")
+        logger.info(
+            "factor daily V2 backfill finished: processed=%s skipped=%s failed=%s rows=%s",
+            result.processed_trade_dates,
+            result.skipped_trade_dates,
+            result.failed_trade_dates,
+            result.daily_factor_rows,
+        )
+        return result
 
     async def backfill_daily(self, payload: FactorBackfillRequest) -> FactorBackfillResult:
         end_date = payload.end_date or await self._resolve_latest_trade_date()

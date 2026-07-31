@@ -71,9 +71,21 @@ def test_daily_basic_adapter_maps_existing_table_fields():
     assert result.mapped_count == 1
     row = result.rows[0]
     assert row["stock_code"] == "000001"
-    assert row["close_price"] == 12.3
     assert row["turnover_rate"] == 1.2
-    assert row["limit_status"] == 0
+    assert "close_price" not in row
+    assert "limit_status" not in row
+
+
+def test_adjust_factor_adapter_maps_history_without_raw_metadata() -> None:
+    result = TushareStockDailyAdapter().map_adjust_factor_range(
+        [{"ts_code": "000001.SZ", "trade_date": "20260701", "adj_factor": 138.2}],
+        start_date=date(2026, 7, 1),
+        end_date=date(2026, 7, 2),
+    )
+
+    assert result.mapped_count == 1
+    assert result.rows[0]["adj_factor"] == 138.2
+    assert "raw" not in result.rows[0]["metadata_json"]
 
 
 def test_moneyflow_adapter_converts_ten_thousand_yuan_to_yuan():

@@ -1506,14 +1506,21 @@ class MarketDataSyncService:
         normalized_table: str,
     ) -> None:
         safe_payload = json_safe(payload)
-        await self.repository.insert_raw({
+        row_count = len(safe_payload) if isinstance(safe_payload, list) else (1 if safe_payload else 0)
+        safe_request = {
+            key: value
+            for key, value in request_params.items()
+            if key.lower() not in {"token", "api_key", "secret", "password", "authorization"}
+        }
+        await self.repository.insert_ingest_audit({
             "trace_id": f"sync_{datetime.now(tz=timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
             "provider_code": provider_code,
             "capability": capability,
-            "request_params": json_safe(request_params),
-            "record_key": record_key or capability,
-            "payload": safe_payload,
-            "payload_summary": {"payload_type": type(safe_payload).__name__, "row_count": len(safe_payload) if isinstance(safe_payload, list) else 1},
+            "request_params": json_safe(safe_request),
+            "requested_fields": [],
+            "response_row_count": row_count,
+            "normalized_row_count": row_count,
             "normalized_table": normalized_table,
-            "status": "captured",
+            "schema_version": "canonical_v2",
+            "status": "complete_zero" if row_count == 0 else "captured",
         })

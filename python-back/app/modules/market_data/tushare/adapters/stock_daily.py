@@ -219,7 +219,6 @@ class TushareStockDailyAdapter(ProviderAdapter):
                     "stock_code": stock_code,
                     "trade_date": row_date,
                     "source": "tushare:daily_basic",
-                    "close_price": safe_float(record.get("close")),
                     "turnover_rate": safe_float(record.get("turnover_rate")),
                     "turnover_rate_f": safe_float(record.get("turnover_rate_f")),
                     "volume_ratio": safe_float(record.get("volume_ratio")),
@@ -235,7 +234,6 @@ class TushareStockDailyAdapter(ProviderAdapter):
                     "free_share": safe_float(record.get("free_share")),
                     "total_mv": safe_float(record.get("total_mv")),
                     "circ_mv": safe_float(record.get("circ_mv")),
-                    "limit_status": safe_int(record.get("limit_status")),
                     "metadata_json": self._metadata("daily_basic", record, self.daily_basic_unit_conversions),
                 }
             )
@@ -262,6 +260,51 @@ class TushareStockDailyAdapter(ProviderAdapter):
     ) -> CanonicalMappingResult:
         target_date = self._as_date(trade_date)
         return self.map_moneyflow_range(records, start_date=target_date, end_date=target_date, universe=universe)
+
+    def map_adjust_factor_range(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        start_date: date | str,
+        end_date: date | str,
+        universe: set[str] | None = None,
+    ) -> CanonicalMappingResult:
+        start = self._as_date(start_date)
+        end = self._as_date(end_date)
+        rows: list[dict[str, Any]] = []
+        for record in records:
+            row_date = parse_date(record.get("trade_date"))
+            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
+            factor = safe_float(record.get("adj_factor"))
+            if (
+                not stock_code
+                or row_date is None
+                or row_date < start
+                or row_date > end
+                or factor is None
+                or (universe is not None and stock_code not in universe)
+            ):
+                continue
+            rows.append(
+                {
+                    "stock_code": stock_code,
+                    "trade_date": row_date,
+                    "source": "tushare:adj_factor",
+                    "adj_factor": factor,
+                    "metadata_json": self._metadata("adj_factor", record, {}),
+                }
+            )
+        warnings = [f"adj_factor skipped records: {len(records) - len(rows)}"] if len(records) != len(rows) else []
+        return self._result(
+            api_name="adj_factor",
+            capability_code="stock_adjust_factor",
+            start_date=start,
+            end_date=end,
+            records=records,
+            rows=rows,
+            warnings=warnings,
+            unit_conversions={},
+        )
 
     def map_moneyflow_range(
         self,
@@ -308,8 +351,6 @@ class TushareStockDailyAdapter(ProviderAdapter):
                     "large_sell_amount": large_sell,
                     "super_large_buy_amount": super_buy,
                     "super_large_sell_amount": super_sell,
-                    "close_price": None,
-                    "change_pct": None,
                     "rank": None,
                     "metadata_json": self._metadata(
                         "moneyflow",
@@ -373,7 +414,7 @@ class TushareStockDailyAdapter(ProviderAdapter):
             "api_name": api_name,
             "source": f"tushare:{api_name}",
             "unit_conversions": unit_conversions,
-            "raw": record,
+            "schema_version": "canonical_v2",
         }
         if unit_normalized:
             metadata["unit_normalized"] = unit_normalized

@@ -8,11 +8,11 @@ from app.modules.market_data.models import (
     LimitEventDaily,
     MarketUniverse,
     MarketUniverseMember,
-    ProviderRawRecord,
+    ProviderIngestAudit,
     SectorBasic,
     SectorComponent,
     Stock,
-    StockFactorDaily,
+    StockFactorDailyActive as StockFactorDaily,
     TradeCalendar,
 )
 from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
@@ -125,10 +125,10 @@ class RealtimeMarketRepository:
         trade_dates = list(dict.fromkeys(trade_dates))[: max(2, lookback_trade_days)]
 
         completion_rows = await self.session.execute(
-            select(ProviderRawRecord.capability).where(
-                ProviderRawRecord.status == "captured",
-                ProviderRawRecord.normalized_table == "t_limit_event_daily",
-                ProviderRawRecord.normalized_pk == target_date.isoformat(),
+            select(ProviderIngestAudit.capability).where(
+                ProviderIngestAudit.status.in_(("captured", "complete_zero")),
+                ProviderIngestAudit.normalized_table == "t_limit_event_daily",
+                ProviderIngestAudit.trade_date == target_date,
             )
         )
         completion_capabilities = sorted({str(value) for value in completion_rows.scalars().all() if value})

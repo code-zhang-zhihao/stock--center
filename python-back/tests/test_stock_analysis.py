@@ -105,6 +105,14 @@ class _FactorPageRepository:
         self.limits[model] = limit
         return []
 
+    async def list_active_daily_factors(self, *, stock_code, end_date, limit):
+        self.limits["active_daily_factors"] = limit
+        return []
+
+    async def computed_technical_snapshots(self, *, stock_code, end_date, limit):
+        self.limits["computed_technical_snapshots"] = limit
+        return []
+
 
 async def test_factor_page_keeps_series_history_but_limits_large_detail_documents() -> None:
     repository = _FactorPageRepository()
@@ -113,8 +121,8 @@ async def test_factor_page_keeps_series_history_but_limits_large_detail_document
     result = await service.factors("600519", trade_date=date(2026, 7, 17), lookback=250)
 
     assert result["daily_factors"] == []
-    assert repository.limits[StockFactorDaily] == 250
+    assert repository.limits["active_daily_factors"] == 250
     assert repository.limits[StockFactorMinute] == 400
-    assert repository.limits[TechnicalIndicatorSnapshot] == 1
+    assert repository.limits["computed_technical_snapshots"] == 1
     assert repository.limits[StockTechnicalFactorDaily] == 1
     assert repository.limits[StockChipPerfDaily] == 1

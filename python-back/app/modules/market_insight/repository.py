@@ -17,12 +17,12 @@ from app.modules.market_data.models import (
     LimitEventDaily,
     MarginSummaryDaily,
     MarketNorthFlowDaily,
-    ProviderRawRecord,
+    ProviderIngestAudit,
     SectorBasic,
     SectorComponent,
     Stock,
     StockDailyBasic,
-    StockFactorDaily,
+    StockFactorDailyActive as StockFactorDaily,
     StockFundFlowDaily,
     StockNorthHoldDaily,
     TradeCalendar,
@@ -197,21 +197,17 @@ class MarketInsightRepository:
     async def limit_event_completion_capabilities(self, trade_dates: list[date]) -> dict[date, set[str]]:
         if not trade_dates:
             return {}
-        date_keys = [item.isoformat() for item in trade_dates]
         rows = await self.session.execute(
-            select(ProviderRawRecord.normalized_pk, ProviderRawRecord.capability).where(
-                ProviderRawRecord.status == "captured",
-                ProviderRawRecord.normalized_table == "t_limit_event_daily",
-                ProviderRawRecord.normalized_pk.in_(date_keys),
+            select(ProviderIngestAudit.trade_date, ProviderIngestAudit.capability).where(
+                ProviderIngestAudit.status.in_(("captured", "complete_zero")),
+                ProviderIngestAudit.normalized_table == "t_limit_event_daily",
+                ProviderIngestAudit.trade_date.in_(trade_dates),
             )
         )
         result: dict[date, set[str]] = {}
-        for date_key, capability in rows.all():
-            try:
-                parsed_date = date.fromisoformat(str(date_key))
-            except ValueError:
-                continue
-            result.setdefault(parsed_date, set()).add(str(capability))
+        for trade_date, capability in rows.all():
+            if trade_date is not None:
+                result.setdefault(trade_date, set()).add(str(capability))
         return result
 
     async def previous_limit_up_premiums(self, trade_dates: list[date]) -> dict[date, dict]:
@@ -653,18 +649,16 @@ class MarketInsightRepository:
         if not trade_dates:
             return {}
         rows = await self.session.execute(
-            select(ProviderRawRecord.normalized_pk, ProviderRawRecord.capability).where(
-                ProviderRawRecord.status == "captured",
-                ProviderRawRecord.normalized_table == normalized_table,
-                ProviderRawRecord.normalized_pk.in_([item.isoformat() for item in trade_dates]),
+            select(ProviderIngestAudit.trade_date, ProviderIngestAudit.capability).where(
+                ProviderIngestAudit.status.in_(("captured", "complete_zero")),
+                ProviderIngestAudit.normalized_table == normalized_table,
+                ProviderIngestAudit.trade_date.in_(trade_dates),
             )
         )
         result: dict[date, set[str]] = {}
-        for date_key, capability in rows:
-            try:
-                result.setdefault(date.fromisoformat(str(date_key)), set()).add(str(capability))
-            except ValueError:
-                continue
+        for trade_date, capability in rows:
+            if trade_date is not None:
+                result.setdefault(trade_date, set()).add(str(capability))
         return result
 
     async def upsert_sector_heat_rows(self, rows: list[dict]) -> int:

@@ -22,6 +22,7 @@ from app.modules.market_data.models import (
     MinuteBar,
     MarginSummaryDaily,
     ProviderRawRecord,
+    ProviderIngestAudit,
     QuoteSnapshot,
     SectorBasic,
     SectorBar,
@@ -31,7 +32,9 @@ from app.modules.market_data.models import (
     Stock,
     StockChipPerfDaily,
     StockDailyBasic,
+    StockAdjustFactor,
     StockFactorDaily,
+    StockFactorDailyV2,
     StockFundFlowDaily,
     StockNorthHoldDaily,
     StockTechnicalFactorDaily,
@@ -59,6 +62,20 @@ def _safe_batch_size(rows: list[dict], *, default: int = DEFAULT_BULK_UPSERT_BAT
     # little headroom for JSON and dialect-specific binds.
     column_count = max(1, len(rows[0]))
     return max(1, min(default, MAX_POSTGRES_QUERY_PARAMS // column_count))
+
+
+def _without_raw_metadata(rows: list[dict]) -> list[dict]:
+    """Strip row-level provider payload copies while preserving compact provenance."""
+    sanitized: list[dict] = []
+    for original in rows:
+        row = dict(original)
+        for key in ("metadata_json", "metadata"):
+            metadata = row.get(key)
+            if isinstance(metadata, dict) and "raw" in metadata:
+                row[key] = {name: value for name, value in metadata.items() if name != "raw"}
+                row[key].setdefault("schema_version", "canonical_v2")
+        sanitized.append(row)
+    return sanitized
 
 
 class MarketDataRepository:
@@ -157,6 +174,16 @@ class MarketDataRepository:
         )
         return set(result.scalars().all())
 
+    async def existing_adjust_factor_dates(self, *, stock_code: str, start_date: date, end_date: date) -> set[date]:
+        result = await self.session.execute(
+            select(StockAdjustFactor.trade_date).where(
+                StockAdjustFactor.stock_code == stock_code,
+                StockAdjustFactor.trade_date >= start_date,
+                StockAdjustFactor.trade_date <= end_date,
+            )
+        )
+        return set(result.scalars().all())
+
     async def existing_stock_fund_flow_dates(self, *, stock_code: str, start_date: date, end_date: date) -> set[date]:
         result = await self.session.execute(
             select(StockFundFlowDaily.trade_date).where(
@@ -185,21 +212,15 @@ class MarketDataRepository:
         end_date: date,
     ) -> set[date]:
         result = await self.session.execute(
-            select(ProviderRawRecord.record_key).where(
-                ProviderRawRecord.capability == STOCK_LIMIT_EVENT_HISTORY_CAPABILITY,
-                ProviderRawRecord.status == "captured",
-                ProviderRawRecord.request_params["completion_scope"].astext == completion_scope,
+            select(ProviderIngestAudit.trade_date).where(
+                ProviderIngestAudit.capability == STOCK_LIMIT_EVENT_HISTORY_CAPABILITY,
+                ProviderIngestAudit.status.in_(("captured", "complete_zero")),
+                ProviderIngestAudit.request_params["completion_scope"].astext == completion_scope,
+                ProviderIngestAudit.trade_date >= start_date,
+                ProviderIngestAudit.trade_date <= end_date,
             )
         )
-        completed: set[date] = set()
-        for record_key in result.scalars().all():
-            try:
-                trade_date = date.fromisoformat(str(record_key or "")[-10:])
-            except ValueError:
-                continue
-            if start_date <= trade_date <= end_date:
-                completed.add(trade_date)
-        return completed
+        return {item for item in result.scalars().all() if item is not None}
 
     async def existing_index_bar_dates(self, *, index_code: str, start_date: date, end_date: date) -> set[date]:
         result = await self.session.execute(
@@ -255,6 +276,7 @@ class MarketDataRepository:
         model = {
             "daily": DailyBar,
             "daily_basic": StockDailyBasic,
+            "adjust_factor": StockAdjustFactor,
             "moneyflow": StockFundFlowDaily,
             "stock_technical_factor_pro": StockTechnicalFactorDaily,
         }.get(fact_kind)
@@ -365,6 +387,15 @@ class MarketDataRepository:
         )
         return list(result.scalars().all())
 
+    async def active_stock_factor_set(self) -> str:
+        value = await self.session.scalar(
+            text(
+                "SELECT factor_set_code FROM t_factor_set_version "
+                "WHERE status = 'active' ORDER BY version_no DESC LIMIT 1"
+            )
+        )
+        return str(value or "stock_daily_v1")
+
     async def daily_close_asset_counts(self, trade_date: date) -> dict[str, int | set[str]]:
         """Read the small count/marker set used by repair and report readiness."""
         start = datetime.combine(trade_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -385,8 +416,14 @@ class MarketDataRepository:
                         (SELECT count(*) FROM t_limit_event_daily WHERE trade_date = :trade_date) AS limit_event,
                         (SELECT count(*) FROM t_lhb_event WHERE trade_date = :trade_date) AS lhb_event,
                         (SELECT count(DISTINCT stock_code) FROM t_stock_technical_factor_daily WHERE trade_date = :trade_date) AS stock_technical,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_adjust_factor WHERE trade_date = :trade_date) AS adjust_factor,
                         (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily
                             WHERE trade_date = :trade_date AND source = 'system:daily_close') AS daily_factor,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily_v2
+                            WHERE trade_date = :trade_date AND factor_set_version = 'stock_daily_v2') AS daily_factor_v2,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily_v2
+                            WHERE trade_date = :trade_date AND factor_set_version = 'stock_daily_v2'
+                              AND factor_status = 'ready') AS daily_factor_v2_ready,
                         (SELECT count(DISTINCT stock_code) FROM t_technical_indicator_snapshot
                             WHERE snapshot_time >= :snapshot_start AND snapshot_time < :snapshot_end
                               AND source = 'system:daily_close') AS technical_snapshot,
@@ -409,25 +446,36 @@ class MarketDataRepository:
                 },
             )
         ).mappings().one()
+        tracked_capabilities = (
+            "daily_market_close_stock_limit",
+            "daily_market_close_stock_suspend",
+            "daily_market_close_lhb",
+            "daily_market_close_lhb_seats",
+            "daily_market_close_index_daily_basic",
+            "daily_market_close_market_stats",
+            "daily_market_close_sector_bars",
+            "daily_market_close_moneyflow_cnt_ths",
+            "daily_market_close_moneyflow_ind_ths",
+        )
         capabilities = set(
+            (
+                await self.session.execute(
+                    select(ProviderIngestAudit.capability).where(
+                        ProviderIngestAudit.trade_date == trade_date,
+                        ProviderIngestAudit.status.in_(("captured", "complete_zero")),
+                        ProviderIngestAudit.capability.in_(tracked_capabilities),
+                    )
+                )
+            ).scalars().all()
+        )
+        # Keep V1 completion markers readable during the seven-day shadow window.
+        capabilities.update(
             (
                 await self.session.execute(
                     select(ProviderRawRecord.capability).where(
                         ProviderRawRecord.record_key == trade_date.isoformat(),
                         ProviderRawRecord.status == "captured",
-                        ProviderRawRecord.capability.in_(
-                            (
-                                "daily_market_close_stock_limit",
-                                "daily_market_close_stock_suspend",
-                                "daily_market_close_lhb",
-                                "daily_market_close_lhb_seats",
-                                "daily_market_close_index_daily_basic",
-                                "daily_market_close_market_stats",
-                                "daily_market_close_sector_bars",
-                                "daily_market_close_moneyflow_cnt_ths",
-                                "daily_market_close_moneyflow_ind_ths",
-                            )
-                        ),
+                        ProviderRawRecord.capability.in_(tracked_capabilities),
                     )
                 )
             ).scalars().all()
@@ -917,18 +965,16 @@ class MarketDataRepository:
         if not trade_dates:
             return {}
         result = await self.session.execute(
-            select(
-                StockFactorDaily.trade_date,
-                StockFactorDaily.ma5,
-                StockFactorDaily.ma10,
-                StockFactorDaily.ma20,
-                StockFactorDaily.ma30,
-                StockFactorDaily.ma60,
-            ).where(
-                StockFactorDaily.stock_code == stock_code,
-                StockFactorDaily.source == "system:daily_close",
-                StockFactorDaily.trade_date.in_(trade_dates),
-            )
+            text(
+                """
+                SELECT trade_date, ma5, ma10, ma20, ma30, ma60
+                FROM v_stock_factor_daily_active
+                WHERE stock_code = :stock_code
+                  AND trade_date = ANY(CAST(:trade_dates AS date[]))
+                  AND factor_status = 'ready'
+                """
+            ),
+            {"stock_code": stock_code, "trade_dates": trade_dates},
         )
         return {
             row.trade_date: {
@@ -941,9 +987,110 @@ class MarketDataRepository:
             for row in result
         }
 
+    async def list_active_daily_factors(
+        self,
+        *,
+        stock_code: str,
+        end_date: date | None = None,
+        limit: int = 60,
+    ) -> list[dict]:
+        """Read the currently activated typed factor set through its compatibility view."""
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM v_stock_factor_daily_active
+                    WHERE stock_code = :stock_code
+                      AND (CAST(:end_date AS date) IS NULL OR trade_date <= CAST(:end_date AS date))
+                      AND factor_status = 'ready'
+                    ORDER BY trade_date DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"stock_code": stock_code, "end_date": end_date, "limit": limit},
+            )
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def computed_technical_snapshots(
+        self,
+        *,
+        stock_code: str,
+        end_date: date | None = None,
+        limit: int = 1,
+    ) -> list[dict]:
+        """Build the legacy technical-snapshot response without persisting duplicate rows."""
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    WITH factors AS (
+                        SELECT *
+                        FROM v_stock_factor_daily_active
+                        WHERE stock_code = :stock_code
+                          AND (CAST(:end_date AS date) IS NULL OR trade_date <= CAST(:end_date AS date))
+                          AND factor_status = 'ready'
+                        ORDER BY trade_date DESC
+                        LIMIT :limit
+                    )
+                    SELECT
+                        factor.stock_code,
+                        (factor.trade_date::timestamp + time '15:00') AT TIME ZONE 'Asia/Shanghai' AS snapshot_time,
+                        ('computed:' || factor.factor_set_version)::varchar AS source,
+                        bar.close_price AS last_price,
+                        bar.change_pct,
+                        coalesce(minute.intraday_strength, factor.close_position) AS intraday_strength,
+                        CASE
+                            WHEN minute.volume_spike_ratio IS NULL THEN NULL
+                            ELSE least(greatest(minute.volume_spike_ratio * 20, 0), 100)
+                        END AS volume_score,
+                        CASE
+                            WHEN factor.ma5 IS NULL OR factor.ma10 IS NULL THEN NULL
+                            ELSE least(
+                                50
+                                + CASE WHEN factor.ma5 > factor.ma10 THEN 20 ELSE 0 END
+                                + CASE WHEN factor.ma20 IS NOT NULL AND factor.ma10 > factor.ma20 THEN 20 ELSE 0 END
+                                + CASE WHEN factor.return_1d > 0 THEN 10 ELSE 0 END,
+                                100
+                            )
+                        END AS trend_score,
+                        jsonb_build_object(
+                            'daily_factor_trade_date', factor.trade_date::text,
+                            'minute_factor_bar_time', minute.bar_time,
+                            'price_source', 't_daily_bar',
+                            'factor_set_version', factor.factor_set_version,
+                            'price_basis', factor.price_basis,
+                            'factor_status', factor.factor_status,
+                            'source_map', factor.source_map,
+                            'missing_factors', factor.missing_factors,
+                            'computed', true
+                        ) AS factor_payload,
+                        greatest(factor.updated_at, bar.updated_at, minute.created_at) AS created_at
+                    FROM factors AS factor
+                    LEFT JOIN t_daily_bar AS bar
+                      ON bar.stock_code = factor.stock_code
+                     AND bar.trade_date = factor.trade_date
+                    LEFT JOIN LATERAL (
+                        SELECT intraday_strength, volume_spike_ratio, bar_time, created_at
+                        FROM t_stock_factor_minute
+                        WHERE stock_code = factor.stock_code
+                          AND trade_date = factor.trade_date
+                        ORDER BY bar_time DESC, id DESC
+                        LIMIT 1
+                    ) AS minute ON true
+                    ORDER BY factor.trade_date DESC
+                    """
+                ),
+                {"stock_code": stock_code, "end_date": end_date, "limit": limit},
+            )
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
     async def upsert_daily_bars(self, rows: list[dict]) -> int:
         if not rows:
             return 0
+        rows = _without_raw_metadata(rows)
         for batch in _chunked(rows, _safe_batch_size(rows)):
             insert_stmt = insert(DailyBar).values(batch)
             await self.session.execute(
@@ -988,6 +1135,7 @@ class MarketDataRepository:
     async def upsert_minute_bars(self, rows: list[dict]) -> int:
         if not rows:
             return 0
+        rows = _without_raw_metadata(rows)
         shanghai = ZoneInfo("Asia/Shanghai")
         for row in rows:
             if row.get("trade_date") is None:
@@ -1047,6 +1195,14 @@ class MarketDataRepository:
                 "limit_status",
                 "metadata_json",
             ],
+        )
+
+    async def upsert_adjust_factor_rows(self, rows: list[dict]) -> int:
+        return await self.upsert_rows(
+            StockAdjustFactor,
+            rows,
+            conflict_attrs=["stock_code", "trade_date", "source"],
+            update_attrs=["adj_factor", "metadata_json"],
         )
 
     async def upsert_stock_technical_factor_rows(self, rows: list[dict]) -> int:
@@ -1269,19 +1425,14 @@ class MarketDataRepository:
 
     async def clear_daily_close_ingest_data(self, trade_date: date) -> dict[str, int]:
         """Remove only data produced by this job for a targeted rebuild."""
-        from app.modules.market_data.models import StockFactorDaily, StockFactorMinute, TechnicalIndicatorSnapshot
+        from app.modules.market_data.models import StockFactorDaily, StockFactorMinute
 
-        start = datetime.combine(trade_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
-        end = datetime.combine(
-            trade_date.fromordinal(trade_date.toordinal() + 1),
-            datetime.min.time(),
-            tzinfo=ZoneInfo("Asia/Shanghai"),
-        )
         statements = {
             "daily": delete(DailyBar).where(DailyBar.trade_date == trade_date),
             "daily_basic": delete(StockDailyBasic).where(
                 StockDailyBasic.trade_date == trade_date,
             ),
+            "adjust_factor": delete(StockAdjustFactor).where(StockAdjustFactor.trade_date == trade_date),
             "stock_technical_factor": delete(StockTechnicalFactorDaily).where(
                 StockTechnicalFactorDaily.trade_date == trade_date,
             ),
@@ -1304,14 +1455,13 @@ class MarketDataRepository:
                 StockFactorDaily.trade_date == trade_date,
                 StockFactorDaily.source == "system:daily_close",
             ),
+            "daily_factor_v2": delete(StockFactorDailyV2).where(
+                StockFactorDailyV2.trade_date == trade_date,
+                StockFactorDailyV2.factor_set_version == "stock_daily_v2",
+            ),
             "minute_factor": delete(StockFactorMinute).where(
                 StockFactorMinute.trade_date == trade_date,
                 StockFactorMinute.source == "system:daily_close",
-            ),
-            "technical_snapshot": delete(TechnicalIndicatorSnapshot).where(
-                TechnicalIndicatorSnapshot.source == "system:daily_close",
-                TechnicalIndicatorSnapshot.snapshot_time >= start,
-                TechnicalIndicatorSnapshot.snapshot_time < end,
             ),
         }
         deleted: dict[str, int] = {}
@@ -1322,6 +1472,12 @@ class MarketDataRepository:
 
     async def insert_raw(self, row: dict) -> ProviderRawRecord:
         result = await self.session.execute(insert(ProviderRawRecord).values(**row).returning(ProviderRawRecord))
+        return result.scalar_one()
+
+    async def insert_ingest_audit(self, row: dict) -> ProviderIngestAudit:
+        result = await self.session.execute(
+            insert(ProviderIngestAudit).values(**row).returning(ProviderIngestAudit)
+        )
         return result.scalar_one()
 
     async def list_rows(self, model, *, filters: list | None = None, order_by: list | None = None, limit: int = 200) -> list:
@@ -1346,6 +1502,7 @@ class MarketDataRepository:
     ) -> int:
         if not rows:
             return 0
+        rows = _without_raw_metadata(rows)
         deduped: dict[tuple, dict] = {}
         for row in rows:
             key = tuple(row.get(attr) for attr in conflict_attrs)

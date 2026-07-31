@@ -1,4 +1,6 @@
 from datetime import date, datetime, timedelta
+import hashlib
+import json
 from uuid import uuid4
 
 from app.modules.market_data.capabilities import capability_definition
@@ -18,10 +20,8 @@ from app.modules.market_data.models import (
     SectorComponent,
     SectorFundFlowDaily,
     Stock,
-    StockFactorDaily,
     StockFactorMinute,
     StockFundFlowDaily,
-    TechnicalIndicatorSnapshot,
     TickTrade,
 )
 from app.modules.market_data.providers import AkShareProvider, MootdxProvider, json_safe, normalize_symbol
@@ -692,22 +692,19 @@ class MarketDataQueryService:
     ) -> QueryResult:
         code = normalize_symbol(stock_code)
         definitions = await self.repository.list_rows(FactorDefinition, order_by=[FactorDefinition.factor_code.asc()], limit=1000)
-        daily = await self.repository.list_rows(StockFactorDaily, filters=[StockFactorDaily.stock_code == code], order_by=[StockFactorDaily.trade_date.desc()], limit=limit)
+        daily = await self.repository.list_active_daily_factors(stock_code=code, limit=limit)
         minute = await self.repository.list_rows(StockFactorMinute, filters=[StockFactorMinute.stock_code == code], order_by=[StockFactorMinute.bar_time.desc()], limit=limit)
-        snapshots = await self.repository.list_rows(
-            TechnicalIndicatorSnapshot,
-            filters=[TechnicalIndicatorSnapshot.stock_code == code],
-            order_by=[TechnicalIndicatorSnapshot.snapshot_time.desc()],
-            limit=limit,
-        )
+        snapshots = await self.repository.computed_technical_snapshots(stock_code=code, limit=limit)
         return self._result(
             "indicators",
             code,
             {
                 "factor_definitions": self._rows(definitions),
-                "daily_factors": self._rows(daily),
+                "daily_factors": [{key: json_safe(value) for key, value in row.items()} for row in daily],
                 "minute_factors": self._rows(minute),
-                "technical_snapshots": self._rows(snapshots),
+                "technical_snapshots": [
+                    {key: json_safe(value) for key, value in row.items()} for row in snapshots
+                ],
             },
             query_mode=query_mode,
             engines=["database"],
@@ -881,20 +878,28 @@ class MarketDataQueryService:
     async def _capture_raw(self, *, provider_code: str, capability: str, stock_code: str, request_extra: dict, payload, normalized_table: str | None) -> dict:
         trace_id = f"trace_{uuid4().hex}"
         safe_payload = json_safe(payload)
-        summary = {"payload_type": type(safe_payload).__name__, "row_count": len(safe_payload) if isinstance(safe_payload, list) else 1}
-        row = await self.repository.insert_raw({
+        row_count = len(safe_payload) if isinstance(safe_payload, list) else (1 if safe_payload else 0)
+        encoded = json.dumps(safe_payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        safe_request = {
+            key: value
+            for key, value in {"stock_code": stock_code, **request_extra}.items()
+            if key.lower() not in {"token", "api_key", "secret", "password", "authorization"}
+        }
+        row = await self.repository.insert_ingest_audit({
             "trace_id": trace_id,
             "provider_code": provider_code,
             "capability": capability,
-            "request_params": json_safe({"stock_code": stock_code, **request_extra}),
-            "record_key": stock_code,
-            "payload": safe_payload,
-            "payload_summary": summary,
+            "request_params": json_safe(safe_request),
+            "requested_fields": [],
+            "response_row_count": row_count,
+            "normalized_row_count": 0,
+            "payload_sha256": hashlib.sha256(encoded).hexdigest(),
             "normalized_table": normalized_table,
-            "status": "captured",
+            "schema_version": "query_audit_v2",
+            "status": "complete_zero" if row_count == 0 else "captured",
         })
         await self.repository.commit()
-        return {"table": "t_provider_raw_record", "id": row.id, "trace_id": trace_id}
+        return {"table": "t_provider_ingest_audit", "id": row.id, "trace_id": trace_id}
 
     def _provider_result(self, capability, stock_code: str, query_mode: QueryMode, engines: list[str], data, provider: dict) -> QueryResult:
         return self._result(

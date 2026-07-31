@@ -46,7 +46,7 @@ def test_limit_event_backfill_skips_completed_dates_and_marks_new_completion(mon
             self.upserted_rows.extend(rows)
             return len(rows)
 
-        async def insert_raw(self, row):
+        async def insert_ingest_audit(self, row):
             self.raw_markers.append(row)
             return SimpleNamespace(id=len(self.raw_markers))
 
@@ -101,7 +101,8 @@ def test_limit_event_backfill_skips_completed_dates_and_marks_new_completion(mon
     assert {row["event_type"] for row in FakeRepository.upserted_rows} == {"limit_up", "suspend"}
     assert [call["api_name"] for call in FakeProviderFactory.calls] == ["limit_list_d", "suspend_d"]
     assert FakeRepository.raw_markers[0]["capability"] == history_backfill.STOCK_LIMIT_EVENT_HISTORY_CAPABILITY
-    assert FakeRepository.raw_markers[0]["request_params"]["trade_date"] == "2026-07-02"
+    assert FakeRepository.raw_markers[0]["trade_date"] == trade_dates[1]
+    assert FakeRepository.raw_markers[0]["status"] == "captured"
 
 
 def test_stock_daily_backfill_request_enables_event_stage_by_default():

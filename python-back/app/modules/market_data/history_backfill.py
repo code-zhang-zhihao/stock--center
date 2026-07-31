@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from datetime import date, datetime
 from typing import Any, Literal
@@ -19,7 +21,7 @@ from app.modules.market_data.tushare_runtime import TushareProviderFactory
 
 logger = logging.getLogger(__name__)
 
-StockFactKind = Literal["daily", "daily_basic", "moneyflow", "stock_technical_factor_pro"]
+StockFactKind = Literal["daily", "daily_basic", "adjust_factor", "moneyflow", "stock_technical_factor_pro"]
 
 
 class StockDailyBackfillError(RuntimeError):
@@ -127,6 +129,9 @@ class StockDailyBackfillService:
     async def run_moneyflow(self, payload: StockDailyBackfillRequest) -> StockDailyBackfillResult:
         return await self._run_fact(payload, "moneyflow")
 
+    async def run_adjust_factor(self, payload: StockDailyBackfillRequest) -> StockDailyBackfillResult:
+        return await self._run_fact(payload, "adjust_factor")
+
     async def run_stock_technical_factor_pro(self, payload: StockDailyBackfillRequest) -> StockDailyBackfillResult:
         return await self._run_fact(payload, "stock_technical_factor_pro")
 
@@ -138,7 +143,7 @@ class StockDailyBackfillService:
         end_date = payload.end_date or await self._resolve_latest_trade_date()
         resolved_payload = payload.model_copy(update={"end_date": end_date})
         fact_results: dict[str, StockDailyBackfillResult] = {}
-        for fact_kind in ("daily", "daily_basic", "moneyflow", "stock_technical_factor_pro"):
+        for fact_kind in ("daily", "daily_basic", "adjust_factor", "moneyflow", "stock_technical_factor_pro"):
             fact_results[fact_kind] = await self._run_fact(resolved_payload, fact_kind)
         limit_event_result = await self._run_limit_events(resolved_payload) if resolved_payload.include_limit_events else None
 
@@ -322,31 +327,24 @@ class StockDailyBackfillService:
                         rows = [*limit_mapping.rows, *suspend_mapping.rows]
                         upserted = await repository.upsert_limit_event_rows(rows)
                         raw_count = len(limit_response.records) + len(suspend_response.records)
-                        await repository.insert_raw(
+                        await repository.insert_ingest_audit(
                             {
                                 "trace_id": uuid4().hex,
                                 "provider_code": "tushare",
                                 "capability": STOCK_LIMIT_EVENT_HISTORY_CAPABILITY,
+                                "trade_date": trade_date,
                                 "request_params": {
                                     "completion_scope": completion_scope,
                                     "pool_code": payload.pool_code,
                                     "max_stocks": payload.max_stocks,
                                     "trade_date": trade_date.isoformat(),
                                 },
-                                "record_key": f"{completion_scope}:{trade_date.isoformat()}",
-                                "payload": {
-                                    "api_names": ["limit_list_d", "suspend_d"],
-                                    "raw_rows": raw_count,
-                                    "mapped_rows": len(rows),
-                                },
-                                "payload_summary": {
-                                    "limit_list_d_raw_rows": len(limit_response.records),
-                                    "suspend_d_raw_rows": len(suspend_response.records),
-                                    "mapped_rows": len(rows),
-                                },
+                                "requested_fields": [],
+                                "response_row_count": raw_count,
+                                "normalized_row_count": len(rows),
                                 "normalized_table": "t_limit_event_daily",
-                                "normalized_pk": trade_date.isoformat(),
-                                "status": "captured",
+                                "schema_version": "canonical_v2",
+                                "status": "captured" if rows else "complete_zero",
                             }
                         )
                         await session.commit()
@@ -512,7 +510,10 @@ class StockDailyBackfillService:
                                 len(existing_dates),
                             )
                             continue
-                        api_name = "stk_factor_pro" if fact_kind == "stock_technical_factor_pro" else fact_kind
+                        api_name = {
+                            "stock_technical_factor_pro": "stk_factor_pro",
+                            "adjust_factor": "adj_factor",
+                        }.get(fact_kind, fact_kind)
                         response = await tushare.call(
                             f"stock_{fact_kind}_backfill",
                             lambda provider, code=stock_code: provider.request(
@@ -550,6 +551,29 @@ class StockDailyBackfillService:
                             mapped_count = mapping.mapped_count
                             warnings = mapping.warnings
                             unit_conversions = mapping.unit_conversions
+                        await repository.insert_ingest_audit(
+                            {
+                                "trace_id": uuid4().hex,
+                                "provider_code": "tushare",
+                                "capability": f"stock_{fact_kind}_history_backfill",
+                                "trade_date": end_date,
+                                "request_params": {
+                                    "api_name": api_name,
+                                    "stock_code": stock_code,
+                                    "start_date": payload.start_date.isoformat(),
+                                    "end_date": end_date.isoformat(),
+                                },
+                                "requested_fields": list(self._fields(fact_kind)),
+                                "response_row_count": raw_count,
+                                "normalized_row_count": mapped_count,
+                                "payload_sha256": self._payload_sha256(response.records),
+                                "normalized_table": self._normalized_table(fact_kind),
+                                "schema_version": "stock_daily_asset_v2",
+                                "status": "captured" if raw_count else "complete_zero",
+                            }
+                        )
+                        # 审计记录独立提交；事实行仍按批次提交，避免保存完整 Provider payload。
+                        await session.commit()
                         if payload.ingest_mode == "append_safe" and payload.only_missing:
                             rows = [row for row in rows if row["trade_date"] not in existing_dates]
                         buffer.extend(rows)
@@ -591,6 +615,31 @@ class StockDailyBackfillService:
                         raise
                     except Exception as exc:
                         await session.rollback()
+                        try:
+                            await repository.insert_ingest_audit(
+                                {
+                                    "trace_id": uuid4().hex,
+                                    "provider_code": "tushare",
+                                    "capability": f"stock_{fact_kind}_history_backfill",
+                                    "trade_date": end_date,
+                                    "request_params": {
+                                        "stock_code": stock_code,
+                                        "start_date": payload.start_date.isoformat(),
+                                        "end_date": end_date.isoformat(),
+                                    },
+                                    "requested_fields": list(self._fields(fact_kind)),
+                                    "response_row_count": 0,
+                                    "normalized_row_count": 0,
+                                    "normalized_table": self._normalized_table(fact_kind),
+                                    "schema_version": "stock_daily_asset_v2",
+                                    "status": "failed",
+                                    "error_code": type(exc).__name__,
+                                    "error_message": str(exc)[:1000],
+                                }
+                            )
+                            await session.commit()
+                        except Exception:
+                            await session.rollback()
                         buffer.clear()
                         buffered_stocks = 0
                         await update_result(failed_stock_count=1)
@@ -670,6 +719,8 @@ class StockDailyBackfillService:
             return await repository.existing_daily_bar_dates(stock_code=stock_code, start_date=start_date, end_date=end_date)
         if fact_kind == "daily_basic":
             return await repository.existing_daily_basic_dates(stock_code=stock_code, start_date=start_date, end_date=end_date)
+        if fact_kind == "adjust_factor":
+            return await repository.existing_adjust_factor_dates(stock_code=stock_code, start_date=start_date, end_date=end_date)
         if fact_kind == "moneyflow":
             return await repository.existing_stock_fund_flow_dates(stock_code=stock_code, start_date=start_date, end_date=end_date)
         return await repository.existing_stock_technical_factor_dates(stock_code=stock_code, start_date=start_date, end_date=end_date)
@@ -694,7 +745,6 @@ class StockDailyBackfillService:
             return (
                 "ts_code",
                 "trade_date",
-                "close",
                 "turnover_rate",
                 "turnover_rate_f",
                 "volume_ratio",
@@ -710,7 +760,6 @@ class StockDailyBackfillService:
                 "free_share",
                 "total_mv",
                 "circ_mv",
-                "limit_status",
             )
         if fact_kind == "moneyflow":
             return (
@@ -726,7 +775,24 @@ class StockDailyBackfillService:
                 "sell_elg_amount",
                 "net_mf_amount",
             )
+        if fact_kind == "adjust_factor":
+            return ("ts_code", "trade_date", "adj_factor")
         return ()
+
+    @staticmethod
+    def _normalized_table(fact_kind: StockFactKind) -> str:
+        return {
+            "daily": "t_daily_bar",
+            "daily_basic": "t_stock_daily_basic",
+            "adjust_factor": "t_stock_adjust_factor",
+            "moneyflow": "t_stock_fund_flow_daily",
+            "stock_technical_factor_pro": "t_stock_technical_factor_daily",
+        }[fact_kind]
+
+    @staticmethod
+    def _payload_sha256(records: list[dict[str, Any]]) -> str:
+        encoded = json.dumps(records, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _map_response(
@@ -740,6 +806,8 @@ class StockDailyBackfillService:
             return adapter.map_daily_range(records, start_date=start_date, end_date=end_date)
         if fact_kind == "daily_basic":
             return adapter.map_daily_basic_range(records, start_date=start_date, end_date=end_date)
+        if fact_kind == "adjust_factor":
+            return adapter.map_adjust_factor_range(records, start_date=start_date, end_date=end_date)
         return adapter.map_moneyflow_range(records, start_date=start_date, end_date=end_date)
 
     @staticmethod
@@ -788,6 +856,8 @@ class StockDailyBackfillService:
             count = await repository.upsert_daily_bars(rows)
         elif fact_kind == "daily_basic":
             count = await repository.upsert_daily_basic_rows(rows)
+        elif fact_kind == "adjust_factor":
+            count = await repository.upsert_adjust_factor_rows(rows)
         elif fact_kind == "stock_technical_factor_pro":
             count = await repository.upsert_stock_technical_factor_rows(rows)
         else:

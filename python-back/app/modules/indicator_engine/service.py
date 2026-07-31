@@ -467,13 +467,7 @@ class IndicatorEngineService:
                     "minute_return": self._ratio(price - first_price, first_price, percent=True),
                     "volume_spike_ratio": self._ratio(volume, volume_baseline),
                     "intraday_strength": self._ratio(price - running_low, running_high - running_low),
-                    "features": {
-                        "minute_index": index + 1,
-                        "day_bar_count": len(bars),
-                        "volume_baseline": "previous_20_minutes" if volume_baseline is not None else None,
-                        "amount_based_features_available": amount_available,
-                        "intraday_strength_kind": "running_range_position",
-                    },
+                    "features": {},
                 }
             )
         return rows
