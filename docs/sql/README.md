@@ -75,6 +75,10 @@
 69. `69-strategy-research-foundation.sql`：新增策略研究定义、T 日候选和模拟交易审计表，以及由候选派生的动态策略股票池约定；不 seed 策略、不调度扫描、不调用行情源或券商。
 70. `70-strategy-evaluation-lifecycle.sql`：新增策略不可变版本、信号事件、模拟交易分笔和日频基线回测，seed 盘后候选与手动回测任务；不连接券商或真实下单。
 71. `71-strategy-parameter-optimization.sql`：新增参数寻优运行/试验审计表与仅手动的历史参数寻优任务；只保存训练/样本外验证结论，不改策略版本、不提升 paper、不调用 Provider 或 LLM。
+72. `72-stock-daily-asset-convergence-v2.sql`：建立个股窄事实统一视图、复权事实、轻量 Provider 审计和 QFQ 标准日频因子 V2 影子资产。
+73. `73-activate-stock-daily-factor-v2.sql`：在至少 5 个完整影子交易日和覆盖门禁通过后，将标准日频因子消费者切换到 V2。
+74. `74-rollback-stock-daily-factor-v1.sql`：V2 语义验收失败时将激活因子版本恢复为 V1，不删除 V2 影子数据。
+75. `75-stock-factor-v2-window-performance.sql`：为 V2 历史因子任务补充 1–4 个数据库计算 worker 参数；代码按交易日窗口并发计算独立股票分片，并在每个窗口结束后统一刷新一次全市场资金强度分位。
 67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 68. `68-market-emotion-baseline-performance.sql`：新增历史市场级北向资金流回填任务，默认按 120 交易日窗口补最近 250 个已有日线交易日；V2 基线改为精确交易日 lookback、20 日持久化检查点与运行进度，并把该手动校准任务超时上限调为 1800 秒。
 
