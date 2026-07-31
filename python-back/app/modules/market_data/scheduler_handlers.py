@@ -768,6 +768,15 @@ class BackfillStockDailyFactorsHandler:
             "max": 500,
             "description": "每个 PostgreSQL 集合计算分片包含的股票数。默认 200，避免单条全市场 SQL 占用过多云端数据库内存；每个分片独立提交，append_safe 可安全续跑。",
         },
+        "calculation_workers": {
+            "label": "数据库计算 worker 数",
+            "type": "number",
+            "default": 2,
+            "required": False,
+            "min": 1,
+            "max": 4,
+            "description": "同一日期窗口并行计算的股票分片数；每个 worker 使用独立数据库会话，默认 2。",
+        },
         "calculate_stock_fund": {
             "label": "计算资金因子",
             "type": "boolean",
@@ -785,6 +794,7 @@ class BackfillStockDailyFactorsHandler:
         "max_stocks": None,
         "factor_window_trade_days": 20,
         "sql_stock_chunk_size": 200,
+        "calculation_workers": 2,
         "fail_fast": False,
         "calculate_stock_fund": True,
         "include_external_technical": False,

@@ -142,12 +142,13 @@ class FactorBackfillService:
         )
         baseline_history_start = payload.start_date - timedelta(days=550)
         logger.info(
-            "factor daily V2 backfill started: pool=%s dates=%s stocks=%s history_start=%s chunk=%s only_missing=%s",
+            "factor daily V2 backfill started: pool=%s dates=%s stocks=%s history_start=%s chunk=%s workers=%s only_missing=%s",
             payload.pool_code,
             len(trade_dates),
             len(stock_codes),
             baseline_history_start,
             payload.sql_stock_chunk_size,
+            payload.calculation_workers,
             payload.only_missing,
         )
         windows = [
@@ -182,50 +183,68 @@ class FactorBackfillService:
                         trade_date: sum(1 for _, item_date in daily_bar_keys if item_date == trade_date)
                         for trade_date in window_dates
                     }
-                    written_by_date: dict[date, int] = {}
-                    logger.info(
-                        "factor daily V2 backfill window started: window=%s/%s start_date=%s end_date=%s trade_dates=%s stocks=%s targets=%s chunks=%s",
-                        window_index,
-                        len(windows),
-                        window_start,
-                        window_end,
-                        len(window_dates),
-                        len(target_stock_codes),
-                        len(target_keys),
-                        (len(target_stock_codes) + payload.sql_stock_chunk_size - 1)
-                        // payload.sql_stock_chunk_size,
-                    )
-                    for chunk_index, offset in enumerate(
-                        range(0, len(target_stock_codes), payload.sql_stock_chunk_size),
-                        start=1,
-                    ):
-                        codes = target_stock_codes[offset : offset + payload.sql_stock_chunk_size]
+                chunks = [
+                    target_stock_codes[offset : offset + payload.sql_stock_chunk_size]
+                    for offset in range(0, len(target_stock_codes), payload.sql_stock_chunk_size)
+                ]
+                logger.info(
+                    "factor daily V2 backfill window started: window=%s/%s start_date=%s end_date=%s trade_dates=%s stocks=%s targets=%s chunks=%s workers=%s",
+                    window_index,
+                    len(windows),
+                    window_start,
+                    window_end,
+                    len(window_dates),
+                    len(target_stock_codes),
+                    len(target_keys),
+                    len(chunks),
+                    payload.calculation_workers,
+                )
+                semaphore = asyncio.Semaphore(payload.calculation_workers)
+
+                async def calculate_chunk(chunk_index: int, codes: list[str]) -> dict[date, int]:
+                    async with semaphore:
                         chunk_started = perf_counter()
-                        chunk_written = await repository.assemble_stock_daily_factors_v2_between(
-                            codes,
-                            start_date=window_start,
-                            end_date=window_end,
-                            history_start=window_start - timedelta(days=550),
-                            only_missing=only_missing,
-                        )
-                        await session.commit()
-                        for trade_date, count in chunk_written.items():
-                            written_by_date[trade_date] = written_by_date.get(trade_date, 0) + count
+                        async with self.sessionmaker() as chunk_session:
+                            chunk_repository = IndicatorRepository(chunk_session)
+                            chunk_written = await chunk_repository.assemble_stock_daily_factors_v2_between(
+                                codes,
+                                start_date=window_start,
+                                end_date=window_end,
+                                history_start=window_start - timedelta(days=550),
+                                only_missing=only_missing,
+                            )
+                            await chunk_session.commit()
                         logger.info(
-                            "factor daily V2 backfill chunk completed: window=%s/%s chunk=%s stocks=%s rows=%s elapsed_ms=%s",
+                            "factor daily V2 backfill chunk completed: window=%s/%s chunk=%s/%s stocks=%s rows=%s elapsed_ms=%s",
                             window_index,
                             len(windows),
                             chunk_index,
+                            len(chunks),
                             len(codes),
                             sum(chunk_written.values()),
                             int((perf_counter() - chunk_started) * 1000),
                         )
+                        return chunk_written
+
+                chunk_results = await asyncio.gather(
+                    *(
+                        calculate_chunk(chunk_index, codes)
+                        for chunk_index, codes in enumerate(chunks, start=1)
+                    )
+                )
+                written_by_date: dict[date, int] = {}
+                for chunk_written in chunk_results:
+                    for trade_date, count in chunk_written.items():
+                        written_by_date[trade_date] = written_by_date.get(trade_date, 0) + count
+
+                async with self.sessionmaker() as percentile_session:
+                    percentile_repository = IndicatorRepository(percentile_session)
                     percentile_started = perf_counter()
-                    percentile_updates = await repository.refresh_stock_daily_v2_fund_percentiles(
+                    percentile_updates = await percentile_repository.refresh_stock_daily_v2_fund_percentiles(
                         start_date=window_start,
                         end_date=window_end,
                     )
-                    await session.commit()
+                    await percentile_session.commit()
                     logger.info(
                         "factor daily V2 fund percentiles refreshed: window=%s/%s dates=%s rows=%s elapsed_ms=%s",
                         window_index,
