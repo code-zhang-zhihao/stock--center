@@ -802,6 +802,24 @@ class IndicatorRepository:
         trade_date: date,
         history_start: date,
     ) -> int:
+        written = await self.assemble_stock_daily_factors_v2_between(
+            stock_codes,
+            start_date=trade_date,
+            end_date=trade_date,
+            history_start=history_start,
+            only_missing=False,
+        )
+        return written.get(trade_date, 0)
+
+    async def assemble_stock_daily_factors_v2_between(
+        self,
+        stock_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+        history_start: date,
+        only_missing: bool,
+    ) -> dict[date, int]:
         """Assemble the typed QFQ serving row without copying professional JSON.
 
         Tushare ``stk_factor_pro`` is the preferred source for technical
@@ -828,7 +846,7 @@ class IndicatorRepository:
                     ) AS source_rank
                 FROM t_daily_bar AS bar
                 WHERE bar.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND bar.trade_date BETWEEN :history_start AND :trade_date
+                  AND bar.trade_date BETWEEN :history_start AND :end_date
             ),
             bars AS (
                 SELECT * FROM ranked_bars WHERE source_rank = 1
@@ -838,7 +856,7 @@ class IndicatorRepository:
                     stock_code, trade_date, adj_factor, source
                 FROM t_stock_adjust_factor
                 WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND trade_date BETWEEN :history_start AND :trade_date
+                  AND trade_date BETWEEN :history_start AND :end_date
                 ORDER BY stock_code, trade_date,
                     CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
                     created_at DESC, id DESC
@@ -935,7 +953,7 @@ class IndicatorRepository:
                     id, stock_code, trade_date, source, factors
                 FROM t_stock_technical_factor_daily
                 WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND trade_date = :trade_date
+                  AND trade_date BETWEEN :start_date AND :end_date
                 ORDER BY stock_code, trade_date, updated_at DESC, id DESC
             ),
             fund_grouped AS (
@@ -946,7 +964,7 @@ class IndicatorRepository:
                     ) AS non_positive_group
                 FROM t_stock_fund_flow_daily AS flow
                 WHERE flow.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND flow.trade_date BETWEEN (:trade_date - INTERVAL '30 days')::date AND :trade_date
+                  AND flow.trade_date BETWEEN (:start_date - INTERVAL '30 days')::date AND :end_date
             ),
             fund_metrics AS (
                 SELECT
@@ -958,14 +976,6 @@ class IndicatorRepository:
                     sum(coalesce(main_net_inflow, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS main_net_inflow_5d,
                     sum(coalesce(main_net_inflow, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS main_net_inflow_10d
                 FROM fund_grouped
-            ),
-            fund_cross_section AS (
-                SELECT
-                    stock_code,
-                    cume_dist() OVER (ORDER BY main_net_inflow) * 100 AS fund_strength_percentile
-                FROM t_stock_fund_flow_daily
-                WHERE trade_date = :trade_date
-                  AND main_net_inflow IS NOT NULL
             ),
             candidates AS (
                 SELECT
@@ -1091,7 +1101,7 @@ class IndicatorRepository:
                     fund.main_net_inflow_5d,
                     fund.main_net_inflow_10d,
                     fund.continuous_main_inflow_days::integer,
-                    cross_section.fund_strength_percentile,
+                    NULL::double precision AS fund_strength_percentile,
                     daily.history_days::integer
                 FROM final_metrics AS daily
                 LEFT JOIN technical
@@ -1103,9 +1113,18 @@ class IndicatorRepository:
                 LEFT JOIN fund_metrics AS fund
                   ON fund.stock_code = daily.stock_code
                  AND fund.trade_date = daily.trade_date
-                LEFT JOIN fund_cross_section AS cross_section
-                  ON cross_section.stock_code = daily.stock_code
-                WHERE daily.trade_date = :trade_date
+                WHERE daily.trade_date BETWEEN :start_date AND :end_date
+                  AND (
+                    NOT :only_missing
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM t_stock_factor_daily_v2 AS existing
+                        WHERE existing.stock_code = daily.stock_code
+                          AND existing.trade_date = daily.trade_date
+                          AND existing.factor_set_version = 'stock_daily_v2'
+                          AND existing.factor_status = 'ready'
+                    )
+                  )
             )
             INSERT INTO t_stock_factor_daily_v2 (
                 stock_code, trade_date, factor_set_version, price_basis, factor_status,
@@ -1214,7 +1233,7 @@ class IndicatorRepository:
                 fund_strength_percentile = EXCLUDED.fund_strength_percentile,
                 history_days = EXCLUDED.history_days,
                 updated_at = now()
-            RETURNING 1
+            RETURNING trade_date
             """
         ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
         rows = (
@@ -1222,12 +1241,61 @@ class IndicatorRepository:
                 statement,
                 {
                     "stock_codes": stock_codes,
-                    "trade_date": trade_date,
+                    "start_date": start_date,
+                    "end_date": end_date,
                     "history_start": history_start,
+                    "only_missing": only_missing,
                 },
             )
         ).all()
-        return len(rows)
+        written: dict[date, int] = {}
+        for (trade_date,) in rows:
+            written[trade_date] = written.get(trade_date, 0) + 1
+        return written
+
+    async def refresh_stock_daily_v2_fund_percentiles(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> dict[date, int]:
+        """Refresh full-market fund percentiles once after a V2 date window is assembled."""
+        statement = text(
+            """
+            WITH fund_cross_section AS (
+                SELECT
+                    stock_code,
+                    trade_date,
+                    cume_dist() OVER (
+                        PARTITION BY trade_date
+                        ORDER BY main_net_inflow
+                    ) * 100 AS fund_strength_percentile
+                FROM t_stock_fund_flow_daily
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                  AND main_net_inflow IS NOT NULL
+            )
+            UPDATE t_stock_factor_daily_v2 AS factor
+            SET fund_strength_percentile = cross_section.fund_strength_percentile,
+                updated_at = now()
+            FROM fund_cross_section AS cross_section
+            WHERE factor.stock_code = cross_section.stock_code
+              AND factor.trade_date = cross_section.trade_date
+              AND factor.factor_set_version = 'stock_daily_v2'
+              AND factor.trade_date BETWEEN :start_date AND :end_date
+              AND factor.fund_strength_percentile IS DISTINCT FROM cross_section.fund_strength_percentile
+            RETURNING factor.trade_date
+            """
+        )
+        rows = (
+            await self.session.execute(
+                statement,
+                {"start_date": start_date, "end_date": end_date},
+            )
+        ).all()
+        updated: dict[date, int] = {}
+        for (trade_date,) in rows:
+            updated[trade_date] = updated.get(trade_date, 0) + 1
+        return updated
 
     async def existing_stock_daily_v2_ready_codes(
         self,
@@ -1252,6 +1320,35 @@ class IndicatorRepository:
             {"stock_codes": stock_codes, "trade_date": trade_date},
         )
         return set(rows.scalars().all())
+
+    async def load_stock_daily_v2_ready_keys_between(
+        self,
+        stock_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> set[tuple[str, date]]:
+        if not stock_codes:
+            return set()
+        statement = text(
+            """
+            SELECT stock_code, trade_date
+            FROM t_stock_factor_daily_v2
+            WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
+              AND trade_date BETWEEN :start_date AND :end_date
+              AND factor_set_version = 'stock_daily_v2'
+              AND factor_status = 'ready'
+            """
+        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
+        rows = await self.session.execute(
+            statement,
+            {
+                "stock_codes": stock_codes,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        )
+        return {(stock_code, trade_date) for stock_code, trade_date in rows.all()}
 
     async def clear_technical_snapshot_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
         if not stock_codes:

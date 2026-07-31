@@ -6,6 +6,8 @@ import asyncio
 
 from sqlalchemy import BigInteger
 
+from app.modules.indicator_engine import backfill as backfill_module
+from app.modules.indicator_engine.backfill import FactorBackfillRequest, FactorBackfillService
 from app.modules.indicator_engine.service import IndicatorEngineService
 from app.modules.market_data.close_ingest import DailyMarketCloseIngestRequest, DailyMarketCloseIngestService
 from app.modules.market_data.models import DailyBar, MinuteBar, QuoteSnapshot, TickTrade
@@ -197,3 +199,98 @@ def test_market_volume_columns_use_bigint_bind_types() -> None:
     assert isinstance(MinuteBar.__table__.c.volume_share.type, BigInteger)
     assert isinstance(QuoteSnapshot.__table__.c.volume_hand.type, BigInteger)
     assert isinstance(TickTrade.__table__.c.volume_hand.type, BigInteger)
+
+
+def test_v2_history_backfill_uses_configured_trade_date_windows(monkeypatch) -> None:
+    trade_dates = [date(2026, 6, 1) + timedelta(days=index) for index in range(6)]
+    stock_codes = ["000001", "600000", "300001"]
+    range_calls: list[tuple[date, date, tuple[str, ...], bool]] = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def commit(self):
+            return None
+
+    class FakeSessionmaker:
+        def __call__(self):
+            return FakeSession()
+
+    class FakeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def load_daily_bar_keys_between(self, codes, *, start_date, end_date):
+            return {
+                (stock_code, trade_date)
+                for stock_code in codes
+                for trade_date in trade_dates
+                if start_date <= trade_date <= end_date
+            }
+
+        async def load_stock_daily_v2_ready_keys_between(self, _codes, *, start_date, end_date):
+            if start_date <= trade_dates[0] <= end_date:
+                return {(stock_codes[0], trade_dates[0])}
+            return set()
+
+        async def assemble_stock_daily_factors_v2_between(
+            self,
+            codes,
+            *,
+            start_date,
+            end_date,
+            history_start,
+            only_missing,
+        ):
+            assert history_start == start_date - timedelta(days=550)
+            range_calls.append((start_date, end_date, tuple(codes), only_missing))
+            return {
+                trade_date: len(codes) - (1 if trade_date == trade_dates[0] else 0)
+                for trade_date in trade_dates
+                if start_date <= trade_date <= end_date
+            }
+
+        async def refresh_stock_daily_v2_fund_percentiles(self, *, start_date, end_date):
+            return {
+                trade_date: len(stock_codes)
+                for trade_date in trade_dates
+                if start_date <= trade_date <= end_date
+            }
+
+    service = FactorBackfillService(FakeSessionmaker())
+
+    async def resolve_trade_dates(_start_date, _end_date):
+        return trade_dates
+
+    async def resolve_stock_codes(_pool_code):
+        return stock_codes
+
+    service._resolve_trade_dates = resolve_trade_dates
+    service._resolve_stock_codes = resolve_stock_codes
+    monkeypatch.setattr(backfill_module, "IndicatorRepository", FakeRepository)
+
+    result = asyncio.run(
+        service.backfill_standard_daily_v2(
+            FactorBackfillRequest(
+                pool_code="all_a_share",
+                start_date=trade_dates[0],
+                end_date=trade_dates[-1],
+                factor_window_trade_days=5,
+                sql_stock_chunk_size=50,
+                include_external_technical=False,
+            )
+        )
+    )
+
+    assert [(start, end) for start, end, _, _ in range_calls] == [
+        (trade_dates[0], trade_dates[4]),
+        (trade_dates[5], trade_dates[5]),
+    ]
+    assert all(only_missing is True for _, _, _, only_missing in range_calls)
+    assert result.processed_trade_dates == 6
+    assert result.failed_trade_dates == 0
+    assert result.daily_factor_rows == 17

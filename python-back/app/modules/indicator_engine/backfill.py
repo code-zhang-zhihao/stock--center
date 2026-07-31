@@ -121,7 +121,7 @@ class FactorBackfillService:
         )
 
     async def backfill_standard_daily_v2(self, payload: FactorBackfillRequest) -> FactorBackfillResult:
-        """Backfill the typed QFQ serving table, one date and one stock shard at a time."""
+        """Backfill the typed QFQ serving table by bounded date windows and stock shards."""
         end_date = payload.end_date or await self._resolve_latest_trade_date()
         trade_dates = await self._resolve_trade_dates(payload.start_date, end_date)
         stock_codes = await self._resolve_stock_codes(payload.pool_code)
@@ -150,54 +150,137 @@ class FactorBackfillService:
             payload.sql_stock_chunk_size,
             payload.only_missing,
         )
-        for trade_date in trade_dates:
-            date_rows = 0
-            attempted = 0
+        windows = [
+            trade_dates[offset : offset + payload.factor_window_trade_days]
+            for offset in range(0, len(trade_dates), payload.factor_window_trade_days)
+        ]
+        for window_index, window_dates in enumerate(windows, start=1):
+            window_start, window_end = window_dates[0], window_dates[-1]
             try:
                 async with self.sessionmaker() as session:
                     repository = IndicatorRepository(session)
-                    for offset in range(0, len(stock_codes), payload.sql_stock_chunk_size):
-                        codes = stock_codes[offset : offset + payload.sql_stock_chunk_size]
-                        if payload.ingest_mode == "append_safe" and payload.only_missing:
-                            ready_codes = await repository.existing_stock_daily_v2_ready_codes(
-                                codes,
-                                trade_date=trade_date,
-                            )
-                            codes = [code for code in codes if code not in ready_codes]
-                        if not codes:
-                            continue
-                        attempted += len(codes)
-                        date_rows += await repository.assemble_stock_daily_factors_v2(
+                    daily_bar_keys = await repository.load_daily_bar_keys_between(
+                        stock_codes,
+                        start_date=window_start,
+                        end_date=window_end,
+                    )
+                    ready_keys: set[tuple[str, date]] = set()
+                    only_missing = payload.ingest_mode == "append_safe" and payload.only_missing
+                    if only_missing:
+                        ready_keys = await repository.load_stock_daily_v2_ready_keys_between(
+                            stock_codes,
+                            start_date=window_start,
+                            end_date=window_end,
+                        )
+                    target_keys = daily_bar_keys - ready_keys if ready_keys else daily_bar_keys
+                    target_stock_codes = sorted({stock_code for stock_code, _ in target_keys})
+                    target_count_by_date = {
+                        trade_date: sum(1 for _, item_date in target_keys if item_date == trade_date)
+                        for trade_date in window_dates
+                    }
+                    total_count_by_date = {
+                        trade_date: sum(1 for _, item_date in daily_bar_keys if item_date == trade_date)
+                        for trade_date in window_dates
+                    }
+                    written_by_date: dict[date, int] = {}
+                    logger.info(
+                        "factor daily V2 backfill window started: window=%s/%s start_date=%s end_date=%s trade_dates=%s stocks=%s targets=%s chunks=%s",
+                        window_index,
+                        len(windows),
+                        window_start,
+                        window_end,
+                        len(window_dates),
+                        len(target_stock_codes),
+                        len(target_keys),
+                        (len(target_stock_codes) + payload.sql_stock_chunk_size - 1)
+                        // payload.sql_stock_chunk_size,
+                    )
+                    for chunk_index, offset in enumerate(
+                        range(0, len(target_stock_codes), payload.sql_stock_chunk_size),
+                        start=1,
+                    ):
+                        codes = target_stock_codes[offset : offset + payload.sql_stock_chunk_size]
+                        chunk_started = perf_counter()
+                        chunk_written = await repository.assemble_stock_daily_factors_v2_between(
                             codes,
-                            trade_date=trade_date,
-                            history_start=trade_date - timedelta(days=550),
+                            start_date=window_start,
+                            end_date=window_end,
+                            history_start=window_start - timedelta(days=550),
+                            only_missing=only_missing,
                         )
                         await session.commit()
-                if attempted == 0:
-                    result.skipped_trade_dates += 1
-                    status = "skipped"
-                    reason = "ready_rows_already_present"
-                else:
+                        for trade_date, count in chunk_written.items():
+                            written_by_date[trade_date] = written_by_date.get(trade_date, 0) + count
+                        logger.info(
+                            "factor daily V2 backfill chunk completed: window=%s/%s chunk=%s stocks=%s rows=%s elapsed_ms=%s",
+                            window_index,
+                            len(windows),
+                            chunk_index,
+                            len(codes),
+                            sum(chunk_written.values()),
+                            int((perf_counter() - chunk_started) * 1000),
+                        )
+                    percentile_started = perf_counter()
+                    percentile_updates = await repository.refresh_stock_daily_v2_fund_percentiles(
+                        start_date=window_start,
+                        end_date=window_end,
+                    )
+                    await session.commit()
+                    logger.info(
+                        "factor daily V2 fund percentiles refreshed: window=%s/%s dates=%s rows=%s elapsed_ms=%s",
+                        window_index,
+                        len(windows),
+                        len(percentile_updates),
+                        sum(percentile_updates.values()),
+                        int((perf_counter() - percentile_started) * 1000),
+                    )
+                for trade_date in window_dates:
+                    target = target_count_by_date[trade_date]
+                    written = written_by_date.get(trade_date, 0)
+                    if target == 0:
+                        result.skipped_trade_dates += 1
+                        result.date_summaries.append(
+                            {
+                                "trade_date": trade_date.isoformat(),
+                                "status": "skipped",
+                                "reason": "ready_rows_already_present",
+                                "target_rows": total_count_by_date[trade_date],
+                            }
+                        )
+                        continue
                     result.processed_trade_dates += 1
-                    result.daily_factor_rows += date_rows
-                    status = "success"
-                    reason = None
-                result.date_summaries.append(
-                    {
-                        "trade_date": trade_date.isoformat(),
-                        "status": status,
-                        "attempted_stocks": attempted,
-                        "daily_factor_v2_rows": date_rows,
-                        **({"reason": reason} if reason else {}),
-                    }
+                    result.daily_factor_rows += written
+                    result.date_summaries.append(
+                        {
+                            "trade_date": trade_date.isoformat(),
+                            "status": "success",
+                            "target_rows": target,
+                            "daily_factor_v2_rows": written,
+                        }
+                    )
+                logger.info(
+                    "factor daily V2 backfill window finished: window=%s/%s start_date=%s end_date=%s targets=%s rows=%s",
+                    window_index,
+                    len(windows),
+                    window_start,
+                    window_end,
+                    len(target_keys),
+                    sum(written_by_date.values()),
                 )
             except Exception as exc:
-                result.failed_trade_dates += 1
-                if len(result.errors) < 30:
-                    result.errors.append(
-                        {"trade_date": trade_date.isoformat(), "error": f"{type(exc).__name__}: {exc}"}
-                    )
-                logger.exception("factor daily V2 backfill date failed: trade_date=%s", trade_date)
+                result.failed_trade_dates += len(window_dates)
+                for trade_date in window_dates:
+                    if len(result.errors) < 30:
+                        result.errors.append(
+                            {"trade_date": trade_date.isoformat(), "error": f"{type(exc).__name__}: {exc}"}
+                        )
+                logger.exception(
+                    "factor daily V2 backfill window failed: window=%s/%s start_date=%s end_date=%s",
+                    window_index,
+                    len(windows),
+                    window_start,
+                    window_end,
+                )
                 if payload.fail_fast:
                     raise
         if result.failed_trade_dates:

@@ -472,6 +472,11 @@ class DailyMarketCloseIngestService:
                     history_start=trade_date.fromordinal(trade_date.toordinal() - 550),
                 )
                 await self.repository.commit()
+            await indicator_repository.refresh_stock_daily_v2_fund_percentiles(
+                start_date=trade_date,
+                end_date=trade_date,
+            )
+            await self.repository.commit()
             result.stage_timings["daily_factors_v2"] = int((perf_counter() - v2_started) * 1000)
 
         if payload.calculate_minute_factors and minute_targets:
