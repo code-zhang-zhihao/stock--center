@@ -157,6 +157,7 @@ tests/test_stock_pool_service.py
 tests/test_strategy_builtins.py
 tests/test_strategy_center_service.py
 tests/test_strategy_optimization.py
+tests/test_strategy_price_basis.py
 tests/test_strategy_realtime_rules.py
 tests/test_tickflow_config_value.py
 tests/test_tickflow_realtime_runtime.py
