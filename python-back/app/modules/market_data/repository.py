@@ -961,17 +961,45 @@ class MarketDataRepository:
         stock_code: str,
         trade_dates: list[date],
     ) -> dict[date, dict[str, float | None]]:
-        """Return the lightweight MA projection used by the stock daily chart."""
+        """Return BFQ moving averages for the BFQ daily-chart candles.
+
+        The strategy factor set may be QFQ, so projecting its MA columns onto
+        BFQ candles would mix price bases around corporate actions. A single
+        stock window query is cheap and keeps the display contract exact.
+        """
         if not trade_dates:
             return {}
         result = await self.session.execute(
             text(
                 """
+                WITH history AS (
+                    SELECT
+                        trade_date,
+                        avg(close_price) OVER (
+                            ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                        ) AS ma5,
+                        avg(close_price) OVER (
+                            ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                        ) AS ma10,
+                        avg(close_price) OVER (
+                            ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                        ) AS ma20,
+                        avg(close_price) OVER (
+                            ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+                        ) AS ma30,
+                        avg(close_price) OVER (
+                            ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                        ) AS ma60
+                    FROM t_daily_bar
+                    WHERE stock_code = :stock_code
+                      AND trade_date <= (
+                          SELECT max(value)
+                          FROM unnest(CAST(:trade_dates AS date[])) AS dates(value)
+                      )
+                )
                 SELECT trade_date, ma5, ma10, ma20, ma30, ma60
-                FROM v_stock_factor_daily_active
-                WHERE stock_code = :stock_code
-                  AND trade_date = ANY(CAST(:trade_dates AS date[]))
-                  AND factor_status = 'ready'
+                FROM history
+                WHERE trade_date = ANY(CAST(:trade_dates AS date[]))
                 """
             ),
             {"stock_code": stock_code, "trade_dates": trade_dates},

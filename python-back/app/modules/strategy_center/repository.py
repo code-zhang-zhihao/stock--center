@@ -344,11 +344,11 @@ class StrategyCenterRepository:
         fact_columns = (
             DailyBar.trade_date.label("trade_date"),
             DailyBar.stock_code.label("stock_code"),
-            DailyBar.open_price,
-            DailyBar.high_price,
-            DailyBar.low_price,
-            DailyBar.close_price,
-            DailyBar.pre_close_price,
+            _factor_basis_price(StockFactorDaily.basis_open_price, DailyBar.open_price).label("open_price"),
+            _factor_basis_price(StockFactorDaily.basis_high_price, DailyBar.high_price).label("high_price"),
+            _factor_basis_price(StockFactorDaily.basis_low_price, DailyBar.low_price).label("low_price"),
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price).label("close_price"),
+            _factor_basis_price(StockFactorDaily.basis_pre_close_price, DailyBar.pre_close_price).label("pre_close_price"),
             DailyBar.change_pct,
             DailyBar.amount_yuan,
             StockFactorDaily.ma5,
@@ -425,11 +425,11 @@ class StrategyCenterRepository:
             # the wire protocol returns one row per candidate stock.
             history_payload = func.jsonb_build_object(
                 "trade_date", DailyBar.trade_date,
-                "open_price", DailyBar.open_price,
-                "high_price", DailyBar.high_price,
-                "low_price", DailyBar.low_price,
-                "close_price", DailyBar.close_price,
-                "pre_close_price", DailyBar.pre_close_price,
+                "open_price", _factor_basis_price(StockFactorDaily.basis_open_price, DailyBar.open_price),
+                "high_price", _factor_basis_price(StockFactorDaily.basis_high_price, DailyBar.high_price),
+                "low_price", _factor_basis_price(StockFactorDaily.basis_low_price, DailyBar.low_price),
+                "close_price", _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price),
+                "pre_close_price", _factor_basis_price(StockFactorDaily.basis_pre_close_price, DailyBar.pre_close_price),
                 "change_pct", DailyBar.change_pct,
                 "amount_yuan", DailyBar.amount_yuan,
                 "ma5", StockFactorDaily.ma5,
@@ -625,10 +625,18 @@ class StrategyCenterRepository:
             select(
                 DailyBar.stock_code,
                 func.array_agg(aggregate_order_by(DailyBar.trade_date, order_date)).label("trade_dates"),
-                func.array_agg(aggregate_order_by(DailyBar.open_price, order_date)).label("open_prices"),
-                func.array_agg(aggregate_order_by(DailyBar.close_price, order_date)).label("close_prices"),
-                func.array_agg(aggregate_order_by(DailyBar.high_price, order_date)).label("high_prices"),
-                func.array_agg(aggregate_order_by(DailyBar.low_price, order_date)).label("low_prices"),
+                func.array_agg(aggregate_order_by(
+                    _factor_basis_price(StockFactorDaily.basis_open_price, DailyBar.open_price), order_date
+                )).label("open_prices"),
+                func.array_agg(aggregate_order_by(
+                    _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price), order_date
+                )).label("close_prices"),
+                func.array_agg(aggregate_order_by(
+                    _factor_basis_price(StockFactorDaily.basis_high_price, DailyBar.high_price), order_date
+                )).label("high_prices"),
+                func.array_agg(aggregate_order_by(
+                    _factor_basis_price(StockFactorDaily.basis_low_price, DailyBar.low_price), order_date
+                )).label("low_prices"),
                 func.array_agg(aggregate_order_by(StockFactorDaily.ma5, order_date)).label("ma5_values"),
                 func.array_agg(aggregate_order_by(StockFactorDaily.ma10, order_date)).label("ma10_values"),
             )
@@ -690,11 +698,11 @@ class StrategyCenterRepository:
             select(
                 DailyBar.trade_date,
                 DailyBar.stock_code,
-                DailyBar.open_price,
-                DailyBar.high_price,
-                DailyBar.low_price,
-                DailyBar.close_price,
-                DailyBar.pre_close_price,
+                _factor_basis_price(StockFactorDaily.basis_open_price, DailyBar.open_price).label("open_price"),
+                _factor_basis_price(StockFactorDaily.basis_high_price, DailyBar.high_price).label("high_price"),
+                _factor_basis_price(StockFactorDaily.basis_low_price, DailyBar.low_price).label("low_price"),
+                _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price).label("close_price"),
+                _factor_basis_price(StockFactorDaily.basis_pre_close_price, DailyBar.pre_close_price).label("pre_close_price"),
                 DailyBar.change_pct,
                 DailyBar.amount_yuan,
                 StockFactorDaily.ma5,
@@ -1576,7 +1584,8 @@ def _backtest_prefilter_conditions(implementation_code: str):
 
     if implementation_code == "trend_breakout":
         return (
-            DailyBar.close_price >= _prior_daily_window_aggregate("high_price", func.max),
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price)
+            >= _prior_daily_window_aggregate("high_price", func.max),
             DailyBar.change_pct >= 2.0,
             DailyBar.change_pct < 9.5,
             StockFactorDaily.amount_ratio >= 1.5,
@@ -1584,7 +1593,7 @@ def _backtest_prefilter_conditions(implementation_code: str):
         )
     if implementation_code == "bullish_alignment":
         return (
-            DailyBar.close_price > StockFactorDaily.ma5,
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price) > StockFactorDaily.ma5,
             StockFactorDaily.ma5 > StockFactorDaily.ma10,
             StockFactorDaily.ma10 > StockFactorDaily.ma20,
             StockFactorDaily.ma20 > StockFactorDaily.ma60,
@@ -1616,7 +1625,7 @@ def _backtest_prefilter_conditions(implementation_code: str):
         )
     if implementation_code == "low_volatility_leader":
         return (
-            DailyBar.close_price > StockFactorDaily.ma20,
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price) > StockFactorDaily.ma20,
             StockFactorDaily.volatility_20d <= 2.5,
             DailyBar.change_pct >= 2.0,
             StockFactorDaily.volume_ratio >= 1.3,
@@ -1624,9 +1633,10 @@ def _backtest_prefilter_conditions(implementation_code: str):
         )
     if implementation_code == "pullback_ma20_bounce":
         return (
-            DailyBar.low_price <= StockFactorDaily.ma20 * 1.01,
-            DailyBar.close_price >= StockFactorDaily.ma20,
-            DailyBar.close_price > DailyBar.open_price,
+            _factor_basis_price(StockFactorDaily.basis_low_price, DailyBar.low_price) <= StockFactorDaily.ma20 * 1.01,
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price) >= StockFactorDaily.ma20,
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price)
+            > _factor_basis_price(StockFactorDaily.basis_open_price, DailyBar.open_price),
             StockFactorDaily.ma5 >= StockFactorDaily.ma10,
             StockFactorDaily.ma10 >= StockFactorDaily.ma20,
             StockFactorDaily.volume_ratio >= 1.0,
@@ -1634,8 +1644,10 @@ def _backtest_prefilter_conditions(implementation_code: str):
         )
     if implementation_code == "n_day_low_reversal":
         return (
-            DailyBar.low_price <= _prior_daily_window_aggregate("low_price", func.min) * 1.02,
-            DailyBar.close_price > DailyBar.open_price,
+            _factor_basis_price(StockFactorDaily.basis_low_price, DailyBar.low_price)
+            <= _prior_daily_window_aggregate("low_price", func.min) * 1.02,
+            _factor_basis_price(StockFactorDaily.basis_close_price, DailyBar.close_price)
+            > _factor_basis_price(StockFactorDaily.basis_open_price, DailyBar.open_price),
             DailyBar.change_pct >= 2.0,
             StockFactorDaily.close_position >= 0.70,
             StockFactorDaily.volume_ratio >= 1.2,
@@ -1668,8 +1680,21 @@ def _backtest_prefilter_conditions(implementation_code: str):
 
 def _prior_daily_window_aggregate(column_name: str, aggregate):
     prior = DailyBar.__table__.alias(f"prior_{column_name}")
+    prior_factor = StockFactorDaily.__table__.alias(f"prior_factor_{column_name}")
+    basis_column = prior_factor.c[f"basis_{column_name}"]
+    prior_value = _factor_basis_price(basis_column, prior.c[column_name]).label("basis_value")
     window = (
-        select(prior.c[column_name])
+        select(prior_value)
+        .select_from(
+            prior.outerjoin(
+                prior_factor,
+                and_(
+                    prior_factor.c.stock_code == prior.c.stock_code,
+                    prior_factor.c.trade_date == prior.c.trade_date,
+                    prior_factor.c.source == "system:daily_close",
+                ),
+            )
+        )
         .where(
             prior.c.stock_code == DailyBar.stock_code,
             prior.c.trade_date < DailyBar.trade_date,
@@ -1679,7 +1704,13 @@ def _prior_daily_window_aggregate(column_name: str, aggregate):
         .correlate(DailyBar)
         .subquery()
     )
-    return select(aggregate(window.c[column_name])).scalar_subquery()
+    return select(aggregate(window.c.basis_value)).scalar_subquery()
+
+
+def _factor_basis_price(factor_price, daily_price):
+    """Use the active factor set's price basis, falling back to BFQ for V1."""
+
+    return func.coalesce(factor_price, daily_price)
 
 
 def _evaluation_context(*, stock_code: str, metadata: dict, facts: dict) -> dict:

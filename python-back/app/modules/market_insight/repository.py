@@ -995,8 +995,14 @@ class MarketInsightRepository:
                 func.sum(target_bars.c.amount_yuan).label("total_amount_yuan"),
                 func.sum(StockFundFlowDaily.main_net_inflow).label("main_net_inflow"),
                 func.avg(StockFundFlowDaily.main_net_ratio).label("main_net_ratio"),
-                func.count().filter(target_bars.c.close_price >= StockFactorDaily.ma20).label("above_ma20_count"),
-                func.count().filter(target_bars.c.close_price >= StockFactorDaily.ma60).label("above_ma60_count"),
+                func.count().filter(
+                    func.coalesce(StockFactorDaily.basis_close_price, target_bars.c.close_price)
+                    >= StockFactorDaily.ma20
+                ).label("above_ma20_count"),
+                func.count().filter(
+                    func.coalesce(StockFactorDaily.basis_close_price, target_bars.c.close_price)
+                    >= StockFactorDaily.ma60
+                ).label("above_ma60_count"),
                 func.count(StockFactorDaily.id).label("factor_count"),
                 func.avg(StockFactorDaily.volatility_20d).label("volatility_20d"),
                 func.avg(StockFactorDaily.amount_ratio).label("amount_ratio"),

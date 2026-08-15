@@ -1231,7 +1231,7 @@ class RealtimeMarketService:
                 depths=self._depth_by_stock,
                 depth_history=self._depth_history_by_stock,
                 minutes=self._minutes,
-                blocks={name: meta.model_dump(mode="json") for name, meta in self._blocks.items()},
+                block_status={name: meta.model_dump(mode="json") for name, meta in self._blocks.items()},
             )
             target_count = int(summary.get("candidate_count") or 0) + int(summary.get("open_trade_count") or 0)
             execution_count = int(summary.get("triggered_count") or 0) + int(summary.get("exit_count") or 0)

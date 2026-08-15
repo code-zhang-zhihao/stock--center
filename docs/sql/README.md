@@ -79,6 +79,7 @@
 73. `73-activate-stock-daily-factor-v2.sql`：在至少 5 个完整影子交易日和覆盖门禁通过后，将标准日频因子消费者切换到 V2。
 74. `74-rollback-stock-daily-factor-v1.sql`：V2 语义验收失败时将激活因子版本恢复为 V1，不删除 V2 影子数据。
 75. `75-stock-factor-v2-window-performance.sql`：为 V2 历史因子任务补充 1–4 个数据库计算 worker 参数；代码按交易日窗口并发计算独立股票分片，并在每个窗口结束后统一刷新一次全市场资金强度分位。
+76. `76-stock-factor-v2-price-basis-consumers.sql`：新增激活因子同口径消费视图；V2 消费者使用 QFQ OHLC 与 QFQ 技术因子，V1 继续回退 BFQ 日 K，阻止激活后混合比较 BFQ 价格和 QFQ 均线，同时避免替换被实时运行时持续读取的兼容视图。
 67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 68. `68-market-emotion-baseline-performance.sql`：新增历史市场级北向资金流回填任务，默认按 120 交易日窗口补最近 250 个已有日线交易日；V2 基线改为精确交易日 lookback、20 日持久化检查点与运行进度，并把该手动校准任务超时上限调为 1800 秒。
 

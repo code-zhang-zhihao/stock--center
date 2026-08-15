@@ -313,7 +313,12 @@ SELECT
     jsonb_build_object('local', legacy.source) AS source_map,
     coalesce(legacy.features -> 'missing_windows', '[]'::jsonb) AS missing_factors,
     legacy.created_at,
-    legacy.created_at AS updated_at
+    legacy.created_at AS updated_at,
+    NULL::double precision AS basis_open_price,
+    NULL::double precision AS basis_high_price,
+    NULL::double precision AS basis_low_price,
+    NULL::double precision AS basis_close_price,
+    NULL::double precision AS basis_pre_close_price
 FROM t_stock_factor_daily AS legacy
 WHERE EXISTS (
     SELECT 1 FROM t_factor_set_version
@@ -343,7 +348,12 @@ SELECT
     v2.source_map,
     v2.missing_factors,
     v2.created_at,
-    v2.updated_at
+    v2.updated_at,
+    v2.open_qfq AS basis_open_price,
+    v2.high_qfq AS basis_high_price,
+    v2.low_qfq AS basis_low_price,
+    v2.close_qfq AS basis_close_price,
+    v2.pre_close_qfq AS basis_pre_close_price
 FROM t_stock_factor_daily_v2 AS v2
 WHERE v2.factor_status = 'ready'
   AND EXISTS (

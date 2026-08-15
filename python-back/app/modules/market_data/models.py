@@ -584,7 +584,7 @@ class StockFactorDailyV2(Base):
 class StockFactorDailyActive(Base):
     """Read-only ORM projection for the currently activated factor set."""
 
-    __tablename__ = "v_stock_factor_daily_active"
+    __tablename__ = "v_stock_factor_daily_active_basis"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -609,6 +609,11 @@ class StockFactorDailyActive(Base):
     missing_factors: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    basis_open_price: Mapped[float | None]
+    basis_high_price: Mapped[float | None]
+    basis_low_price: Mapped[float | None]
+    basis_close_price: Mapped[float | None]
+    basis_pre_close_price: Mapped[float | None]
 
 
 class StockFactorMinute(Base):

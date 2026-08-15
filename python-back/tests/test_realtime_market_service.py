@@ -359,6 +359,24 @@ def test_realtime_block_status_reports_cache_age_at_read_time():
     assert 0 <= rendered.cache_freshness_seconds <= 1
 
 
+def test_strategy_runtime_receives_named_block_status_contract():
+    captured = {}
+
+    class StrategyRuntime:
+        async def process(self, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+    service = RealtimeMarketService()
+    service._strategy_runtime = StrategyRuntime()
+
+    asyncio.run(service._refresh_strategy_runtime(RealtimeSettings()))
+
+    assert "block_status" in captured
+    assert "blocks" not in captured
+    assert set(captured["block_status"]) == {"market", "decision_quote", "depth", "minute", "strategy"}
+
+
 def test_minute_features_do_not_invent_amount_or_vwap():
     features = RealtimeMarketService._minute_features(
         [

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.models import (
     DailyBar,
+    FactorSetVersion,
     LimitEventDaily,
     MarketUniverse,
     MarketUniverseMember,
@@ -12,7 +13,9 @@ from app.modules.market_data.models import (
     SectorBasic,
     SectorComponent,
     Stock,
+    StockFactorDaily as StockFactorDailyLegacy,
     StockFactorDailyActive as StockFactorDaily,
+    StockFactorDailyV2,
     TradeCalendar,
 )
 from app.modules.stock_pool.models import StockPool, StockPoolMember, StockPoolRealtimePolicy
@@ -44,29 +47,79 @@ class RealtimeMarketRepository:
         incomplete intraday bar and does not promote this read-only reference
         into a realtime fact table.
         """
-        trade_date = (
-            await self.session.execute(
-                select(func.max(StockFactorDaily.trade_date)).where(StockFactorDaily.source == "system:daily_close")
+        active_factor_set = await self.session.scalar(
+            select(FactorSetVersion.factor_set_code).where(FactorSetVersion.status == "active").limit(1)
+        )
+        if active_factor_set == "stock_daily_v2":
+            latest_date_statement = (
+                select(StockFactorDailyV2.trade_date)
+                .where(
+                    StockFactorDailyV2.factor_set_version == "stock_daily_v2",
+                    StockFactorDailyV2.factor_status == "ready",
+                )
+                .order_by(StockFactorDailyV2.trade_date.desc())
+                .limit(1)
             )
-        ).scalar_one_or_none()
+        else:
+            latest_date_statement = (
+                select(StockFactorDailyLegacy.trade_date)
+                .where(StockFactorDailyLegacy.source == "system:daily_close")
+                .order_by(StockFactorDailyLegacy.trade_date.desc())
+                .limit(1)
+            )
+        trade_date = (await self.session.execute(latest_date_statement)).scalar_one_or_none()
         if trade_date is None:
             return None, {}
-        rows = await self.session.execute(
-            select(
-                StockFactorDaily.stock_code,
-                StockFactorDaily.ma5,
-                StockFactorDaily.ma20,
-                StockFactorDaily.ma60,
-            )
-            .join(Stock, Stock.stock_code == StockFactorDaily.stock_code)
-            .where(
-                StockFactorDaily.trade_date == trade_date,
-                StockFactorDaily.source == "system:daily_close",
-                Stock.status == "active",
-                Stock.is_st.is_(False),
-                Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
-            )
+        stock_filters = (
+            Stock.status == "active",
+            Stock.is_st.is_(False),
+            Stock.exchange.in_(("SH", "SZ", "SSE", "SZSE")),
         )
+        if active_factor_set == "stock_daily_v2":
+            # TickFlow live Quote is BFQ. Re-anchor QFQ moving averages to
+            # the latest completed day's BFQ close before comparing them.
+            bfq_scale = func.coalesce(
+                DailyBar.close_price / func.nullif(StockFactorDailyV2.close_qfq, 0),
+                1.0,
+            )
+            reference_statement = (
+                select(
+                    StockFactorDailyV2.stock_code,
+                    (StockFactorDailyV2.ma5 * bfq_scale).label("ma5"),
+                    (StockFactorDailyV2.ma20 * bfq_scale).label("ma20"),
+                    (StockFactorDailyV2.ma60 * bfq_scale).label("ma60"),
+                )
+                .join(Stock, Stock.stock_code == StockFactorDailyV2.stock_code)
+                .outerjoin(
+                    DailyBar,
+                    and_(
+                        DailyBar.stock_code == StockFactorDailyV2.stock_code,
+                        DailyBar.trade_date == StockFactorDailyV2.trade_date,
+                    ),
+                )
+                .where(
+                    StockFactorDailyV2.trade_date == trade_date,
+                    StockFactorDailyV2.factor_set_version == "stock_daily_v2",
+                    StockFactorDailyV2.factor_status == "ready",
+                    *stock_filters,
+                )
+            )
+        else:
+            reference_statement = (
+                select(
+                    StockFactorDailyLegacy.stock_code,
+                    StockFactorDailyLegacy.ma5,
+                    StockFactorDailyLegacy.ma20,
+                    StockFactorDailyLegacy.ma60,
+                )
+                .join(Stock, Stock.stock_code == StockFactorDailyLegacy.stock_code)
+                .where(
+                    StockFactorDailyLegacy.trade_date == trade_date,
+                    StockFactorDailyLegacy.source == "system:daily_close",
+                    *stock_filters,
+                )
+            )
+        rows = await self.session.execute(reference_statement)
         return trade_date, {
             stock_code: {"ma5": ma5, "ma20": ma20, "ma60": ma60}
             for stock_code, ma5, ma20, ma60 in rows.all()
