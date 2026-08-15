@@ -172,10 +172,91 @@ def test_provider_payload_compaction_never_keeps_response_rows() -> None:
     assert "data" not in small_compact
 
 
-def test_sector_daily_uses_three_batches_plus_one_missing_retry() -> None:
+def test_sector_daily_uses_one_trade_date_request_and_keeps_available_rows() -> None:
     trade_date = date(2026, 7, 24)
     raw_codes = [f"{700000 + index}.TI" for index in range(1003)]
+    provider_only_codes = [f"{800000 + index}.TI" for index in range(10)]
     calls: list[dict] = []
+    captures: list[dict] = []
+
+    class Repository:
+        async def tushare_ths_sector_map(self):
+            return {
+                code: {
+                    "sector_code": f"ths_{code.split('.')[0]}",
+                    "sector_name": code,
+                    "sector_type": "concept",
+                }
+                for code in raw_codes
+            }
+
+        async def upsert_sector_bar_rows(self, rows):
+            self.rows = rows
+            return len(rows)
+
+    class Adapter:
+        def map_ths_daily(self, records, *, trade_date, sector_map):
+            rows = [
+                {
+                    "sector_code": sector_map[item["ts_code"]]["sector_code"],
+                    "trade_date": trade_date,
+                }
+                for item in records
+                if item["ts_code"] in sector_map
+            ]
+            return SimpleNamespace(
+                provider_code="tushare",
+                api_name="ths_daily",
+                capability_code="sector_daily",
+                request_range={"trade_date": trade_date.isoformat()},
+                raw_count=len(records),
+                mapped_count=len(rows),
+                missing_count=0,
+                unit_conversions={},
+                warnings=[],
+                rows=rows,
+            )
+
+    service = object.__new__(DailyMarketCloseIngestService)
+    service.repository = Repository()
+    service.tushare_market_adapter = Adapter()
+
+    async def response(_api_name, params, *, capability):
+        calls.append({"params": params, "capability": capability})
+        assert params == {"trade_date": trade_date}
+        return SimpleNamespace(
+            records=[
+                {"ts_code": code, "trade_date": trade_date.isoformat()}
+                for code in [*raw_codes[:-1], *provider_only_codes]
+            ]
+        )
+
+    async def capture(*args, **kwargs):
+        captures.append({"args": args, "kwargs": kwargs})
+
+    service._tushare_response = response
+    service._capture_raw_summary = capture
+    result = DailyMarketCloseIngestResult(trade_date=trade_date)
+
+    written = asyncio.run(service._sync_sector_bars(trade_date, result))
+
+    assert written == 1002
+    assert len(calls) == 1
+    assert calls[0]["capability"] == "daily_market_close_sector_bars"
+    assert captures[0]["args"][2]["request_mode"] == "single_trade_date"
+    assert captures[0]["args"][2]["request_count"] == 1
+    assert captures[0]["kwargs"]["response_row_count"] == 1012
+    assert captures[0]["kwargs"]["audit_details"]["missing_code_count"] == 1
+    assert captures[0]["kwargs"]["audit_details"]["unmapped_code_count"] == 10
+    assert captures[0]["kwargs"]["status"] == "captured"
+    assert any("缺少 1 个目标板块" in warning for warning in result.warnings)
+    assert any("10 个未映射 Provider 板块" in warning for warning in result.warnings)
+
+
+def test_sector_daily_persists_partial_rows_and_marks_low_coverage_audit_failed() -> None:
+    trade_date = date(2026, 7, 24)
+    raw_codes = [f"{700000 + index}.TI" for index in range(100)]
+    captures: list[dict] = []
 
     class Repository:
         async def tushare_ths_sector_map(self):
@@ -218,20 +299,16 @@ def test_sector_daily_uses_three_batches_plus_one_missing_retry() -> None:
     service.repository = Repository()
     service.tushare_market_adapter = Adapter()
 
-    async def response(_api_name, params, *, capability):
-        calls.append({"params": params, "capability": capability})
-        codes = str(params["ts_code"]).split(",")
-        if capability == "daily_market_close_sector_bars" and raw_codes[-1] in codes:
-            codes = [code for code in codes if code != raw_codes[-1]]
+    async def response(*_args, **_kwargs):
         return SimpleNamespace(
             records=[
                 {"ts_code": code, "trade_date": trade_date.isoformat()}
-                for code in codes
+                for code in raw_codes[:80]
             ]
         )
 
-    async def capture(*_args, **_kwargs):
-        return None
+    async def capture(*_args, **kwargs):
+        captures.append(kwargs)
 
     service._tushare_response = response
     service._capture_raw_summary = capture
@@ -239,10 +316,11 @@ def test_sector_daily_uses_three_batches_plus_one_missing_retry() -> None:
 
     written = asyncio.run(service._sync_sector_bars(trade_date, result))
 
-    assert written == 1003
-    assert len(calls) == 4
-    assert max(len(call["params"]["ts_code"].split(",")) for call in calls[:3]) <= 500
-    assert calls[-1]["capability"] == "daily_market_close_sector_bars_retry_missing"
+    assert written == 80
+    assert len(service.repository.rows) == 80
+    assert captures[0]["status"] == "failed"
+    assert captures[0]["error_code"] == "ths_daily_coverage_below_threshold"
+    assert any("已保留成功数据" in warning for warning in result.warnings)
 
 
 def test_empty_sector_bar_response_is_audited_as_failed_not_captured() -> None:
@@ -296,7 +374,7 @@ def test_empty_sector_bar_response_is_audited_as_failed_not_captured() -> None:
     assert written == 0
     assert captures[0]["status"] == "failed"
     assert captures[0]["error_code"] == "ths_daily_empty_or_not_published"
-    assert any("Raw 记录标记为 failed" in warning for warning in result.warnings)
+    assert any("审计标记为 failed" in warning for warning in result.warnings)
 
 
 def test_core_index_daily_prefers_tickflow_current_day_bars_without_tushare() -> None:

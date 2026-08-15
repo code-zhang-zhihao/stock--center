@@ -135,6 +135,7 @@ class DailyMarketCloseIngestService:
 
     minute_complete_threshold = 230
     daily_minimum_floor = 3000
+    sector_bar_complete_threshold = 0.90
     core_index_tickflow_max_concurrency = 3
     core_index_codes = ("000001.SH", "399001.SZ", "399006.SZ", "000300.SH", "000905.SH", "000852.SH", "000016.SH")
 
@@ -1651,34 +1652,15 @@ class DailyMarketCloseIngestService:
     async def _sync_sector_bars(self, trade_date: date, result: DailyMarketCloseIngestResult) -> int:
         sector_map = await self.repository.tushare_ths_sector_map()
         raw_codes = sorted(sector_map)
-        records: list[dict] = []
-        request_count = 0
-        for code_batch in self._chunks(raw_codes, 500):
-            response = await self._tushare_response(
-                "ths_daily",
-                {"ts_code": ",".join(code_batch), "trade_date": trade_date},
-                capability="daily_market_close_sector_bars",
-            )
-            request_count += 1
-            records.extend(response.records)
-
-        returned_codes = {
-            str(record.get("ts_code") or "").strip()
-            for record in records
-            if parse_date(record.get("trade_date")) == trade_date
-        }
-        missing_codes = [code for code in raw_codes if code not in returned_codes]
-        if missing_codes:
-            retry = await self._tushare_response(
-                "ths_daily",
-                {"ts_code": ",".join(missing_codes), "trade_date": trade_date},
-                capability="daily_market_close_sector_bars_retry_missing",
-            )
-            request_count += 1
-            records.extend(retry.records)
+        response = await self._tushare_response(
+            "ths_daily",
+            {"trade_date": trade_date},
+            capability="daily_market_close_sector_bars",
+        )
+        response_row_count = len(response.records)
 
         deduplicated: dict[tuple[str, date], dict] = {}
-        for record in records:
+        for record in response.records:
             raw_code = str(record.get("ts_code") or "").strip()
             row_date = parse_date(record.get("trade_date"))
             if raw_code and row_date == trade_date:
@@ -1686,36 +1668,86 @@ class DailyMarketCloseIngestService:
         records = list(deduplicated.values())
         final_codes = {key[0] for key in deduplicated}
         missing_codes = [code for code in raw_codes if code not in final_codes]
+        unmapped_codes = sorted(code for code in final_codes if code not in sector_map)
+        target_coverage = (
+            len(final_codes.intersection(raw_codes)) / len(raw_codes)
+            if raw_codes
+            else 0.0
+        )
         if missing_codes:
             result.warnings.append(
-                f"ths_daily 批量查询后仍缺少 {len(missing_codes)} 个板块当日行情"
+                "ths_daily 单日全量查询缺少 "
+                f"{len(missing_codes)} 个目标板块当日行情（覆盖率 {target_coverage:.2%}）"
+            )
+        if unmapped_codes:
+            result.warnings.append(
+                f"ths_daily 单日全量返回 {len(unmapped_codes)} 个未映射 Provider 板块，已跳过"
             )
         mapping = self.tushare_market_adapter.map_ths_daily(records, trade_date=trade_date, sector_map=sector_map)
         self._log_mapping_summary(mapping)
         rows = mapping.rows
-        empty_response = bool(raw_codes) and not rows
+        empty_response = not rows
+        coverage_below_threshold = bool(rows) and target_coverage < self.sector_bar_complete_threshold
         if empty_response:
-            result.warnings.append("ths_daily 未返回任何板块当日行情，Raw 记录标记为 failed，等待缺口修复")
+            result.warnings.append("ths_daily 未返回任何可映射板块当日行情，审计标记为 failed，等待缺口修复")
+        elif coverage_below_threshold:
+            result.warnings.append(
+                "ths_daily 板块日行情覆盖率 "
+                f"{target_coverage:.2%}，低于完整阈值 {self.sector_bar_complete_threshold:.0%}；"
+                "已保留成功数据并等待缺口修复"
+            )
+        upserted = await self.repository.upsert_sector_bar_rows(rows)
+        self._log_upsert_summary(mapping, upserted, "t_sector_bar")
+        audit_failed = empty_response or coverage_below_threshold
         await self._capture_raw_summary(
             "daily_market_close_sector_bars",
             trade_date,
             {
                 "api_name": "ths_daily",
-                "request_mode": "ts_code_batch",
-                "batch_size": 500,
-                "request_count": request_count,
+                "request_mode": "single_trade_date",
+                "request_count": 1,
                 "target_codes": len(raw_codes),
-                "raw_records": len(records),
+                "response_records": response_row_count,
+                "deduplicated_records": len(records),
+                "mapped_records": len(rows),
+                "target_coverage": round(target_coverage, 6),
                 "missing_codes": missing_codes[:100],
+                "unmapped_codes": unmapped_codes[:100],
             },
             len(rows),
             normalized_table="t_sector_bar",
-            status="failed" if empty_response else "captured",
-            error_code="ths_daily_empty_or_not_published" if empty_response else None,
-            error_message="ths_daily 未返回任何目标板块的当日行情" if empty_response else None,
+            response_row_count=response_row_count,
+            audit_details={
+                "request_mode": "single_trade_date",
+                "request_count": 1,
+                "target_codes": len(raw_codes),
+                "response_records": response_row_count,
+                "mapped_records": len(rows),
+                "target_coverage": round(target_coverage, 6),
+                "missing_code_count": len(missing_codes),
+                "missing_code_sample": missing_codes[:100],
+                "unmapped_code_count": len(unmapped_codes),
+                "unmapped_code_sample": unmapped_codes[:100],
+            },
+            status="failed" if audit_failed else "captured",
+            error_code=(
+                "ths_daily_empty_or_not_published"
+                if empty_response
+                else "ths_daily_coverage_below_threshold"
+                if coverage_below_threshold
+                else None
+            ),
+            error_message=(
+                "ths_daily 未返回任何可映射目标板块的当日行情"
+                if empty_response
+                else (
+                    f"ths_daily 目标板块覆盖率 {target_coverage:.2%}，"
+                    f"低于完整阈值 {self.sector_bar_complete_threshold:.0%}"
+                )
+                if coverage_below_threshold
+                else None
+            ),
         )
-        upserted = await self.repository.upsert_sector_bar_rows(rows)
-        self._log_upsert_summary(mapping, upserted, "t_sector_bar")
         return upserted
 
     async def _sync_sector_moneyflow(self, trade_date: date, *, start_date: date | None = None, end_date: date | None = None) -> int:
@@ -2046,12 +2078,20 @@ class DailyMarketCloseIngestService:
         status: str = "captured",
         error_code: str | None = None,
         error_message: str | None = None,
+        response_row_count: int | None = None,
+        audit_details: dict[str, Any] | None = None,
     ) -> None:
         trace_id = uuid4().hex
         data = payload.get("data") if isinstance(payload, dict) else None
         items = data.get("items") if isinstance(data, dict) else payload.get("items")
         fields = data.get("fields") if isinstance(data, dict) else payload.get("fields")
-        response_row_count = len(items) if isinstance(items, list) else row_count
+        actual_response_row_count = (
+            int(response_row_count)
+            if response_row_count is not None
+            else len(items)
+            if isinstance(items, list)
+            else row_count
+        )
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         audit_status = status
         if status == "captured" and row_count == 0:
@@ -2064,9 +2104,12 @@ class DailyMarketCloseIngestService:
                 "provider_code": provider_code,
                 "capability": capability,
                 "trade_date": trade_date,
-                "request_params": {"trade_date": trade_date.isoformat()},
+                "request_params": {
+                    "trade_date": trade_date.isoformat(),
+                    **(audit_details or {}),
+                },
                 "requested_fields": fields if isinstance(fields, list) else [],
-                "response_row_count": response_row_count,
+                "response_row_count": actual_response_row_count,
                 "normalized_row_count": row_count,
                 "payload_sha256": hashlib.sha256(encoded).hexdigest(),
                 "normalized_table": normalized_table
