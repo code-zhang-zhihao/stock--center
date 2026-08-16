@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import asyncio
 
 from sqlalchemy import BigInteger
+from sqlalchemy import Boolean, Date
 from sqlalchemy.dialects import postgresql
 
 from app.modules.indicator_engine import backfill as backfill_module
@@ -113,6 +114,49 @@ def test_final_index_sql_binds_canonical_codes() -> None:
 
     asyncio.run(repository.rebuild_market_summary(trade_date=trade_date))
     assert session.calls[-1][1]["core_index_codes"] == list(CORE_INDEX_CANONICAL_CODES)
+
+
+def test_final_stock_factor_sql_binds_date_parameters_for_asyncpg() -> None:
+    class Result:
+        @staticmethod
+        def all():
+            return []
+
+    class Session:
+        calls = []
+
+        async def execute(self, statement, params=None):
+            self.calls.append((statement, params or {}))
+            return Result()
+
+    session = Session()
+    repository = IndicatorRepository(session)  # type: ignore[arg-type]
+
+    async def no_local_core(*_args, **_kwargs):
+        return 0
+
+    async def no_relative_strength(*_args, **_kwargs):
+        return 0
+
+    repository._fill_local_technical_core = no_local_core  # type: ignore[method-assign]
+    repository._fill_relative_csi300 = no_relative_strength  # type: ignore[method-assign]
+
+    asyncio.run(
+        repository.assemble_stock_daily_factors_final_between(
+            ["600519"],
+            start_date=date(2026, 8, 14),
+            end_date=date(2026, 8, 14),
+            history_start=date(2025, 1, 1),
+            only_missing=False,
+        )
+    )
+
+    statement = session.calls[0][0]
+    assert isinstance(statement._bindparams["start_date"].type, Date)
+    assert isinstance(statement._bindparams["end_date"].type, Date)
+    assert isinstance(statement._bindparams["history_start"].type, Date)
+    assert isinstance(statement._bindparams["only_missing"].type, Boolean)
+    assert "CAST(:start_date AS date) - INTERVAL '45 days'" in statement.text
 
 
 def test_partial_professional_upsert_preserves_existing_local_core_values() -> None:

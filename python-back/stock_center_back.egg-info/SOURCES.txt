@@ -40,6 +40,7 @@ app/modules/market_data/capabilities.py
 app/modules/market_data/close_ingest.py
 app/modules/market_data/entity_history_backfill.py
 app/modules/market_data/history_backfill.py
+app/modules/market_data/index_contract.py
 app/modules/market_data/market_north_flow_backfill.py
 app/modules/market_data/models.py
 app/modules/market_data/partitioning.py
@@ -50,6 +51,7 @@ app/modules/market_data/schemas.py
 app/modules/market_data/sector_analysis.py
 app/modules/market_data/service.py
 app/modules/market_data/stock_analysis.py
+app/modules/market_data/stock_factor_contract.py
 app/modules/market_data/sync_service.py
 app/modules/market_data/tushare_catalog.py
 app/modules/market_data/tushare_mappers.py
@@ -92,7 +94,6 @@ app/modules/market_insight/models.py
 app/modules/market_insight/report_service.py
 app/modules/market_insight/repository.py
 app/modules/market_insight/scheduler_handlers.py
-app/modules/market_insight/service.py
 app/modules/realtime_market/__init__.py
 app/modules/realtime_market/api.py
 app/modules/realtime_market/rate_limit.py
@@ -146,7 +147,6 @@ tests/test_market_data_history_backfill.py
 tests/test_market_data_stock_basic_sync.py
 tests/test_market_emotion_service.py
 tests/test_market_north_flow_backfill.py
-tests/test_market_sentiment_service.py
 tests/test_realtime_market_service.py
 tests/test_realtime_rate_limit.py
 tests/test_scheduler_result_summary.py

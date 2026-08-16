@@ -4,9 +4,8 @@ from datetime import date, datetime, timedelta
 from statistics import pstdev
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import bindparam, case, delete, func, or_, select, text
+from sqlalchemy import Boolean, Date, String, bindparam, case, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, insert
-from sqlalchemy import String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.market_data.index_contract import (
@@ -341,7 +340,7 @@ class IndicatorRepository:
                            OVER (PARTITION BY stock_code ORDER BY trade_date) AS non_positive_group
                 FROM t_stock_fund_flow_daily flow
                 WHERE flow.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND flow.trade_date BETWEEN (:start_date - INTERVAL '45 days')::date AND :end_date
+                  AND flow.trade_date BETWEEN (CAST(:start_date AS date) - INTERVAL '45 days') AND :end_date
             ),
             fund AS (
                 SELECT fund_grouped.*,
@@ -533,7 +532,13 @@ class IndicatorRepository:
                 calculated_at = now(), updated_at = now()
             RETURNING trade_date
             """
-        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
+        ).bindparams(
+            bindparam("stock_codes", type_=ARRAY(String())),
+            bindparam("start_date", type_=Date()),
+            bindparam("end_date", type_=Date()),
+            bindparam("history_start", type_=Date()),
+            bindparam("only_missing", type_=Boolean()),
+        )
         rows = (
             await self.session.execute(
                 statement,
