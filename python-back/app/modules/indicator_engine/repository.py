@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from statistics import pstdev
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, bindparam, case, delete, func, or_, select, text
+from sqlalchemy import bindparam, case, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 from sqlalchemy import String
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.market_data.index_contract import (
+    CORE_INDEX_CANONICAL_CODES,
+    CSI300_CANONICAL_CODE,
+)
 from app.modules.market_data.models import (
     DailyBar,
+    IndexBar,
+    IndexDailyBasic,
     IndexFactorDaily,
     LimitEventDaily,
     MinuteBar,
@@ -17,13 +24,11 @@ from app.modules.market_data.models import (
     SectorBasic,
     SectorComponent,
     SectorFactorDaily,
+    SectorLeaderDaily,
     SectorFundFlowDaily,
-    StockChipPerfDaily,
     StockFactorDaily,
     StockFactorMinute,
     StockFundFlowDaily,
-    StockTechnicalFactorDaily,
-    TechnicalIndicatorSnapshot,
 )
 from app.modules.market_data.partitioning import ensure_market_partitions
 
@@ -187,622 +192,14 @@ class IndicatorRepository:
             grouped.setdefault(row.stock_code, []).append(row)
         return grouped
 
-    async def load_stock_fund_flows(self, stock_codes: list[str], *, trade_date: date) -> dict[str, list[StockFundFlowDaily]]:
-        start_date = trade_date.fromordinal(trade_date.toordinal() - 20)
-        return await self.load_stock_fund_flows_between(stock_codes, start_date=start_date, end_date=trade_date)
-
-    async def load_stock_fund_flows_between(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-    ) -> dict[str, list[StockFundFlowDaily]]:
-        if not stock_codes:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockFundFlowDaily)
-                .where(
-                    StockFundFlowDaily.stock_code.in_(stock_codes),
-                    StockFundFlowDaily.trade_date.between(start_date, end_date),
-                )
-                .order_by(StockFundFlowDaily.stock_code, StockFundFlowDaily.trade_date)
-            )
-        ).scalars().all()
-        grouped: dict[str, list[StockFundFlowDaily]] = {}
-        for row in rows:
-            grouped.setdefault(row.stock_code, []).append(row)
-        return grouped
-
-    async def load_stock_fund_cross_section(self, stock_codes: list[str], *, trade_date: date) -> dict[str, StockFundFlowDaily]:
-        if not stock_codes:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockFundFlowDaily).where(
-                    StockFundFlowDaily.stock_code.in_(stock_codes),
-                    StockFundFlowDaily.trade_date == trade_date,
-                )
-            )
-        ).scalars().all()
-        return {row.stock_code: row for row in rows}
-
-    async def load_stock_fund_cross_sections(
-        self,
-        stock_codes: list[str],
-        *,
-        trade_dates: list[date],
-    ) -> dict[date, dict[str, StockFundFlowDaily]]:
-        if not stock_codes or not trade_dates:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockFundFlowDaily).where(
-                    StockFundFlowDaily.stock_code.in_(stock_codes),
-                    StockFundFlowDaily.trade_date.in_(trade_dates),
-                )
-            )
-        ).scalars().all()
-        grouped: dict[date, dict[str, StockFundFlowDaily]] = {}
-        for row in rows:
-            grouped.setdefault(row.trade_date, {})[row.stock_code] = row
-        return grouped
-
-    async def load_stock_technical_factors(self, stock_codes: list[str], *, trade_date: date) -> dict[str, StockTechnicalFactorDaily]:
-        if not stock_codes:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockTechnicalFactorDaily).where(
-                    StockTechnicalFactorDaily.stock_code.in_(stock_codes),
-                    StockTechnicalFactorDaily.trade_date == trade_date,
-                )
-            )
-        ).scalars().all()
-        return {row.stock_code: row for row in rows}
-
-    async def load_stock_technical_factors_between(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-    ) -> dict[tuple[str, date], StockTechnicalFactorDaily]:
-        if not stock_codes:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockTechnicalFactorDaily).where(
-                    StockTechnicalFactorDaily.stock_code.in_(stock_codes),
-                    StockTechnicalFactorDaily.trade_date.between(start_date, end_date),
-                )
-            )
-        ).scalars().all()
-        return {(row.stock_code, row.trade_date): row for row in rows}
-
-    async def load_stock_chip_perf(self, stock_codes: list[str], *, trade_date: date) -> dict[str, StockChipPerfDaily]:
-        if not stock_codes:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockChipPerfDaily).where(
-                    StockChipPerfDaily.stock_code.in_(stock_codes),
-                    StockChipPerfDaily.trade_date == trade_date,
-                )
-            )
-        ).scalars().all()
-        return {row.stock_code: row for row in rows}
-
-    async def load_daily_factor_rows(self, stock_codes: list[str], *, trade_date: date) -> dict[str, dict]:
-        if not stock_codes:
-            return {}
-        rows = (
-            await self.session.execute(
-                select(StockFactorDaily).where(
-                    StockFactorDaily.stock_code.in_(stock_codes),
-                    StockFactorDaily.trade_date == trade_date,
-                    StockFactorDaily.source == "system:daily_close",
-                )
-            )
-        ).scalars().all()
-        return {
-            row.stock_code: {
-                "stock_code": row.stock_code,
-                "trade_date": row.trade_date,
-                "ma5": row.ma5,
-                "ma10": row.ma10,
-                "ma20": row.ma20,
-                "ma30": row.ma30,
-                "ma60": row.ma60,
-                "return_1d": row.return_1d,
-                "features": row.features,
-            }
-            for row in rows
-        }
-
-    async def count_daily_factor_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
-        if not stock_codes:
-            return 0
-        result = await self.session.execute(
-            select(func.count(StockFactorDaily.id)).where(
-                StockFactorDaily.stock_code.in_(stock_codes),
-                StockFactorDaily.trade_date == trade_date,
-                StockFactorDaily.source == "system:daily_close",
-            )
-        )
-        return int(result.scalar_one() or 0)
-
-    async def load_daily_factor_keys_between(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-    ) -> set[tuple[str, date]]:
-        if not stock_codes:
-            return set()
-        rows = (
-            await self.session.execute(
-                select(StockFactorDaily.stock_code, StockFactorDaily.trade_date).where(
-                    StockFactorDaily.stock_code.in_(stock_codes),
-                    StockFactorDaily.trade_date.between(start_date, end_date),
-                    StockFactorDaily.source == "system:daily_close",
-                )
-            )
-        ).all()
-        return {(stock_code, trade_date) for stock_code, trade_date in rows}
-
-    async def count_technical_snapshot_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
-        if not stock_codes:
-            return 0
-        start = datetime.combine(trade_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
-        end = datetime.combine(
-            trade_date.fromordinal(trade_date.toordinal() + 1),
-            datetime.min.time(),
-            tzinfo=ZoneInfo("Asia/Shanghai"),
-        )
-        result = await self.session.execute(
-            select(func.count(TechnicalIndicatorSnapshot.id)).where(
-                TechnicalIndicatorSnapshot.stock_code.in_(stock_codes),
-                TechnicalIndicatorSnapshot.source == "system:daily_close",
-                TechnicalIndicatorSnapshot.snapshot_time >= start,
-                TechnicalIndicatorSnapshot.snapshot_time < end,
-            )
-        )
-        return int(result.scalar_one() or 0)
-
-    async def count_sector_factor_rows(self, *, trade_date: date) -> int:
-        result = await self.session.execute(
-            select(func.count(SectorFactorDaily.id)).where(SectorFactorDaily.trade_date == trade_date)
-        )
-        return int(result.scalar_one() or 0)
-
-    async def clear_daily_factor_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
-        if not stock_codes:
-            return 0
-        deleted = 0
-        for codes in _chunked(stock_codes, 1000):
-            result = await self.session.execute(
-                delete(StockFactorDaily).where(
-                    StockFactorDaily.stock_code.in_(codes),
-                    StockFactorDaily.trade_date == trade_date,
-                    StockFactorDaily.source == "system:daily_close",
-                )
-            )
-            deleted += int(result.rowcount or 0)
-        return deleted
-
-    async def clear_daily_factor_rows_between(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-    ) -> int:
-        if not stock_codes:
-            return 0
-        deleted = 0
-        for codes in _chunked(stock_codes, 1000):
-            result = await self.session.execute(
-                delete(StockFactorDaily).where(
-                    StockFactorDaily.stock_code.in_(codes),
-                    StockFactorDaily.trade_date.between(start_date, end_date),
-                    StockFactorDaily.source == "system:daily_close",
-                )
-            )
-            deleted += int(result.rowcount or 0)
-        return deleted
-
-    async def backfill_daily_factors_set_based(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-        history_start: date,
-        fund_history_start: date,
-        only_missing: bool,
-        calculate_stock_fund: bool,
-        include_external_technical: bool,
-    ) -> dict[date, int]:
-        """Calculate one historical daily-factor window inside PostgreSQL.
-
-        Historical backfill used to materialize overlapping daily bars, fund-flow
-        rows and full ``stk_factor_pro`` JSON documents in Python for every
-        200-stock batch.  The query below keeps the calculation next to the
-        canonical tables and extracts only the small professional-factor subset
-        that is exposed through ``features.tushare_technical``.
-        """
-        if not stock_codes:
-            return {}
-
-        conflict_clause = (
-            "DO NOTHING"
-            if only_missing
-            else """DO UPDATE SET
-                ma5 = EXCLUDED.ma5,
-                ma10 = EXCLUDED.ma10,
-                ma20 = EXCLUDED.ma20,
-                ma30 = EXCLUDED.ma30,
-                ma60 = EXCLUDED.ma60,
-                return_1d = EXCLUDED.return_1d,
-                amplitude = EXCLUDED.amplitude,
-                volume_ratio = EXCLUDED.volume_ratio,
-                amount_ratio = EXCLUDED.amount_ratio,
-                volatility_20d = EXCLUDED.volatility_20d,
-                close_position = EXCLUDED.close_position,
-                features = EXCLUDED.features"""
-        )
-        statement = text(
-            f"""
-            WITH ranked_bars AS (
-                SELECT
-                    bar.id,
-                    bar.stock_code,
-                    bar.trade_date,
-                    bar.open_price,
-                    bar.high_price,
-                    bar.low_price,
-                    bar.close_price,
-                    bar.pre_close_price,
-                    bar.volume_hand,
-                    bar.amount_yuan,
-                    row_number() OVER (
-                        PARTITION BY bar.stock_code, bar.trade_date
-                        ORDER BY CASE bar.source
-                            WHEN 'tushare:daily' THEN 0
-                            WHEN 'akshare_qfq' THEN 1
-                            WHEN 'mootdx' THEN 2
-                            ELSE 9
-                        END, bar.updated_at DESC, bar.id DESC
-                    ) AS source_rank
-                FROM t_daily_bar AS bar
-                WHERE bar.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND bar.trade_date BETWEEN :history_start AND :end_date
-            ),
-            bars AS (
-                SELECT * FROM ranked_bars WHERE source_rank = 1
-            ),
-            bar_with_previous AS (
-                SELECT
-                    bars.*,
-                    lag(close_price) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date
-                    ) AS previous_close_price,
-                    row_number() OVER (
-                        PARTITION BY stock_code ORDER BY trade_date
-                    ) AS history_days
-                FROM bars
-            ),
-            bar_metrics AS (
-                SELECT
-                    bar_with_previous.*,
-                    CASE
-                        WHEN previous_close_price IS NOT NULL AND previous_close_price <> 0
-                        THEN (close_price - previous_close_price) / previous_close_price * 100
-                    END AS close_return,
-                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                    ) AS ma5,
-                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
-                    ) AS ma10,
-                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS ma20,
-                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-                    ) AS ma30,
-                    avg(close_price) FILTER (WHERE close_price IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
-                    ) AS ma60,
-                    avg(volume_hand) FILTER (WHERE volume_hand IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
-                    ) AS previous_volume_mean_5,
-                    avg(amount_yuan) FILTER (WHERE amount_yuan IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING
-                    ) AS previous_amount_mean_5
-                FROM bar_with_previous
-            ),
-            daily_metrics AS (
-                SELECT
-                    bar_metrics.*,
-                    stddev_pop(close_return) FILTER (WHERE close_return IS NOT NULL) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS volatility_20d
-                FROM bar_metrics
-            ),
-            fund_with_streak_group AS (
-                SELECT
-                    flow.*,
-                    sum(CASE WHEN coalesce(main_net_inflow, 0) <= 0 THEN 1 ELSE 0 END) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS non_positive_group
-                FROM t_stock_fund_flow_daily AS flow
-                WHERE :calculate_stock_fund
-                  AND flow.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND flow.trade_date BETWEEN :fund_history_start AND :end_date
-            ),
-            fund_metrics AS (
-                SELECT
-                    fund_with_streak_group.*,
-                    count(*) FILTER (WHERE coalesce(main_net_inflow, 0) > 0) OVER (
-                        PARTITION BY stock_code, non_positive_group
-                    ) AS continuous_main_inflow_days,
-                    sum(coalesce(main_net_inflow, 0)) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-                    ) AS main_net_inflow_3d,
-                    sum(coalesce(main_net_inflow, 0)) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                    ) AS main_net_inflow_5d,
-                    sum(coalesce(main_net_inflow, 0)) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
-                    ) AS main_net_inflow_10d,
-                    count(*) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-                    ) AS fund_days_3,
-                    count(*) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
-                    ) AS fund_days_5,
-                    count(*) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
-                    ) AS fund_days_10
-                FROM fund_with_streak_group
-            ),
-            fund_cross_section AS (
-                SELECT
-                    stock_code,
-                    trade_date,
-                    cume_dist() OVER (
-                        PARTITION BY trade_date ORDER BY main_net_inflow
-                    ) * 100 AS fund_strength_percentile
-                FROM t_stock_fund_flow_daily
-                WHERE :calculate_stock_fund
-                  AND trade_date BETWEEN :start_date AND :end_date
-                  AND main_net_inflow IS NOT NULL
-            ),
-            technical_raw AS (
-                SELECT
-                    technical.stock_code,
-                    technical.trade_date,
-                    jsonb_strip_nulls(jsonb_build_object(
-                        'ma_bfq_5', technical.factors -> 'ma_bfq_5',
-                        'ma_bfq_10', technical.factors -> 'ma_bfq_10',
-                        'ma_bfq_20', technical.factors -> 'ma_bfq_20',
-                        'ma_bfq_60', technical.factors -> 'ma_bfq_60',
-                        'ma_bfq_90', technical.factors -> 'ma_bfq_90',
-                        'ma_bfq_250', technical.factors -> 'ma_bfq_250',
-                        'ema_bfq_5', technical.factors -> 'ema_bfq_5',
-                        'ema_bfq_10', technical.factors -> 'ema_bfq_10',
-                        'ema_bfq_20', technical.factors -> 'ema_bfq_20',
-                        'ema_bfq_60', technical.factors -> 'ema_bfq_60',
-                        'macd_bfq', technical.factors -> 'macd_bfq',
-                        'macd_dif_bfq', technical.factors -> 'macd_dif_bfq',
-                        'macd_dea_bfq', technical.factors -> 'macd_dea_bfq',
-                        'kdj_bfq', technical.factors -> 'kdj_bfq',
-                        'kdj_k_bfq', technical.factors -> 'kdj_k_bfq',
-                        'kdj_d_bfq', technical.factors -> 'kdj_d_bfq',
-                        'rsi_bfq_6', technical.factors -> 'rsi_bfq_6',
-                        'rsi_bfq_12', technical.factors -> 'rsi_bfq_12',
-                        'rsi_bfq_24', technical.factors -> 'rsi_bfq_24',
-                        'boll_upper_bfq', technical.factors -> 'boll_upper_bfq',
-                        'boll_mid_bfq', technical.factors -> 'boll_mid_bfq',
-                        'boll_lower_bfq', technical.factors -> 'boll_lower_bfq',
-                        'atr_bfq', technical.factors -> 'atr_bfq',
-                        'cci_bfq', technical.factors -> 'cci_bfq',
-                        'vr_bfq', technical.factors -> 'vr_bfq',
-                        'wr_bfq', technical.factors -> 'wr_bfq',
-                        'wr1_bfq', technical.factors -> 'wr1_bfq',
-                        'bias1_bfq', technical.factors -> 'bias1_bfq',
-                        'bias2_bfq', technical.factors -> 'bias2_bfq',
-                        'bias3_bfq', technical.factors -> 'bias3_bfq',
-                        'obv_bfq', technical.factors -> 'obv_bfq',
-                        'mfi_bfq', technical.factors -> 'mfi_bfq',
-                        'roc_bfq', technical.factors -> 'roc_bfq',
-                        'mtm_bfq', technical.factors -> 'mtm_bfq',
-                        'updays', technical.factors -> 'updays',
-                        'downdays', technical.factors -> 'downdays',
-                        'topdays', technical.factors -> 'topdays',
-                        'lowdays', technical.factors -> 'lowdays'
-                    )) AS selected_factors
-                FROM t_stock_technical_factor_daily AS technical
-                WHERE :include_external_technical
-                  AND technical.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND technical.trade_date BETWEEN :start_date AND :end_date
-            ),
-            candidates AS (
-                SELECT
-                    daily.stock_code,
-                    daily.trade_date,
-                    daily.ma5,
-                    daily.ma10,
-                    daily.ma20,
-                    daily.ma30,
-                    daily.ma60,
-                    CASE
-                        WHEN coalesce(daily.pre_close_price, daily.previous_close_price) IS NOT NULL
-                         AND coalesce(daily.pre_close_price, daily.previous_close_price) <> 0
-                        THEN (daily.close_price - coalesce(daily.pre_close_price, daily.previous_close_price))
-                             / coalesce(daily.pre_close_price, daily.previous_close_price) * 100
-                    END AS return_1d,
-                    CASE
-                        WHEN coalesce(daily.pre_close_price, daily.close_price) IS NOT NULL
-                         AND coalesce(daily.pre_close_price, daily.close_price) <> 0
-                        THEN (daily.high_price - daily.low_price)
-                             / coalesce(daily.pre_close_price, daily.close_price) * 100
-                    END AS amplitude,
-                    daily.volume_hand / NULLIF(daily.previous_volume_mean_5, 0) AS volume_ratio,
-                    daily.amount_yuan / NULLIF(daily.previous_amount_mean_5, 0) AS amount_ratio,
-                    daily.volatility_20d,
-                    (daily.close_price - daily.low_price) / NULLIF(daily.high_price - daily.low_price, 0) AS close_position,
-                    jsonb_build_object(
-                        'history_days', daily.history_days,
-                        'missing_windows', to_jsonb(array_remove(ARRAY[
-                            CASE WHEN daily.history_days < 5 THEN 'ma5' END,
-                            CASE WHEN daily.history_days < 10 THEN 'ma10' END,
-                            CASE WHEN daily.history_days < 20 THEN 'ma20' END,
-                            CASE WHEN daily.history_days < 30 THEN 'ma30' END,
-                            CASE WHEN daily.history_days < 60 THEN 'ma60' END,
-                            CASE WHEN daily.history_days < 21 THEN 'volatility_20d' END
-                        ]::text[], NULL))
-                    )
-                    || CASE
-                        WHEN :calculate_stock_fund THEN CASE
-                            WHEN fund.stock_code IS NULL THEN jsonb_build_object('fund_flow_available', false)
-                            ELSE jsonb_build_object(
-                                'fund_flow_available', true,
-                                'main_net_inflow', fund.main_net_inflow,
-                                'main_net_ratio', fund.main_net_inflow / NULLIF(daily.amount_yuan, 0),
-                                'big_order_net_inflow', fund.big_order_net_inflow,
-                                'big_order_net_ratio', fund.big_order_net_inflow / NULLIF(daily.amount_yuan, 0),
-                                'super_large_net_inflow', fund.super_large_net_inflow,
-                                'super_large_net_ratio', fund.super_large_net_inflow / NULLIF(daily.amount_yuan, 0),
-                                'continuous_main_inflow_days', fund.continuous_main_inflow_days,
-                                'main_net_inflow_3d', fund.main_net_inflow_3d,
-                                'main_net_inflow_5d', fund.main_net_inflow_5d,
-                                'main_net_inflow_10d', fund.main_net_inflow_10d,
-                                'fund_strength_percentile', cross_section.fund_strength_percentile,
-                                'fund_factor_missing_windows', to_jsonb(array_remove(ARRAY[
-                                    CASE WHEN fund.fund_days_3 < 3 THEN 'main_net_inflow_3d' END,
-                                    CASE WHEN fund.fund_days_5 < 5 THEN 'main_net_inflow_5d' END,
-                                    CASE WHEN fund.fund_days_10 < 10 THEN 'main_net_inflow_10d' END,
-                                    CASE WHEN daily.amount_yuan IS NULL OR daily.amount_yuan = 0 THEN 'main_net_ratio' END,
-                                    CASE WHEN daily.amount_yuan IS NULL OR daily.amount_yuan = 0 THEN 'big_order_net_ratio' END,
-                                    CASE WHEN daily.amount_yuan IS NULL OR daily.amount_yuan = 0 THEN 'super_large_net_ratio' END
-                                ]::text[], NULL))
-                            )
-                        END
-                        ELSE '{{}}'::jsonb
-                    END
-                    || CASE
-                        WHEN :include_external_technical AND technical.selected_factors <> '{{}}'::jsonb
-                        THEN jsonb_build_object(
-                            'tushare_technical', technical.selected_factors || jsonb_build_object('source', 'tushare:stk_factor_pro')
-                        )
-                        ELSE '{{}}'::jsonb
-                    END AS features
-                FROM daily_metrics AS daily
-                LEFT JOIN fund_metrics AS fund
-                  ON :calculate_stock_fund
-                 AND fund.stock_code = daily.stock_code
-                 AND fund.trade_date = daily.trade_date
-                LEFT JOIN fund_cross_section AS cross_section
-                  ON :calculate_stock_fund
-                 AND cross_section.stock_code = daily.stock_code
-                 AND cross_section.trade_date = daily.trade_date
-                LEFT JOIN technical_raw AS technical
-                  ON :include_external_technical
-                 AND technical.stock_code = daily.stock_code
-                 AND technical.trade_date = daily.trade_date
-                WHERE daily.trade_date BETWEEN :start_date AND :end_date
-            )
-            INSERT INTO t_stock_factor_daily (
-                stock_code, trade_date, source,
-                ma5, ma10, ma20, ma30, ma60, return_1d, amplitude,
-                volume_ratio, amount_ratio, volatility_20d, close_position, features, created_at
-            )
-            SELECT
-                stock_code, trade_date, 'system:daily_close',
-                ma5, ma10, ma20, ma30, ma60, return_1d, amplitude,
-                volume_ratio, amount_ratio, volatility_20d, close_position, features, now()
-            FROM candidates
-            ON CONFLICT (stock_code, trade_date, source) {conflict_clause}
-            RETURNING trade_date
-            """
-        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
-        rows = (
-            await self.session.execute(
-                statement,
-                {
-                    "stock_codes": stock_codes,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "history_start": history_start,
-                    "fund_history_start": fund_history_start,
-                    "only_missing": only_missing,
-                    "calculate_stock_fund": calculate_stock_fund,
-                    "include_external_technical": include_external_technical,
-                },
-            )
-        ).all()
-        written: dict[date, int] = {}
-        for (trade_date,) in rows:
-            written[trade_date] = written.get(trade_date, 0) + 1
-        return written
-
-    async def merge_external_technical_features(
-        self,
-        stock_codes: list[str],
-        *,
-        trade_date: date,
-    ) -> int:
-        """Merge only the selected Tushare technical fields into existing daily factors."""
-        if not stock_codes:
-            return 0
-        technical_pairs = ", ".join(
-            f"'{name}', technical.factors -> '{name}'"
-            for name in TUSHARE_TECHNICAL_FEATURE_NAMES
-        )
-        statement = text(
-            f"""
-            WITH selected AS (
-                SELECT
-                    technical.stock_code,
-                    technical.trade_date,
-                    jsonb_strip_nulls(jsonb_build_object({technical_pairs}))
-                        || jsonb_build_object('source', 'tushare:stk_factor_pro') AS factors
-                FROM t_stock_technical_factor_daily AS technical
-                WHERE technical.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND technical.trade_date = :trade_date
-            )
-            UPDATE t_stock_factor_daily AS factor
-            SET features = coalesce(factor.features, '{{}}'::jsonb)
-                || jsonb_build_object('tushare_technical', selected.factors)
-            FROM selected
-            WHERE factor.stock_code = selected.stock_code
-              AND factor.trade_date = selected.trade_date
-              AND factor.source = 'system:daily_close'
-              AND selected.factors <> jsonb_build_object('source', 'tushare:stk_factor_pro')
-            RETURNING factor.id
-            """
-        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
-        rows = (
-            await self.session.execute(
-                statement,
-                {"stock_codes": stock_codes, "trade_date": trade_date},
-            )
-        ).all()
-        return len(rows)
-
-    async def assemble_stock_daily_factors_v2(
+    async def assemble_stock_daily_factors_final(
         self,
         stock_codes: list[str],
         *,
         trade_date: date,
         history_start: date,
     ) -> int:
-        written = await self.assemble_stock_daily_factors_v2_between(
+        written = await self.assemble_stock_daily_factors_final_between(
             stock_codes,
             start_date=trade_date,
             end_date=trade_date,
@@ -811,7 +208,7 @@ class IndicatorRepository:
         )
         return written.get(trade_date, 0)
 
-    async def assemble_stock_daily_factors_v2_between(
+    async def assemble_stock_daily_factors_final_between(
         self,
         stock_codes: list[str],
         *,
@@ -820,37 +217,29 @@ class IndicatorRepository:
         history_start: date,
         only_missing: bool,
     ) -> dict[date, int]:
-        """Assemble the typed QFQ serving row without copying professional JSON.
+        """Assemble local and service groups in the one official factor row.
 
-        Tushare ``stk_factor_pro`` is the preferred source for technical
-        indicators.  QFQ prices and the reusable price/liquidity/fund windows
-        retain deterministic local fallbacks built from canonical facts and
-        adjustment factors.  Missing extended professional indicators remain
-        explicit in ``missing_factors`` instead of silently mixing price bases.
+        Professional columns may already have been written by ``stk_factor_pro``.
+        Conflict updates preserve those values and fill only missing core price
+        indicators from QFQ prices built with the adjustment-factor history.
         """
         if not stock_codes:
-            return 0
+            return {}
         statement = text(
             """
             WITH ranked_bars AS (
-                SELECT
-                    bar.*,
-                    row_number() OVER (
-                        PARTITION BY bar.stock_code, bar.trade_date
-                        ORDER BY CASE bar.source
-                            WHEN 'tushare:daily' THEN 0
-                            WHEN 'akshare_qfq' THEN 1
-                            WHEN 'mootdx' THEN 2
-                            ELSE 9
-                        END, bar.updated_at DESC, bar.id DESC
-                    ) AS source_rank
-                FROM t_daily_bar AS bar
+                SELECT bar.*,
+                       row_number() OVER (
+                           PARTITION BY bar.stock_code, bar.trade_date
+                           ORDER BY CASE bar.source WHEN 'tushare:daily' THEN 0
+                               WHEN 'akshare_qfq' THEN 1 WHEN 'mootdx' THEN 2 ELSE 9 END,
+                               bar.updated_at DESC, bar.id DESC
+                       ) AS source_rank
+                FROM t_daily_bar bar
                 WHERE bar.stock_code = ANY(CAST(:stock_codes AS varchar[]))
                   AND bar.trade_date BETWEEN :history_start AND :end_date
             ),
-            bars AS (
-                SELECT * FROM ranked_bars WHERE source_rank = 1
-            ),
+            bars AS (SELECT * FROM ranked_bars WHERE source_rank = 1),
             adjustments AS (
                 SELECT DISTINCT ON (stock_code, trade_date)
                     stock_code, trade_date, adj_factor, source
@@ -858,381 +247,290 @@ class IndicatorRepository:
                 WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
                   AND trade_date BETWEEN :history_start AND :end_date
                 ORDER BY stock_code, trade_date,
-                    CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
-                    created_at DESC, id DESC
+                         CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                         created_at DESC, id DESC
             ),
-            series AS (
-                SELECT
-                    bar.stock_code,
-                    bar.trade_date,
-                    bar.source AS daily_bar_source,
-                    bar.open_price,
-                    bar.high_price,
-                    bar.low_price,
-                    bar.close_price,
-                    bar.pre_close_price,
-                    bar.volume_hand,
-                    bar.amount_yuan,
-                    coalesce(adj.adj_factor, 1.0) AS adj_factor,
-                    adj.source AS adjust_source,
-                    bar.open_price * coalesce(adj.adj_factor, 1.0) AS scaled_open,
-                    bar.high_price * coalesce(adj.adj_factor, 1.0) AS scaled_high,
-                    bar.low_price * coalesce(adj.adj_factor, 1.0) AS scaled_low,
-                    bar.close_price * coalesce(adj.adj_factor, 1.0) AS scaled_close
-                FROM bars AS bar
-                LEFT JOIN adjustments AS adj
-                  ON adj.stock_code = bar.stock_code
-                 AND adj.trade_date = bar.trade_date
+            latest_adjustments AS (
+                SELECT DISTINCT ON (stock_code)
+                    stock_code, adj_factor AS latest_adj_factor
+                FROM t_stock_adjust_factor
+                WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                ORDER BY stock_code, trade_date DESC,
+                         CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                         created_at DESC, id DESC
+            ),
+            normalized AS (
+                SELECT bar.*,
+                       adj.adj_factor,
+                       adj.source AS adjust_source,
+                       latest.latest_adj_factor
+                FROM bars bar
+                LEFT JOIN adjustments adj USING (stock_code, trade_date)
+                LEFT JOIN latest_adjustments latest USING (stock_code)
+            ),
+            qfq AS (
+                SELECT normalized.*,
+                       open_price * adj_factor / nullif(latest_adj_factor, 0) AS qfq_open,
+                       high_price * adj_factor / nullif(latest_adj_factor, 0) AS qfq_high,
+                       low_price * adj_factor / nullif(latest_adj_factor, 0) AS qfq_low,
+                       close_price * adj_factor / nullif(latest_adj_factor, 0) AS qfq_close,
+                       row_number() OVER (PARTITION BY stock_code ORDER BY trade_date) AS history_days
+                FROM normalized
             ),
             changes AS (
-                SELECT
-                    series.*,
-                    lag(scaled_close, 1) OVER stock_window AS scaled_close_1,
-                    lag(scaled_close, 3) OVER stock_window AS scaled_close_3,
-                    lag(scaled_close, 5) OVER stock_window AS scaled_close_5,
-                    lag(scaled_close, 10) OVER stock_window AS scaled_close_10,
-                    lag(scaled_close, 20) OVER stock_window AS scaled_close_20,
-                    lag(adjust_source, 1) OVER stock_window AS adjust_source_1,
-                    lag(adjust_source, 3) OVER stock_window AS adjust_source_3,
-                    lag(adjust_source, 5) OVER stock_window AS adjust_source_5,
-                    lag(adjust_source, 10) OVER stock_window AS adjust_source_10,
-                    lag(adjust_source, 20) OVER stock_window AS adjust_source_20,
-                    CASE
-                        WHEN adjust_source IS NOT NULL
-                         AND lag(adjust_source, 1) OVER stock_window IS NOT NULL
-                        THEN scaled_close - lag(scaled_close, 1) OVER stock_window
-                    END AS close_delta,
-                    row_number() OVER stock_window AS history_days
-                FROM series
-                WINDOW stock_window AS (PARTITION BY stock_code ORDER BY trade_date)
+                SELECT qfq.*,
+                       lag(qfq_close, 1) OVER w AS close_1,
+                       lag(qfq_close, 3) OVER w AS close_3,
+                       lag(qfq_close, 5) OVER w AS close_5,
+                       lag(qfq_close, 10) OVER w AS close_10,
+                       lag(qfq_close, 20) OVER w AS close_20,
+                       lag(qfq_close, 60) OVER w AS close_60,
+                       lag(qfq_close, 120) OVER w AS close_120,
+                       lag(qfq_close, 250) OVER w AS close_250,
+                       lag(qfq_close, 1) OVER w AS pre_close_qfq,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS local_ma5,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS local_ma10,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS local_ma20,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS local_ma30,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS local_ma60,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 89 PRECEDING AND CURRENT ROW) AS local_ma90,
+                       avg(qfq_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) AS local_ma250,
+                       avg(volume_share) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS avg_volume_5,
+                       avg(volume_share) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING) AS avg_volume_10,
+                       avg(volume_share) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS avg_volume_20,
+                       avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS avg_amount_5,
+                       avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS avg_amount_20,
+                       avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS avg_amount_60,
+                       avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_amount_5,
+                       avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING) AS previous_amount_10,
+                       avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS previous_amount_20,
+                       max(qfq_high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high_20,
+                       min(qfq_low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS low_20,
+                       max(qfq_high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS high_60,
+                       min(qfq_low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS low_60,
+                       max(qfq_high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS high_120,
+                       min(qfq_low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 119 PRECEDING AND CURRENT ROW) AS low_120,
+                       max(qfq_high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) AS high_250,
+                       min(qfq_low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) AS low_250
+                FROM qfq
+                WINDOW w AS (PARTITION BY stock_code ORDER BY trade_date)
             ),
-            metrics AS (
-                SELECT
-                    changes.*,
-                    CASE WHEN adjust_source IS NOT NULL AND adjust_source_1 IS NOT NULL THEN (scaled_close / NULLIF(scaled_close_1, 0) - 1) * 100 END AS return_1d,
-                    CASE WHEN adjust_source IS NOT NULL AND adjust_source_3 IS NOT NULL THEN (scaled_close / NULLIF(scaled_close_3, 0) - 1) * 100 END AS return_3d,
-                    CASE WHEN adjust_source IS NOT NULL AND adjust_source_5 IS NOT NULL THEN (scaled_close / NULLIF(scaled_close_5, 0) - 1) * 100 END AS return_5d,
-                    CASE WHEN adjust_source IS NOT NULL AND adjust_source_10 IS NOT NULL THEN (scaled_close / NULLIF(scaled_close_10, 0) - 1) * 100 END AS return_10d,
-                    CASE WHEN adjust_source IS NOT NULL AND adjust_source_20 IS NOT NULL THEN (scaled_close / NULLIF(scaled_close_20, 0) - 1) * 100 END AS return_20d,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) = least(history_days, 5)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma5,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) = least(history_days, 10)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma10,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) = least(history_days, 20)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma20,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) = least(history_days, 30)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma30,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) = least(history_days, 60)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma60,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 89 PRECEDING AND CURRENT ROW) = least(history_days, 90)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 89 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma90,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) = least(history_days, 250)
-                        THEN avg(scaled_close) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 249 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS local_ma250,
-                    avg(volume_hand) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_volume_mean_5,
-                    avg(amount_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_amount_mean_5,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) = least(history_days, 20)
-                        THEN max(scaled_high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS high_20d,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) = least(history_days, 20)
-                        THEN min(scaled_low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS low_20d,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) = least(history_days, 60)
-                        THEN max(scaled_high) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS high_60d,
-                    CASE WHEN count(adjust_source) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) = least(history_days, 60)
-                        THEN min(scaled_low) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) / NULLIF(adj_factor, 0) END AS low_60d,
-                    avg(greatest(close_delta, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS avg_gain_14,
-                    avg(greatest(-close_delta, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS avg_loss_14
+            returns AS (
+                SELECT changes.*,
+                       (qfq_close / nullif(close_1, 0) - 1) * 100 AS r1,
+                       (qfq_close / nullif(close_3, 0) - 1) * 100 AS r3,
+                       (qfq_close / nullif(close_5, 0) - 1) * 100 AS r5,
+                       (qfq_close / nullif(close_10, 0) - 1) * 100 AS r10,
+                       (qfq_close / nullif(close_20, 0) - 1) * 100 AS r20,
+                       (qfq_close / nullif(close_60, 0) - 1) * 100 AS r60,
+                       (qfq_close / nullif(close_120, 0) - 1) * 100 AS r120,
+                       (qfq_close / nullif(close_250, 0) - 1) * 100 AS r250
                 FROM changes
             ),
-            final_metrics AS (
-                SELECT
-                    metrics.*,
-                    stddev_pop(return_1d) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS volatility_20d
-                FROM metrics
-            ),
-            technical AS (
-                SELECT DISTINCT ON (stock_code, trade_date)
-                    id, stock_code, trade_date, source, factors
-                FROM t_stock_technical_factor_daily
-                WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND trade_date BETWEEN :start_date AND :end_date
-                ORDER BY stock_code, trade_date, updated_at DESC, id DESC
+            metrics AS (
+                SELECT returns.*,
+                       stddev_pop(r1) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS vol5,
+                       stddev_pop(r1) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS vol10,
+                       stddev_pop(r1) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS vol20,
+                       stddev_pop(r1) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS vol60
+                FROM returns
             ),
             fund_grouped AS (
-                SELECT
-                    flow.*,
-                    sum(CASE WHEN coalesce(main_net_inflow, 0) <= 0 THEN 1 ELSE 0 END) OVER (
-                        PARTITION BY stock_code ORDER BY trade_date
-                    ) AS non_positive_group
-                FROM t_stock_fund_flow_daily AS flow
+                SELECT flow.*,
+                       sum(CASE WHEN coalesce(main_net_inflow_yuan, 0) <= 0 THEN 1 ELSE 0 END)
+                           OVER (PARTITION BY stock_code ORDER BY trade_date) AS non_positive_group
+                FROM t_stock_fund_flow_daily flow
                 WHERE flow.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND flow.trade_date BETWEEN (:start_date - INTERVAL '30 days')::date AND :end_date
+                  AND flow.trade_date BETWEEN (:start_date - INTERVAL '45 days')::date AND :end_date
             ),
-            fund_metrics AS (
-                SELECT
-                    fund_grouped.*,
-                    count(*) FILTER (WHERE coalesce(main_net_inflow, 0) > 0) OVER (
-                        PARTITION BY stock_code, non_positive_group
-                    ) AS continuous_main_inflow_days,
-                    sum(coalesce(main_net_inflow, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS main_net_inflow_3d,
-                    sum(coalesce(main_net_inflow, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS main_net_inflow_5d,
-                    sum(coalesce(main_net_inflow, 0)) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS main_net_inflow_10d
+            fund AS (
+                SELECT fund_grouped.*,
+                       sum(main_net_inflow_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS net3,
+                       sum(main_net_inflow_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS net5,
+                       sum(main_net_inflow_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS net10,
+                       sum(main_net_inflow_yuan) OVER (PARTITION BY stock_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS net20,
+                       count(*) FILTER (WHERE coalesce(main_net_inflow_yuan, 0) > 0)
+                           OVER (PARTITION BY stock_code, non_positive_group) AS positive_days
                 FROM fund_grouped
             ),
             candidates AS (
-                SELECT
-                    daily.stock_code,
-                    daily.trade_date,
-                    'stock_daily_v2'::varchar AS factor_set_version,
-                    'qfq'::varchar AS price_basis,
-                    CASE
-                        WHEN basic.id IS NOT NULL
-                         AND fund.id IS NOT NULL
-                         AND daily.adjust_source IS NOT NULL
-                         AND (daily.history_days = 1 OR daily.adjust_source_1 IS NOT NULL)
-                         AND coalesce(NULLIF(technical.factors ->> 'ma_qfq_20', '')::double precision, daily.local_ma20) IS NOT NULL
-                        THEN 'ready' ELSE 'partial'
-                    END::varchar AS factor_status,
-                    CASE WHEN technical.id IS NOT NULL THEN technical.source END AS technical_source,
-                    'system:daily_factor_v2'::varchar AS local_source,
-                    fund.source AS fund_source,
-                    jsonb_strip_nulls(jsonb_build_object(
-                        'daily_bar', daily.daily_bar_source,
-                        'adjust_factor', daily.adjust_source,
-                        'technical', technical.source,
-                        'daily_basic', basic.source,
-                        'fund_flow', fund.source
-                    )) AS source_map,
-                    to_jsonb(array_remove(ARRAY[
-                        CASE WHEN basic.id IS NULL THEN 'daily_basic' END,
-                        CASE WHEN fund.id IS NULL THEN 'fund_flow' END,
-                        CASE WHEN technical.id IS NULL THEN 'professional_technical' END,
-                        CASE WHEN daily.adjust_source IS NULL THEN 'adjust_factor' END,
-                        CASE WHEN daily.history_days > 1 AND daily.adjust_source_1 IS NULL THEN 'adjust_factor_history' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'ema_qfq_5', '') IS NULL THEN 'ema5' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'macd_qfq', '') IS NULL THEN 'macd' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'kdj_qfq', '') IS NULL THEN 'kdj' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'rsi_qfq_6', '') IS NULL THEN 'rsi6' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'boll_mid_qfq', '') IS NULL THEN 'boll' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'atr_qfq', '') IS NULL THEN 'atr' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'cci_qfq', '') IS NULL THEN 'cci' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'vr_qfq', '') IS NULL THEN 'vr' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'wr_qfq', '') IS NULL THEN 'wr' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'obv_qfq', '') IS NULL THEN 'obv' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'mfi_qfq', '') IS NULL THEN 'mfi' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'roc_qfq', '') IS NULL THEN 'roc' END,
-                        CASE WHEN NULLIF(technical.factors ->> 'mtm_qfq', '') IS NULL THEN 'mtm' END,
-                        CASE WHEN daily.history_days < 20 THEN 'history_20d' END,
-                        CASE WHEN daily.history_days < 60 THEN 'history_60d' END,
-                        CASE WHEN daily.history_days < 250 THEN 'history_250d' END
-                    ]::text[], NULL)) AS missing_factors,
-
-                    coalesce(NULLIF(technical.factors ->> 'open_qfq', '')::double precision, daily.open_price) AS open_qfq,
-                    coalesce(NULLIF(technical.factors ->> 'high_qfq', '')::double precision, daily.high_price) AS high_qfq,
-                    coalesce(NULLIF(technical.factors ->> 'low_qfq', '')::double precision, daily.low_price) AS low_qfq,
-                    coalesce(NULLIF(technical.factors ->> 'close_qfq', '')::double precision, daily.close_price) AS close_qfq,
-                    CASE WHEN daily.adjust_source_1 IS NOT NULL
-                        THEN daily.scaled_close_1 / NULLIF(daily.adj_factor, 0) END AS pre_close_qfq,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_5', '')::double precision, daily.local_ma5) AS ma5,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_10', '')::double precision, daily.local_ma10) AS ma10,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_20', '')::double precision, daily.local_ma20) AS ma20,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_30', '')::double precision, daily.local_ma30) AS ma30,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_60', '')::double precision, daily.local_ma60) AS ma60,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_90', '')::double precision, daily.local_ma90) AS ma90,
-                    coalesce(NULLIF(technical.factors ->> 'ma_qfq_250', '')::double precision, daily.local_ma250) AS ma250,
-                    NULLIF(technical.factors ->> 'ema_qfq_5', '')::double precision AS ema5,
-                    NULLIF(technical.factors ->> 'ema_qfq_10', '')::double precision AS ema10,
-                    NULLIF(technical.factors ->> 'ema_qfq_20', '')::double precision AS ema20,
-                    NULLIF(technical.factors ->> 'ema_qfq_30', '')::double precision AS ema30,
-                    NULLIF(technical.factors ->> 'ema_qfq_60', '')::double precision AS ema60,
-                    NULLIF(technical.factors ->> 'macd_qfq', '')::double precision AS macd,
-                    NULLIF(technical.factors ->> 'macd_dif_qfq', '')::double precision AS macd_dif,
-                    NULLIF(technical.factors ->> 'macd_dea_qfq', '')::double precision AS macd_dea,
-                    NULLIF(technical.factors ->> 'kdj_qfq', '')::double precision AS kdj_j,
-                    NULLIF(technical.factors ->> 'kdj_k_qfq', '')::double precision AS kdj_k,
-                    NULLIF(technical.factors ->> 'kdj_d_qfq', '')::double precision AS kdj_d,
-                    NULLIF(technical.factors ->> 'rsi_qfq_6', '')::double precision AS rsi6,
-                    NULLIF(technical.factors ->> 'rsi_qfq_12', '')::double precision AS rsi12,
-                    CASE
-                        WHEN daily.avg_loss_14 = 0 AND daily.avg_gain_14 > 0 THEN 100
-                        WHEN daily.avg_loss_14 > 0 THEN 100 - 100 / (1 + daily.avg_gain_14 / daily.avg_loss_14)
-                    END AS rsi14,
-                    NULLIF(technical.factors ->> 'rsi_qfq_24', '')::double precision AS rsi24,
-                    NULLIF(technical.factors ->> 'boll_upper_qfq', '')::double precision AS boll_upper,
-                    NULLIF(technical.factors ->> 'boll_mid_qfq', '')::double precision AS boll_mid,
-                    NULLIF(technical.factors ->> 'boll_lower_qfq', '')::double precision AS boll_lower,
-                    NULLIF(technical.factors ->> 'atr_qfq', '')::double precision AS atr,
-                    NULLIF(technical.factors ->> 'cci_qfq', '')::double precision AS cci,
-                    NULLIF(technical.factors ->> 'vr_qfq', '')::double precision AS vr,
-                    NULLIF(technical.factors ->> 'wr_qfq', '')::double precision AS wr,
-                    NULLIF(technical.factors ->> 'wr1_qfq', '')::double precision AS wr1,
-                    NULLIF(technical.factors ->> 'bias1_qfq', '')::double precision AS bias1,
-                    NULLIF(technical.factors ->> 'bias2_qfq', '')::double precision AS bias2,
-                    NULLIF(technical.factors ->> 'bias3_qfq', '')::double precision AS bias3,
-                    NULLIF(technical.factors ->> 'obv_qfq', '')::double precision AS obv,
-                    NULLIF(technical.factors ->> 'mfi_qfq', '')::double precision AS mfi,
-                    NULLIF(technical.factors ->> 'roc_qfq', '')::double precision AS roc,
-                    NULLIF(technical.factors ->> 'mtm_qfq', '')::double precision AS mtm,
-                    daily.return_1d,
-                    daily.return_3d,
-                    daily.return_5d,
-                    daily.return_10d,
-                    daily.return_20d,
-                    (daily.high_price - daily.low_price) / NULLIF(coalesce(daily.pre_close_price, daily.close_price), 0) * 100 AS amplitude_1d,
-                    daily.volume_hand / NULLIF(daily.previous_volume_mean_5, 0) AS volume_ratio_5d,
-                    daily.amount_yuan / NULLIF(daily.previous_amount_mean_5, 0) AS amount_ratio_5d,
-                    daily.volatility_20d,
-                    (daily.close_price - daily.low_price) / NULLIF(daily.high_price - daily.low_price, 0) AS close_position_1d,
-                    daily.high_20d,
-                    daily.low_20d,
-                    daily.high_60d,
-                    daily.low_60d,
-                    (coalesce(NULLIF(technical.factors ->> 'close_qfq', '')::double precision, daily.close_price) / NULLIF(daily.high_20d, 0) - 1) * 100 AS drawdown_20d,
-                    (coalesce(NULLIF(technical.factors ->> 'close_qfq', '')::double precision, daily.close_price) / NULLIF(daily.high_60d, 0) - 1) * 100 AS drawdown_60d,
-                    basic.turnover_rate,
-                    basic.circ_mv,
-                    basic.total_mv,
-                    fund.main_net_inflow,
-                    fund.main_net_ratio AS provider_main_net_ratio,
-                    fund.main_net_inflow / NULLIF(daily.amount_yuan, 0) AS main_net_amount_ratio,
-                    fund.big_order_net_inflow,
-                    fund.big_order_net_inflow / NULLIF(daily.amount_yuan, 0) AS big_order_net_amount_ratio,
-                    fund.super_large_net_inflow,
-                    fund.super_large_net_inflow / NULLIF(daily.amount_yuan, 0) AS super_large_net_amount_ratio,
-                    fund.main_net_inflow_3d,
-                    fund.main_net_inflow_5d,
-                    fund.main_net_inflow_10d,
-                    fund.continuous_main_inflow_days::integer,
-                    NULL::double precision AS fund_strength_percentile,
-                    daily.history_days::integer
-                FROM final_metrics AS daily
-                LEFT JOIN technical
-                  ON technical.stock_code = daily.stock_code
-                 AND technical.trade_date = daily.trade_date
-                LEFT JOIN t_stock_daily_basic AS basic
-                  ON basic.stock_code = daily.stock_code
-                 AND basic.trade_date = daily.trade_date
-                LEFT JOIN fund_metrics AS fund
-                  ON fund.stock_code = daily.stock_code
-                 AND fund.trade_date = daily.trade_date
-                WHERE daily.trade_date BETWEEN :start_date AND :end_date
-                  AND (
-                    NOT :only_missing
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM t_stock_factor_daily_v2 AS existing
-                        WHERE existing.stock_code = daily.stock_code
-                          AND existing.trade_date = daily.trade_date
-                          AND existing.factor_set_version = 'stock_daily_v2'
-                          AND existing.factor_status = 'ready'
-                    )
-                  )
+                SELECT m.*, basic.id AS basic_id, basic.source AS basic_source_value,
+                       basic.turnover_rate_pct, basic.turnover_rate_free_pct,
+                       basic.pe, basic.pe_ttm, basic.pb, basic.ps_ttm,
+                       basic.dividend_yield_pct, basic.total_share_shares,
+                       basic.float_share_shares, basic.free_share_shares,
+                       basic.total_market_value_yuan, basic.circulating_market_value_yuan,
+                       fund.id AS fund_id, fund.source AS fund_source_value,
+                       fund.main_net_inflow_yuan, fund.main_net_ratio,
+                       fund.big_order_net_inflow_yuan, fund.super_large_net_inflow_yuan,
+                       fund.net3, fund.net5, fund.net10, fund.net20, fund.positive_days
+                FROM metrics m
+                LEFT JOIN t_stock_daily_basic basic USING (stock_code, trade_date)
+                LEFT JOIN fund USING (stock_code, trade_date)
+                WHERE m.trade_date BETWEEN :start_date AND :end_date
             )
-            INSERT INTO t_stock_factor_daily_v2 (
-                stock_code, trade_date, factor_set_version, price_basis, factor_status,
-                technical_source, local_source, fund_source, source_map, missing_factors,
+            INSERT INTO t_stock_factor_daily (
+                stock_code, trade_date, price_basis, price_status,
+                technical_core_status, technical_extended_status,
+                valuation_status, fund_status, quality_flags,
+                price_source, basic_source, fund_source, local_source,
+                calculation_revision, history_days,
                 open_qfq, high_qfq, low_qfq, close_qfq, pre_close_qfq,
                 ma5, ma10, ma20, ma30, ma60, ma90, ma250,
-                ema5, ema10, ema20, ema30, ema60,
-                macd, macd_dif, macd_dea, kdj_j, kdj_k, kdj_d,
-                rsi6, rsi12, rsi14, rsi24, boll_upper, boll_mid, boll_lower,
-                atr, cci, vr, wr, wr1, bias1, bias2, bias3, obv, mfi, roc, mtm,
-                return_1d, return_3d, return_5d, return_10d, return_20d,
-                amplitude_1d, volume_ratio_5d, amount_ratio_5d, volatility_20d,
-                close_position_1d, high_20d, low_20d, high_60d, low_60d,
-                drawdown_20d, drawdown_60d, turnover_rate, circ_mv, total_mv,
-                main_net_inflow, provider_main_net_ratio, main_net_amount_ratio,
-                big_order_net_inflow, big_order_net_amount_ratio,
-                super_large_net_inflow, super_large_net_amount_ratio,
-                main_net_inflow_3d, main_net_inflow_5d, main_net_inflow_10d,
-                continuous_main_inflow_days, fund_strength_percentile, history_days,
-                created_at, updated_at
+                return_1d_pct, return_3d_pct, return_5d_pct, return_10d_pct,
+                return_20d_pct, return_60d_pct, return_120d_pct, return_250d_pct,
+                amplitude_1d_pct, open_gap_pct, close_position_ratio,
+                volume_ratio_5d, volume_ratio_10d, volume_ratio_20d,
+                amount_ratio_5d, amount_ratio_10d, amount_ratio_20d,
+                average_amount_5d_yuan, average_amount_20d_yuan, average_amount_60d_yuan,
+                volatility_5d, volatility_10d, volatility_20d, volatility_60d,
+                high_20d, low_20d, high_60d, low_60d,
+                high_120d, low_120d, high_250d, low_250d,
+                distance_high_20d_ratio, distance_low_20d_ratio,
+                distance_high_60d_ratio, distance_low_60d_ratio,
+                drawdown_20d_pct, drawdown_60d_pct, drawdown_120d_pct, drawdown_250d_pct,
+                turnover_rate_pct, turnover_rate_free_pct, pe, pe_ttm, pb, ps_ttm,
+                dividend_yield_pct, total_share_shares, float_share_shares, free_share_shares,
+                total_market_value_yuan, circulating_market_value_yuan,
+                main_net_inflow_yuan, provider_main_net_ratio, main_net_amount_ratio,
+                big_order_net_inflow_yuan, big_order_net_amount_ratio,
+                super_large_net_inflow_yuan, super_large_net_amount_ratio,
+                main_net_inflow_3d_yuan, main_net_inflow_5d_yuan,
+                main_net_inflow_10d_yuan, main_net_inflow_20d_yuan,
+                continuous_main_inflow_days, calculated_at, created_at, updated_at
             )
             SELECT
-                candidates.*, now(), now()
+                stock_code, trade_date, 'qfq',
+                CASE WHEN qfq_close IS NOT NULL THEN 'ready' ELSE 'missing' END,
+                'partial', 'partial',
+                CASE WHEN basic_id IS NOT NULL THEN 'ready' ELSE 'missing' END,
+                CASE WHEN fund_id IS NOT NULL THEN 'ready' ELSE 'missing' END,
+                array_remove(ARRAY[
+                    CASE WHEN adj_factor IS NULL THEN 'adjust_factor' END,
+                    CASE WHEN basic_id IS NULL THEN 'daily_basic' END,
+                    CASE WHEN fund_id IS NULL THEN 'fund_flow' END
+                ]::text[], NULL),
+                CASE WHEN adj_factor IS NOT NULL THEN 'local:t_daily_bar+adjust_factor' END,
+                basic_source_value, fund_source_value, 'system:stock_daily_factor',
+                'stock_daily_final_r1', history_days,
+                qfq_open, qfq_high, qfq_low, qfq_close, pre_close_qfq,
+                local_ma5, local_ma10, local_ma20, local_ma30, local_ma60, local_ma90, local_ma250,
+                r1, r3, r5, r10, r20, r60, r120, r250,
+                (high_price - low_price) / nullif(coalesce(pre_close_price, close_price), 0) * 100,
+                (open_price / nullif(pre_close_price, 0) - 1) * 100,
+                (close_price - low_price) / nullif(high_price - low_price, 0),
+                volume_share / nullif(avg_volume_5, 0), volume_share / nullif(avg_volume_10, 0),
+                volume_share / nullif(avg_volume_20, 0),
+                amount_yuan / nullif(previous_amount_5, 0), amount_yuan / nullif(previous_amount_10, 0),
+                amount_yuan / nullif(previous_amount_20, 0),
+                avg_amount_5, avg_amount_20, avg_amount_60,
+                vol5, vol10, vol20, vol60,
+                high_20, low_20, high_60, low_60, high_120, low_120, high_250, low_250,
+                qfq_close / nullif(high_20, 0) - 1, qfq_close / nullif(low_20, 0) - 1,
+                qfq_close / nullif(high_60, 0) - 1, qfq_close / nullif(low_60, 0) - 1,
+                (qfq_close / nullif(high_20, 0) - 1) * 100,
+                (qfq_close / nullif(high_60, 0) - 1) * 100,
+                (qfq_close / nullif(high_120, 0) - 1) * 100,
+                (qfq_close / nullif(high_250, 0) - 1) * 100,
+                turnover_rate_pct, turnover_rate_free_pct, pe, pe_ttm, pb, ps_ttm,
+                dividend_yield_pct, total_share_shares, float_share_shares, free_share_shares,
+                total_market_value_yuan, circulating_market_value_yuan,
+                main_net_inflow_yuan, main_net_ratio, main_net_inflow_yuan / nullif(amount_yuan, 0),
+                big_order_net_inflow_yuan, big_order_net_inflow_yuan / nullif(amount_yuan, 0),
+                super_large_net_inflow_yuan, super_large_net_inflow_yuan / nullif(amount_yuan, 0),
+                net3, net5, net10, net20, positive_days::integer, now(), now(), now()
             FROM candidates
-            ON CONFLICT (stock_code, trade_date, factor_set_version)
-            DO UPDATE SET
-                price_basis = EXCLUDED.price_basis,
-                factor_status = EXCLUDED.factor_status,
-                technical_source = EXCLUDED.technical_source,
-                local_source = EXCLUDED.local_source,
+            WHERE NOT :only_missing OR NOT EXISTS (
+                SELECT 1 FROM t_stock_factor_daily existing
+                WHERE existing.stock_code = candidates.stock_code
+                  AND existing.trade_date = candidates.trade_date
+                  AND existing.price_status = 'ready'
+                  AND existing.valuation_status = 'ready'
+                  AND existing.fund_status = 'ready'
+                  AND existing.calculation_revision = 'stock_daily_final_r1'
+            )
+            ON CONFLICT (stock_code, trade_date) DO UPDATE SET
+                price_basis = 'qfq',
+                price_status = EXCLUDED.price_status,
+                valuation_status = EXCLUDED.valuation_status,
+                fund_status = EXCLUDED.fund_status,
+                quality_flags = EXCLUDED.quality_flags,
+                price_source = coalesce(t_stock_factor_daily.price_source, EXCLUDED.price_source),
+                basic_source = EXCLUDED.basic_source,
                 fund_source = EXCLUDED.fund_source,
-                source_map = EXCLUDED.source_map,
-                missing_factors = EXCLUDED.missing_factors,
-                open_qfq = EXCLUDED.open_qfq,
-                high_qfq = EXCLUDED.high_qfq,
-                low_qfq = EXCLUDED.low_qfq,
-                close_qfq = EXCLUDED.close_qfq,
-                pre_close_qfq = EXCLUDED.pre_close_qfq,
-                ma5 = EXCLUDED.ma5,
-                ma10 = EXCLUDED.ma10,
-                ma20 = EXCLUDED.ma20,
-                ma30 = EXCLUDED.ma30,
-                ma60 = EXCLUDED.ma60,
-                ma90 = EXCLUDED.ma90,
-                ma250 = EXCLUDED.ma250,
-                ema5 = EXCLUDED.ema5,
-                ema10 = EXCLUDED.ema10,
-                ema20 = EXCLUDED.ema20,
-                ema30 = EXCLUDED.ema30,
-                ema60 = EXCLUDED.ema60,
-                macd = EXCLUDED.macd,
-                macd_dif = EXCLUDED.macd_dif,
-                macd_dea = EXCLUDED.macd_dea,
-                kdj_j = EXCLUDED.kdj_j,
-                kdj_k = EXCLUDED.kdj_k,
-                kdj_d = EXCLUDED.kdj_d,
-                rsi6 = EXCLUDED.rsi6,
-                rsi12 = EXCLUDED.rsi12,
-                rsi14 = EXCLUDED.rsi14,
-                rsi24 = EXCLUDED.rsi24,
-                boll_upper = EXCLUDED.boll_upper,
-                boll_mid = EXCLUDED.boll_mid,
-                boll_lower = EXCLUDED.boll_lower,
-                atr = EXCLUDED.atr,
-                cci = EXCLUDED.cci,
-                vr = EXCLUDED.vr,
-                wr = EXCLUDED.wr,
-                wr1 = EXCLUDED.wr1,
-                bias1 = EXCLUDED.bias1,
-                bias2 = EXCLUDED.bias2,
-                bias3 = EXCLUDED.bias3,
-                obv = EXCLUDED.obv,
-                mfi = EXCLUDED.mfi,
-                roc = EXCLUDED.roc,
-                mtm = EXCLUDED.mtm,
-                return_1d = EXCLUDED.return_1d,
-                return_3d = EXCLUDED.return_3d,
-                return_5d = EXCLUDED.return_5d,
-                return_10d = EXCLUDED.return_10d,
-                return_20d = EXCLUDED.return_20d,
-                amplitude_1d = EXCLUDED.amplitude_1d,
+                local_source = EXCLUDED.local_source,
+                calculation_revision = EXCLUDED.calculation_revision,
+                history_days = EXCLUDED.history_days,
+                open_qfq = coalesce(t_stock_factor_daily.open_qfq, EXCLUDED.open_qfq),
+                high_qfq = coalesce(t_stock_factor_daily.high_qfq, EXCLUDED.high_qfq),
+                low_qfq = coalesce(t_stock_factor_daily.low_qfq, EXCLUDED.low_qfq),
+                close_qfq = coalesce(t_stock_factor_daily.close_qfq, EXCLUDED.close_qfq),
+                pre_close_qfq = coalesce(t_stock_factor_daily.pre_close_qfq, EXCLUDED.pre_close_qfq),
+                ma5 = coalesce(t_stock_factor_daily.ma5, EXCLUDED.ma5),
+                ma10 = coalesce(t_stock_factor_daily.ma10, EXCLUDED.ma10),
+                ma20 = coalesce(t_stock_factor_daily.ma20, EXCLUDED.ma20),
+                ma30 = coalesce(t_stock_factor_daily.ma30, EXCLUDED.ma30),
+                ma60 = coalesce(t_stock_factor_daily.ma60, EXCLUDED.ma60),
+                ma90 = coalesce(t_stock_factor_daily.ma90, EXCLUDED.ma90),
+                ma250 = coalesce(t_stock_factor_daily.ma250, EXCLUDED.ma250),
+                return_1d_pct = EXCLUDED.return_1d_pct,
+                return_3d_pct = EXCLUDED.return_3d_pct,
+                return_5d_pct = EXCLUDED.return_5d_pct,
+                return_10d_pct = EXCLUDED.return_10d_pct,
+                return_20d_pct = EXCLUDED.return_20d_pct,
+                return_60d_pct = EXCLUDED.return_60d_pct,
+                return_120d_pct = EXCLUDED.return_120d_pct,
+                return_250d_pct = EXCLUDED.return_250d_pct,
+                amplitude_1d_pct = EXCLUDED.amplitude_1d_pct,
+                open_gap_pct = EXCLUDED.open_gap_pct,
+                close_position_ratio = EXCLUDED.close_position_ratio,
                 volume_ratio_5d = EXCLUDED.volume_ratio_5d,
+                volume_ratio_10d = EXCLUDED.volume_ratio_10d,
+                volume_ratio_20d = EXCLUDED.volume_ratio_20d,
                 amount_ratio_5d = EXCLUDED.amount_ratio_5d,
+                amount_ratio_10d = EXCLUDED.amount_ratio_10d,
+                amount_ratio_20d = EXCLUDED.amount_ratio_20d,
+                average_amount_5d_yuan = EXCLUDED.average_amount_5d_yuan,
+                average_amount_20d_yuan = EXCLUDED.average_amount_20d_yuan,
+                average_amount_60d_yuan = EXCLUDED.average_amount_60d_yuan,
+                volatility_5d = EXCLUDED.volatility_5d,
+                volatility_10d = EXCLUDED.volatility_10d,
                 volatility_20d = EXCLUDED.volatility_20d,
-                close_position_1d = EXCLUDED.close_position_1d,
-                high_20d = EXCLUDED.high_20d,
-                low_20d = EXCLUDED.low_20d,
-                high_60d = EXCLUDED.high_60d,
-                low_60d = EXCLUDED.low_60d,
-                drawdown_20d = EXCLUDED.drawdown_20d,
-                drawdown_60d = EXCLUDED.drawdown_60d,
-                turnover_rate = EXCLUDED.turnover_rate,
-                circ_mv = EXCLUDED.circ_mv,
-                total_mv = EXCLUDED.total_mv,
-                main_net_inflow = EXCLUDED.main_net_inflow,
+                volatility_60d = EXCLUDED.volatility_60d,
+                high_20d = EXCLUDED.high_20d, low_20d = EXCLUDED.low_20d,
+                high_60d = EXCLUDED.high_60d, low_60d = EXCLUDED.low_60d,
+                high_120d = EXCLUDED.high_120d, low_120d = EXCLUDED.low_120d,
+                high_250d = EXCLUDED.high_250d, low_250d = EXCLUDED.low_250d,
+                distance_high_20d_ratio = EXCLUDED.distance_high_20d_ratio,
+                distance_low_20d_ratio = EXCLUDED.distance_low_20d_ratio,
+                distance_high_60d_ratio = EXCLUDED.distance_high_60d_ratio,
+                distance_low_60d_ratio = EXCLUDED.distance_low_60d_ratio,
+                drawdown_20d_pct = EXCLUDED.drawdown_20d_pct,
+                drawdown_60d_pct = EXCLUDED.drawdown_60d_pct,
+                drawdown_120d_pct = EXCLUDED.drawdown_120d_pct,
+                drawdown_250d_pct = EXCLUDED.drawdown_250d_pct,
+                turnover_rate_pct = EXCLUDED.turnover_rate_pct,
+                turnover_rate_free_pct = EXCLUDED.turnover_rate_free_pct,
+                pe = EXCLUDED.pe, pe_ttm = EXCLUDED.pe_ttm, pb = EXCLUDED.pb, ps_ttm = EXCLUDED.ps_ttm,
+                dividend_yield_pct = EXCLUDED.dividend_yield_pct,
+                total_share_shares = EXCLUDED.total_share_shares,
+                float_share_shares = EXCLUDED.float_share_shares,
+                free_share_shares = EXCLUDED.free_share_shares,
+                total_market_value_yuan = EXCLUDED.total_market_value_yuan,
+                circulating_market_value_yuan = EXCLUDED.circulating_market_value_yuan,
+                main_net_inflow_yuan = EXCLUDED.main_net_inflow_yuan,
                 provider_main_net_ratio = EXCLUDED.provider_main_net_ratio,
                 main_net_amount_ratio = EXCLUDED.main_net_amount_ratio,
-                big_order_net_inflow = EXCLUDED.big_order_net_inflow,
+                big_order_net_inflow_yuan = EXCLUDED.big_order_net_inflow_yuan,
                 big_order_net_amount_ratio = EXCLUDED.big_order_net_amount_ratio,
-                super_large_net_inflow = EXCLUDED.super_large_net_inflow,
+                super_large_net_inflow_yuan = EXCLUDED.super_large_net_inflow_yuan,
                 super_large_net_amount_ratio = EXCLUDED.super_large_net_amount_ratio,
-                main_net_inflow_3d = EXCLUDED.main_net_inflow_3d,
-                main_net_inflow_5d = EXCLUDED.main_net_inflow_5d,
-                main_net_inflow_10d = EXCLUDED.main_net_inflow_10d,
+                main_net_inflow_3d_yuan = EXCLUDED.main_net_inflow_3d_yuan,
+                main_net_inflow_5d_yuan = EXCLUDED.main_net_inflow_5d_yuan,
+                main_net_inflow_10d_yuan = EXCLUDED.main_net_inflow_10d_yuan,
+                main_net_inflow_20d_yuan = EXCLUDED.main_net_inflow_20d_yuan,
                 continuous_main_inflow_days = EXCLUDED.continuous_main_inflow_days,
-                fund_strength_percentile = EXCLUDED.fund_strength_percentile,
-                history_days = EXCLUDED.history_days,
-                updated_at = now()
+                calculated_at = now(), updated_at = now()
             RETURNING trade_date
             """
         ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
@@ -1248,80 +546,494 @@ class IndicatorRepository:
                 },
             )
         ).all()
-        written: dict[date, int] = {}
-        for (trade_date,) in rows:
-            written[trade_date] = written.get(trade_date, 0) + 1
-        return written
+        result: dict[date, int] = {}
+        for (row_date,) in rows:
+            result[row_date] = result.get(row_date, 0) + 1
+        await self._fill_local_technical_core(
+            stock_codes,
+            start_date=start_date,
+            end_date=end_date,
+            history_start=history_start,
+        )
+        await self._fill_relative_csi300(
+            stock_codes,
+            start_date=start_date,
+            end_date=end_date,
+            history_start=history_start,
+        )
+        return result
 
-    async def refresh_stock_daily_v2_fund_percentiles(
+    async def rebase_qfq_history_for_adjustment_changes(self, *, trade_date: date) -> int:
+        """Re-anchor historical price-dimensional factors after an ex-date.
+
+        The scale is derived from the last stored pre-event QFQ close and its
+        BFQ/adjustment facts, rather than blindly applying the adjustment
+        ratio.  A repeated run therefore derives a scale of one and is
+        idempotent.  Dimensionless indicators and returns are not changed.
+        """
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    WITH current_adjustment AS (
+                        SELECT DISTINCT ON (stock_code)
+                            stock_code, trade_date, adj_factor
+                        FROM t_stock_adjust_factor
+                        WHERE trade_date = :trade_date
+                        ORDER BY stock_code,
+                                 CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                                 created_at DESC, id DESC
+                    ),
+                    changed AS (
+                        SELECT current.stock_code, current.trade_date,
+                               current.adj_factor AS current_factor,
+                               previous.adj_factor AS previous_factor
+                        FROM current_adjustment current
+                        JOIN LATERAL (
+                            SELECT adj_factor
+                            FROM t_stock_adjust_factor prior
+                            WHERE prior.stock_code = current.stock_code
+                              AND prior.trade_date < current.trade_date
+                            ORDER BY prior.trade_date DESC,
+                                     CASE WHEN prior.source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                                     prior.created_at DESC, prior.id DESC
+                            LIMIT 1
+                        ) previous ON true
+                        WHERE abs(current.adj_factor - previous.adj_factor) > 1e-12
+                    ),
+                    reference AS (
+                        SELECT changed.*, factor.trade_date AS reference_date,
+                               factor.close_qfq AS stored_qfq_close,
+                               bar.close_price AS bfq_close,
+                               reference_adjustment.adj_factor AS reference_factor
+                        FROM changed
+                        JOIN LATERAL (
+                            SELECT stock_code, trade_date, close_qfq
+                            FROM t_stock_factor_daily item
+                            WHERE item.stock_code = changed.stock_code
+                              AND item.trade_date < changed.trade_date
+                              AND item.close_qfq IS NOT NULL
+                            ORDER BY item.trade_date DESC
+                            LIMIT 1
+                        ) factor ON true
+                        JOIN t_daily_bar bar
+                          ON bar.stock_code = factor.stock_code
+                         AND bar.trade_date = factor.trade_date
+                        JOIN LATERAL (
+                            SELECT adj_factor
+                            FROM t_stock_adjust_factor item
+                            WHERE item.stock_code = changed.stock_code
+                              AND item.trade_date <= factor.trade_date
+                            ORDER BY item.trade_date DESC,
+                                     CASE WHEN item.source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                                     item.created_at DESC, item.id DESC
+                            LIMIT 1
+                        ) reference_adjustment ON true
+                    ),
+                    scales AS (
+                        SELECT stock_code, trade_date,
+                               (bfq_close * reference_factor / nullif(current_factor, 0))
+                                   / nullif(stored_qfq_close, 0) AS scale
+                        FROM reference
+                    )
+                    UPDATE t_stock_factor_daily target
+                    SET open_qfq = target.open_qfq * scales.scale,
+                        high_qfq = target.high_qfq * scales.scale,
+                        low_qfq = target.low_qfq * scales.scale,
+                        close_qfq = target.close_qfq * scales.scale,
+                        pre_close_qfq = target.pre_close_qfq * scales.scale,
+                        ma5 = target.ma5 * scales.scale,
+                        ma10 = target.ma10 * scales.scale,
+                        ma20 = target.ma20 * scales.scale,
+                        ma30 = target.ma30 * scales.scale,
+                        ma60 = target.ma60 * scales.scale,
+                        ma90 = target.ma90 * scales.scale,
+                        ma250 = target.ma250 * scales.scale,
+                        ema5 = target.ema5 * scales.scale,
+                        ema10 = target.ema10 * scales.scale,
+                        ema20 = target.ema20 * scales.scale,
+                        ema30 = target.ema30 * scales.scale,
+                        ema60 = target.ema60 * scales.scale,
+                        ema90 = target.ema90 * scales.scale,
+                        ema250 = target.ema250 * scales.scale,
+                        macd = target.macd * scales.scale,
+                        macd_dif = target.macd_dif * scales.scale,
+                        macd_dea = target.macd_dea * scales.scale,
+                        boll_upper = target.boll_upper * scales.scale,
+                        boll_mid = target.boll_mid * scales.scale,
+                        boll_lower = target.boll_lower * scales.scale,
+                        atr = target.atr * scales.scale,
+                        bbi = target.bbi * scales.scale,
+                        mtm = target.mtm * scales.scale,
+                        mtmma = target.mtmma * scales.scale,
+                        asi = target.asi * scales.scale,
+                        asit = target.asit * scales.scale,
+                        dfma_dif = target.dfma_dif * scales.scale,
+                        dfma_difma = target.dfma_difma * scales.scale,
+                        dpo = target.dpo * scales.scale,
+                        madpo = target.madpo * scales.scale,
+                        emv = target.emv * scales.scale,
+                        maemv = target.maemv * scales.scale,
+                        expma12 = target.expma12 * scales.scale,
+                        expma50 = target.expma50 * scales.scale,
+                        keltner_lower = target.keltner_lower * scales.scale,
+                        keltner_mid = target.keltner_mid * scales.scale,
+                        keltner_upper = target.keltner_upper * scales.scale,
+                        taq_lower = target.taq_lower * scales.scale,
+                        taq_mid = target.taq_mid * scales.scale,
+                        taq_upper = target.taq_upper * scales.scale,
+                        xsii_td1 = target.xsii_td1 * scales.scale,
+                        xsii_td2 = target.xsii_td2 * scales.scale,
+                        xsii_td3 = target.xsii_td3 * scales.scale,
+                        xsii_td4 = target.xsii_td4 * scales.scale,
+                        high_20d = target.high_20d * scales.scale,
+                        low_20d = target.low_20d * scales.scale,
+                        high_60d = target.high_60d * scales.scale,
+                        low_60d = target.low_60d * scales.scale,
+                        high_120d = target.high_120d * scales.scale,
+                        low_120d = target.low_120d * scales.scale,
+                        high_250d = target.high_250d * scales.scale,
+                        low_250d = target.low_250d * scales.scale,
+                        price_source = CASE
+                            WHEN coalesce(target.price_source, '') LIKE '%system:qfq_rebase%'
+                                THEN target.price_source
+                            ELSE concat_ws('+', nullif(target.price_source, ''), 'system:qfq_rebase')
+                        END,
+                        technical_source = CASE
+                            WHEN coalesce(target.technical_source, '') LIKE '%system:qfq_rebase%'
+                                THEN target.technical_source
+                            ELSE concat_ws('+', nullif(target.technical_source, ''), 'system:qfq_rebase')
+                        END,
+                        quality_flags = array_append(
+                            array_remove(coalesce(target.quality_flags, ARRAY[]::text[]), 'qfq_basis_rebased'),
+                            'qfq_basis_rebased'
+                        ),
+                        calculation_revision = 'stock_daily_final_r1',
+                        calculated_at = now(),
+                        updated_at = now()
+                    FROM scales
+                    WHERE target.stock_code = scales.stock_code
+                      AND target.trade_date < scales.trade_date
+                      AND scales.scale BETWEEN 0.01 AND 100
+                      AND abs(scales.scale - 1) > 1e-8
+                    RETURNING target.id
+                    """
+                ),
+                {"trade_date": trade_date},
+            )
+        ).all()
+        return len(rows)
+
+    async def _fill_local_technical_core(
+        self,
+        stock_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+        history_start: date,
+    ) -> int:
+        """Fill only missing strategy-core indicators from a local QFQ series.
+
+        The provider remains authoritative.  Existing provider values are
+        never overwritten; this path makes a temporary ``stk_factor_pro``
+        delay non-blocking for strategies that only need the core indicators.
+        """
+        if not stock_codes:
+            return 0
+        qfq_rows = (
+            await self.session.execute(
+                text(
+                    """
+                    WITH bars AS (
+                        SELECT DISTINCT ON (bar.stock_code, bar.trade_date)
+                            bar.stock_code, bar.trade_date, bar.open_price,
+                            bar.high_price, bar.low_price, bar.close_price
+                        FROM t_daily_bar bar
+                        WHERE bar.stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                          AND bar.trade_date BETWEEN :history_start AND :end_date
+                        ORDER BY bar.stock_code, bar.trade_date,
+                                 CASE bar.source WHEN 'tushare:daily' THEN 0
+                                     WHEN 'akshare_qfq' THEN 1 WHEN 'mootdx' THEN 2 ELSE 9 END,
+                                 bar.updated_at DESC, bar.id DESC
+                    ),
+                    adjustments AS (
+                        SELECT DISTINCT ON (stock_code, trade_date)
+                            stock_code, trade_date, adj_factor
+                        FROM t_stock_adjust_factor
+                        WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                          AND trade_date BETWEEN :history_start AND :end_date
+                        ORDER BY stock_code, trade_date,
+                                 CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                                 created_at DESC, id DESC
+                    ),
+                    latest_adjustments AS (
+                        SELECT DISTINCT ON (stock_code)
+                            stock_code, adj_factor AS latest_adj_factor
+                        FROM t_stock_adjust_factor
+                        WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                        ORDER BY stock_code, trade_date DESC,
+                                 CASE WHEN source = 'tushare:adj_factor' THEN 0 ELSE 9 END,
+                                 created_at DESC, id DESC
+                    ),
+                    series AS (
+                        SELECT bars.*, adjustments.adj_factor, latest.latest_adj_factor
+                        FROM bars
+                        LEFT JOIN adjustments USING (stock_code, trade_date)
+                        LEFT JOIN latest_adjustments latest USING (stock_code)
+                    )
+                    SELECT stock_code, trade_date,
+                           open_price * adj_factor / nullif(latest_adj_factor, 0) AS open_qfq,
+                           high_price * adj_factor / nullif(latest_adj_factor, 0) AS high_qfq,
+                           low_price * adj_factor / nullif(latest_adj_factor, 0) AS low_qfq,
+                           close_price * adj_factor / nullif(latest_adj_factor, 0) AS close_qfq
+                    FROM series
+                    WHERE adj_factor IS NOT NULL
+                    ORDER BY stock_code, trade_date
+                    """
+                ).bindparams(bindparam("stock_codes", type_=ARRAY(String()))),
+                {
+                    "stock_codes": stock_codes,
+                    "history_start": history_start,
+                    "end_date": end_date,
+                },
+            )
+        ).mappings().all()
+        current_rows = (
+            await self.session.execute(
+                select(StockFactorDaily).where(
+                    StockFactorDaily.stock_code.in_(stock_codes),
+                    StockFactorDaily.trade_date.between(start_date, end_date),
+                )
+            )
+        ).scalars().all()
+        current_by_key = {(row.stock_code, row.trade_date): row for row in current_rows}
+        by_stock: dict[str, list[dict]] = {}
+        for raw in qfq_rows:
+            if raw["close_qfq"] is not None:
+                by_stock.setdefault(str(raw["stock_code"]), []).append(dict(raw))
+
+        fallback_rows: list[dict] = []
+        for stock_code, series in by_stock.items():
+            closes: list[float] = []
+            highs: list[float] = []
+            lows: list[float] = []
+            gains: list[float] = []
+            losses: list[float] = []
+            ema_values = {period: None for period in (5, 10, 12, 20, 26, 30, 60, 90, 250)}
+            dea = None
+            k_value = d_value = 50.0
+            previous_close = None
+            true_ranges: list[float] = []
+            for item in series:
+                close = float(item["close_qfq"])
+                high = float(item["high_qfq"] or close)
+                low = float(item["low_qfq"] or close)
+                closes.append(close)
+                highs.append(high)
+                lows.append(low)
+                change = 0.0 if previous_close is None else close - previous_close
+                gains.append(max(change, 0.0))
+                losses.append(max(-change, 0.0))
+                true_ranges.append(
+                    high - low if previous_close is None else max(high - low, abs(high - previous_close), abs(low - previous_close))
+                )
+                for period in ema_values:
+                    previous = ema_values[period]
+                    alpha = 2.0 / (period + 1)
+                    ema_values[period] = close if previous is None else close * alpha + previous * (1 - alpha)
+                dif = float(ema_values[12]) - float(ema_values[26])
+                dea = dif if dea is None else dif * (2.0 / 10.0) + dea * (8.0 / 10.0)
+                macd = 2 * (dif - dea)
+                high9 = max(highs[-9:])
+                low9 = min(lows[-9:])
+                rsv = 50.0 if high9 == low9 else (close - low9) / (high9 - low9) * 100
+                k_value = k_value * 2 / 3 + rsv / 3
+                d_value = d_value * 2 / 3 + k_value / 3
+                j_value = 3 * k_value - 2 * d_value
+
+                if item["trade_date"] < start_date or item["trade_date"] > end_date:
+                    previous_close = close
+                    continue
+                current = current_by_key.get((stock_code, item["trade_date"]))
+                if current is None:
+                    previous_close = close
+                    continue
+                needs_core_fallback = current.technical_core_status != "ready"
+                needs_rsi14 = current.rsi14 is None
+                if not needs_core_fallback and not needs_rsi14:
+                    previous_close = close
+                    continue
+                middle = sum(closes[-20:]) / len(closes[-20:])
+                variance = sum((value - middle) ** 2 for value in closes[-20:]) / len(closes[-20:])
+                boll_std = variance ** 0.5
+
+                def rsi(period: int) -> float:
+                    avg_gain = sum(gains[-period:]) / len(gains[-period:])
+                    avg_loss = sum(losses[-period:]) / len(losses[-period:])
+                    if avg_loss == 0:
+                        return 100.0 if avg_gain > 0 else 50.0
+                    rs = avg_gain / avg_loss
+                    return 100 - 100 / (1 + rs)
+
+                flag_set = set(current.quality_flags or [])
+                if needs_core_fallback:
+                    # The group is ready after this local rebuild. Keep a
+                    # provenance flag, not a stale "technical_core missing"
+                    # flag that would contradict the typed status column.
+                    flag_set.discard("technical_core")
+                    flag_set.add("technical_pro_missing_local_core_fallback")
+                flags = sorted(flag_set)
+                if needs_core_fallback:
+                    technical_source = (
+                        "tushare:stk_factor_pro+local:qfq_core"
+                        if current.technical_source == "tushare:stk_factor_pro"
+                        else "local:t_daily_bar+adjust_factor"
+                    )
+                else:
+                    technical_source = "tushare:stk_factor_pro+local:rsi14"
+                fallback_rows.append(
+                    {
+                        "stock_code": stock_code,
+                        "trade_date": item["trade_date"],
+                        "price_basis": "qfq",
+                        "technical_core_status": "ready",
+                        "technical_extended_status": current.technical_extended_status or "missing",
+                        "technical_source": technical_source,
+                        "quality_flags": flags,
+                        "ema5": ema_values[5], "ema10": ema_values[10], "ema20": ema_values[20],
+                        "ema30": ema_values[30], "ema60": ema_values[60], "ema90": ema_values[90],
+                        "ema250": ema_values[250],
+                        "macd": macd, "macd_dif": dif, "macd_dea": dea,
+                        "kdj_k": k_value, "kdj_d": d_value, "kdj_j": j_value,
+                        "rsi6": rsi(6), "rsi12": rsi(12), "rsi24": rsi(24), "rsi14": rsi(14),
+                        "boll_mid": middle, "boll_upper": middle + 2 * boll_std,
+                        "boll_lower": middle - 2 * boll_std,
+                        "atr": sum(true_ranges[-14:]) / len(true_ranges[-14:]),
+                        "calculation_revision": "stock_daily_final_r1",
+                        "calculated_at": datetime.now(ZoneInfo("Asia/Shanghai")),
+                    }
+                )
+                previous_close = close
+
+        if not fallback_rows:
+            return 0
+        update_columns = (
+            "ema5", "ema10", "ema20", "ema30", "ema60", "ema90", "ema250",
+            "macd", "macd_dif", "macd_dea", "kdj_k", "kdj_d", "kdj_j",
+            "rsi6", "rsi12", "rsi24", "rsi14", "boll_mid", "boll_upper", "boll_lower", "atr",
+        )
+        for batch in _chunked(fallback_rows, _safe_batch_size(fallback_rows)):
+            stmt = insert(StockFactorDaily).values(batch)
+            values = {name: func.coalesce(getattr(StockFactorDaily, name), stmt.excluded[name]) for name in update_columns}
+            values.update(
+                {
+                    "technical_core_status": "ready",
+                    "technical_source": stmt.excluded.technical_source,
+                    "quality_flags": stmt.excluded.quality_flags,
+                    "calculation_revision": stmt.excluded.calculation_revision,
+                    "calculated_at": func.now(),
+                    "updated_at": func.now(),
+                }
+            )
+            await self.session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[StockFactorDaily.stock_code, StockFactorDaily.trade_date],
+                    set_=values,
+                )
+            )
+        return len(fallback_rows)
+
+    async def _fill_relative_csi300(
+        self,
+        stock_codes: list[str],
+        *,
+        start_date: date,
+        end_date: date,
+        history_start: date,
+    ) -> int:
+        """Fill typed relative-strength columns against the settled CSI 300 close."""
+        if not stock_codes:
+            return 0
+        result = await self.session.execute(
+            text(
+                """
+                WITH index_returns AS (
+                    SELECT trade_date, close_price,
+                           (close_price / nullif(lag(close_price, 5) OVER (ORDER BY trade_date), 0) - 1) * 100 AS return5,
+                           (close_price / nullif(lag(close_price, 20) OVER (ORDER BY trade_date), 0) - 1) * 100 AS return20,
+                           (close_price / nullif(lag(close_price, 60) OVER (ORDER BY trade_date), 0) - 1) * 100 AS return60
+                    FROM t_index_bar
+                    WHERE index_code = :csi300_code
+                      AND trade_date BETWEEN :history_start AND :end_date
+                )
+                UPDATE t_stock_factor_daily factor
+                SET relative_csi300_5d_pct = factor.return_5d_pct - benchmark.return5,
+                    relative_csi300_20d_pct = factor.return_20d_pct - benchmark.return20,
+                    relative_csi300_60d_pct = factor.return_60d_pct - benchmark.return60,
+                    calculated_at = now(), updated_at = now()
+                FROM index_returns benchmark
+                WHERE factor.trade_date = benchmark.trade_date
+                  AND factor.stock_code = ANY(CAST(:stock_codes AS varchar[]))
+                  AND factor.trade_date BETWEEN :start_date AND :end_date
+                RETURNING factor.trade_date
+                """
+            ).bindparams(bindparam("stock_codes", type_=ARRAY(String()))),
+            {
+                "stock_codes": stock_codes,
+                "csi300_code": CSI300_CANONICAL_CODE,
+                "start_date": start_date,
+                "end_date": end_date,
+                "history_start": history_start,
+            },
+        )
+        return len(result.all())
+
+    async def refresh_stock_daily_final_percentiles(
         self,
         *,
         start_date: date,
         end_date: date,
     ) -> dict[date, int]:
-        """Refresh full-market fund percentiles once after a V2 date window is assembled."""
-        statement = text(
-            """
-            WITH fund_cross_section AS (
-                SELECT
-                    stock_code,
-                    trade_date,
-                    cume_dist() OVER (
-                        PARTITION BY trade_date
-                        ORDER BY main_net_inflow
-                    ) * 100 AS fund_strength_percentile
-                FROM t_stock_fund_flow_daily
-                WHERE trade_date BETWEEN :start_date AND :end_date
-                  AND main_net_inflow IS NOT NULL
-            )
-            UPDATE t_stock_factor_daily_v2 AS factor
-            SET fund_strength_percentile = cross_section.fund_strength_percentile,
-                updated_at = now()
-            FROM fund_cross_section AS cross_section
-            WHERE factor.stock_code = cross_section.stock_code
-              AND factor.trade_date = cross_section.trade_date
-              AND factor.factor_set_version = 'stock_daily_v2'
-              AND factor.trade_date BETWEEN :start_date AND :end_date
-              AND factor.fund_strength_percentile IS DISTINCT FROM cross_section.fund_strength_percentile
-            RETURNING factor.trade_date
-            """
-        )
+        """Refresh all cross-sectional ranks once after stock batches finish."""
         rows = (
             await self.session.execute(
-                statement,
+                text(
+                    """
+                    WITH ranked AS (
+                        SELECT factor.stock_code, factor.trade_date,
+                            cume_dist() OVER (PARTITION BY factor.trade_date ORDER BY factor.return_1d_pct) * 100 AS return_p1,
+                            cume_dist() OVER (PARTITION BY factor.trade_date ORDER BY factor.return_5d_pct) * 100 AS return_p5,
+                            cume_dist() OVER (PARTITION BY factor.trade_date ORDER BY factor.return_20d_pct) * 100 AS return_p20,
+                            cume_dist() OVER (PARTITION BY factor.trade_date ORDER BY bar.amount_yuan) * 100 AS amount_p,
+                            cume_dist() OVER (PARTITION BY factor.trade_date ORDER BY factor.turnover_rate_pct) * 100 AS turnover_p,
+                            cume_dist() OVER (PARTITION BY factor.trade_date ORDER BY factor.main_net_inflow_yuan) * 100 AS fund_p
+                        FROM t_stock_factor_daily factor
+                        LEFT JOIN t_daily_bar bar USING (stock_code, trade_date)
+                        WHERE factor.trade_date BETWEEN :start_date AND :end_date
+                    )
+                    UPDATE t_stock_factor_daily factor
+                    SET return_percentile_1d = ranked.return_p1,
+                        return_percentile_5d = ranked.return_p5,
+                        return_percentile_20d = ranked.return_p20,
+                        amount_percentile = ranked.amount_p,
+                        turnover_percentile = ranked.turnover_p,
+                        main_net_inflow_percentile = ranked.fund_p,
+                        calculated_at = now(), updated_at = now()
+                    FROM ranked
+                    WHERE factor.stock_code = ranked.stock_code
+                      AND factor.trade_date = ranked.trade_date
+                    RETURNING factor.trade_date
+                    """
+                ),
                 {"start_date": start_date, "end_date": end_date},
             )
         ).all()
         updated: dict[date, int] = {}
-        for (trade_date,) in rows:
-            updated[trade_date] = updated.get(trade_date, 0) + 1
+        for (row_date,) in rows:
+            updated[row_date] = updated.get(row_date, 0) + 1
         return updated
 
-    async def existing_stock_daily_v2_ready_codes(
-        self,
-        stock_codes: list[str],
-        *,
-        trade_date: date,
-    ) -> set[str]:
-        if not stock_codes:
-            return set()
-        statement = text(
-            """
-            SELECT stock_code
-            FROM t_stock_factor_daily_v2
-            WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
-              AND trade_date = :trade_date
-              AND factor_set_version = 'stock_daily_v2'
-              AND factor_status = 'ready'
-            """
-        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
-        rows = await self.session.execute(
-            statement,
-            {"stock_codes": stock_codes, "trade_date": trade_date},
-        )
-        return set(rows.scalars().all())
-
-    async def load_stock_daily_v2_ready_keys_between(
+    async def load_stock_daily_ready_keys_between(
         self,
         stock_codes: list[str],
         *,
@@ -1330,226 +1042,22 @@ class IndicatorRepository:
     ) -> set[tuple[str, date]]:
         if not stock_codes:
             return set()
-        statement = text(
-            """
-            SELECT stock_code, trade_date
-            FROM t_stock_factor_daily_v2
-            WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
-              AND trade_date BETWEEN :start_date AND :end_date
-              AND factor_set_version = 'stock_daily_v2'
-              AND factor_status = 'ready'
-            """
-        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
         rows = await self.session.execute(
-            statement,
-            {
-                "stock_codes": stock_codes,
-                "start_date": start_date,
-                "end_date": end_date,
-            },
-        )
-        return {(stock_code, trade_date) for stock_code, trade_date in rows.all()}
-
-    async def clear_technical_snapshot_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
-        if not stock_codes:
-            return 0
-        start = datetime.combine(trade_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
-        end = datetime.combine(
-            trade_date.fromordinal(trade_date.toordinal() + 1),
-            datetime.min.time(),
-            tzinfo=ZoneInfo("Asia/Shanghai"),
-        )
-        deleted = 0
-        for codes in _chunked(stock_codes, 1000):
-            result = await self.session.execute(
-                delete(TechnicalIndicatorSnapshot).where(
-                    TechnicalIndicatorSnapshot.stock_code.in_(codes),
-                    TechnicalIndicatorSnapshot.source == "system:daily_close",
-                    TechnicalIndicatorSnapshot.snapshot_time >= start,
-                    TechnicalIndicatorSnapshot.snapshot_time < end,
-                )
-            )
-            deleted += int(result.rowcount or 0)
-        return deleted
-
-    async def clear_technical_snapshot_rows_between(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-    ) -> int:
-        if not stock_codes:
-            return 0
-        start = datetime.combine(start_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
-        end = datetime.combine(
-            end_date.fromordinal(end_date.toordinal() + 1),
-            datetime.min.time(),
-            tzinfo=ZoneInfo("Asia/Shanghai"),
-        )
-        deleted = 0
-        for offset in range(0, len(stock_codes), 1000):
-            result = await self.session.execute(
-                delete(TechnicalIndicatorSnapshot).where(
-                    TechnicalIndicatorSnapshot.stock_code.in_(stock_codes[offset : offset + 1000]),
-                    TechnicalIndicatorSnapshot.snapshot_time >= start,
-                    TechnicalIndicatorSnapshot.snapshot_time < end,
-                    TechnicalIndicatorSnapshot.source == "system:daily_close",
-                )
-            )
-            deleted += int(result.rowcount or 0)
-        return deleted
-
-    async def backfill_technical_snapshots_set_based(
-        self,
-        stock_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-        only_missing: bool,
-    ) -> dict[date, int]:
-        """Build EOD snapshots from canonical daily/minute bars and daily factors."""
-        if not stock_codes:
-            return {}
-        conflict_clause = (
-            "DO NOTHING"
-            if only_missing
-            else """DO UPDATE SET
-                last_price = EXCLUDED.last_price,
-                change_pct = EXCLUDED.change_pct,
-                intraday_strength = EXCLUDED.intraday_strength,
-                volume_score = EXCLUDED.volume_score,
-                trend_score = EXCLUDED.trend_score,
-                factor_payload = EXCLUDED.factor_payload"""
-        )
-        statement = text(
-            f"""
-            WITH ranked_bars AS (
-                SELECT
-                    bar.*,
-                    row_number() OVER (
-                        PARTITION BY bar.stock_code, bar.trade_date
-                        ORDER BY CASE bar.source
-                            WHEN 'tushare:daily' THEN 0
-                            WHEN 'akshare_qfq' THEN 1
-                            WHEN 'mootdx' THEN 2
-                            ELSE 9
-                        END, bar.updated_at DESC, bar.id DESC
-                    ) AS source_rank
-                FROM t_daily_bar AS bar
-                WHERE bar.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND bar.trade_date BETWEEN :start_date AND :end_date
-            ),
-            factors AS (
-                SELECT DISTINCT ON (stock_code, trade_date)
-                    stock_code, trade_date, ma5, ma10, ma20, return_1d
+            text(
+                """
+                SELECT stock_code, trade_date
                 FROM t_stock_factor_daily
                 WHERE stock_code = ANY(CAST(:stock_codes AS varchar[]))
                   AND trade_date BETWEEN :start_date AND :end_date
-                ORDER BY stock_code, trade_date,
-                    CASE WHEN source = 'system:daily_close' THEN 0 ELSE 9 END,
-                    created_at DESC, id DESC
-            ),
-            minute_metrics AS (
-                SELECT
-                    minute.stock_code,
-                    minute.trade_date,
-                    minute.bar_time,
-                    minute.price,
-                    minute.volume_hand,
-                    min(minute.price) OVER (
-                        PARTITION BY minute.stock_code, minute.trade_date
-                    ) AS day_low,
-                    max(minute.price) OVER (
-                        PARTITION BY minute.stock_code, minute.trade_date
-                    ) AS day_high,
-                    avg(minute.volume_hand) FILTER (
-                        WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
-                    ) OVER (
-                        PARTITION BY minute.stock_code, minute.trade_date
-                        ORDER BY minute.bar_time
-                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
-                    ) AS previous_volume_mean_20,
-                    count(minute.volume_hand) FILTER (
-                        WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
-                    ) OVER (
-                        PARTITION BY minute.stock_code, minute.trade_date
-                        ORDER BY minute.bar_time
-                        ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
-                    ) AS previous_volume_count_20,
-                    row_number() OVER (
-                        PARTITION BY minute.stock_code, minute.trade_date
-                        ORDER BY minute.bar_time DESC, minute.id DESC
-                    ) AS latest_rank
-                FROM t_minute_bar AS minute
-                WHERE minute.stock_code = ANY(CAST(:stock_codes AS varchar[]))
-                  AND minute.trade_date BETWEEN :start_date AND :end_date
-            ),
-            latest_minute AS (
-                SELECT * FROM minute_metrics WHERE latest_rank = 1
-            )
-            INSERT INTO t_technical_indicator_snapshot (
-                stock_code, snapshot_time, source, last_price, change_pct,
-                intraday_strength, volume_score, trend_score, factor_payload, created_at
-            )
-            SELECT
-                bar.stock_code,
-                (bar.trade_date::timestamp + time '15:00') AT TIME ZONE 'Asia/Shanghai',
-                'system:daily_close',
-                bar.close_price,
-                bar.change_pct,
-                coalesce(
-                    (minute.price - minute.day_low) / NULLIF(minute.day_high - minute.day_low, 0),
-                    bar.change_pct
-                ),
-                CASE
-                    WHEN minute.previous_volume_count_20 = 20
-                     AND minute.previous_volume_mean_20 <> 0
-                    THEN LEAST(minute.volume_hand / minute.previous_volume_mean_20 * 20, 100)
-                END,
-                CASE
-                    WHEN factor.ma5 IS NULL OR factor.ma10 IS NULL THEN NULL
-                    ELSE LEAST(
-                        50
-                        + CASE WHEN factor.ma5 > factor.ma10 THEN 20 ELSE 0 END
-                        + CASE WHEN factor.ma20 IS NOT NULL AND factor.ma10 > factor.ma20 THEN 20 ELSE 0 END
-                        + CASE WHEN factor.return_1d > 0 THEN 10 ELSE 0 END,
-                        100
-                    )
-                END,
-                jsonb_build_object(
-                    'daily_factor_trade_date', CASE WHEN factor.trade_date IS NULL THEN NULL ELSE factor.trade_date::text END,
-                    'minute_factor_bar_time', CASE WHEN minute.bar_time IS NULL THEN NULL ELSE minute.bar_time::text END,
-                    'daily_bar_id', bar.id,
-                    'price_source', 't_daily_bar'
-                ),
-                now()
-            FROM ranked_bars AS bar
-            LEFT JOIN factors AS factor
-              ON factor.stock_code = bar.stock_code
-             AND factor.trade_date = bar.trade_date
-            LEFT JOIN latest_minute AS minute
-              ON minute.stock_code = bar.stock_code
-             AND minute.trade_date = bar.trade_date
-            WHERE bar.source_rank = 1
-            ON CONFLICT (stock_code, snapshot_time, source) {conflict_clause}
-            RETURNING (snapshot_time AT TIME ZONE 'Asia/Shanghai')::date
-            """
-        ).bindparams(bindparam("stock_codes", type_=ARRAY(String())))
-        rows = (
-            await self.session.execute(
-                statement,
-                {
-                    "stock_codes": stock_codes,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                },
-            )
-        ).all()
-        written: dict[date, int] = {}
-        for (trade_date,) in rows:
-            written[trade_date] = written.get(trade_date, 0) + 1
-        return written
+                  AND price_status = 'ready'
+                  AND valuation_status = 'ready'
+                  AND fund_status = 'ready'
+                  AND calculation_revision = 'stock_daily_final_r1'
+                """
+            ).bindparams(bindparam("stock_codes", type_=ARRAY(String()))),
+            {"stock_codes": stock_codes, "start_date": start_date, "end_date": end_date},
+        )
+        return {(stock_code, row_date) for stock_code, row_date in rows.all()}
 
     async def clear_minute_factor_rows(self, stock_codes: list[str], *, trade_date: date) -> int:
         if not stock_codes:
@@ -1617,6 +1125,30 @@ class IndicatorRepository:
                         ORDER BY minute.bar_time, minute.id
                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                     ) AS running_high,
+                    lag(minute.price, 1) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                    ) AS price_1m_ago,
+                    lag(minute.price, 5) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                    ) AS price_5m_ago,
+                    lag(minute.price, 15) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id
+                    ) AS price_15m_ago,
+                    avg(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                    ) AS ma5,
+                    avg(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                    ) AS ma10,
+                    avg(minute.price) OVER (
+                        PARTITION BY minute.stock_code, minute.trade_date
+                        ORDER BY minute.bar_time, minute.id ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ) AS ma20,
                     avg(minute.volume_hand) FILTER (
                         WHERE minute.volume_hand IS NOT NULL AND minute.volume_hand > 0
                     ) OVER (
@@ -1645,8 +1177,9 @@ class IndicatorRepository:
             upserted AS (
                 INSERT INTO t_stock_factor_minute (
                     stock_code, trade_date, bar_time, source,
-                    vwap, minute_return, volume_spike_ratio, intraday_strength,
-                    features, created_at
+                    vwap, return_1m_pct, return_5m_pct, return_15m_pct,
+                    ma5, ma10, ma20, volume_ratio_20m, intraday_position_ratio,
+                    created_at
                 )
                 SELECT
                     stock_code,
@@ -1654,23 +1187,31 @@ class IndicatorRepository:
                     bar_time,
                     'system:daily_close',
                     cumulative_amount / NULLIF(cumulative_amount_volume * 100, 0),
-                    (price - first_price) / NULLIF(first_price, 0) * 100,
+                    (price - price_1m_ago) / NULLIF(price_1m_ago, 0) * 100,
+                    (price - price_5m_ago) / NULLIF(price_5m_ago, 0) * 100,
+                    (price - price_15m_ago) / NULLIF(price_15m_ago, 0) * 100,
+                    ma5,
+                    ma10,
+                    ma20,
                     CASE
                         WHEN previous_volume_count_20 = 20
                         THEN volume_hand / NULLIF(previous_volume_mean_20, 0)
                     END,
                     (price - running_low) / NULLIF(running_high - running_low, 0),
-                    '{}'::jsonb,
                     now()
                 FROM minute_metrics
                 WHERE price IS NOT NULL
                 ON CONFLICT (stock_code, trade_date, bar_time, source)
                 DO UPDATE SET
                     vwap = EXCLUDED.vwap,
-                    minute_return = EXCLUDED.minute_return,
-                    volume_spike_ratio = EXCLUDED.volume_spike_ratio,
-                    intraday_strength = EXCLUDED.intraday_strength,
-                    features = EXCLUDED.features
+                    return_1m_pct = EXCLUDED.return_1m_pct,
+                    return_5m_pct = EXCLUDED.return_5m_pct,
+                    return_15m_pct = EXCLUDED.return_15m_pct,
+                    ma5 = EXCLUDED.ma5,
+                    ma10 = EXCLUDED.ma10,
+                    ma20 = EXCLUDED.ma20,
+                    volume_ratio_20m = EXCLUDED.volume_ratio_20m,
+                    intraday_position_ratio = EXCLUDED.intraday_position_ratio
                 RETURNING 1
             )
             SELECT count(*) FROM upserted
@@ -1708,135 +1249,6 @@ class IndicatorRepository:
             )
             deleted += int(result.rowcount or 0)
         return deleted
-
-    async def backfill_index_factors_set_based(
-        self,
-        index_codes: list[str],
-        *,
-        start_date: date,
-        end_date: date,
-        history_start: date,
-        only_missing: bool,
-    ) -> dict[date, int]:
-        if not index_codes:
-            return {}
-        conflict_clause = (
-            "DO NOTHING"
-            if only_missing
-            else """DO UPDATE SET
-                source = EXCLUDED.source,
-                ma5 = EXCLUDED.ma5,
-                ma10 = EXCLUDED.ma10,
-                ma20 = EXCLUDED.ma20,
-                ma30 = EXCLUDED.ma30,
-                ma60 = EXCLUDED.ma60,
-                return_1d = EXCLUDED.return_1d,
-                amplitude = EXCLUDED.amplitude,
-                volume_ratio = EXCLUDED.volume_ratio,
-                amount_ratio = EXCLUDED.amount_ratio,
-                volatility_20d = EXCLUDED.volatility_20d,
-                turnover_rate = EXCLUDED.turnover_rate,
-                pe_ttm = EXCLUDED.pe_ttm,
-                pb = EXCLUDED.pb,
-                features = EXCLUDED.features,
-                updated_at = now()"""
-        )
-        statement = text(
-            f"""
-            WITH bars AS (
-                SELECT
-                    bar.*,
-                    lag(close_price) OVER (PARTITION BY index_code ORDER BY trade_date) AS previous_close,
-                    row_number() OVER (PARTITION BY index_code ORDER BY trade_date) AS history_days,
-                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
-                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
-                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
-                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS ma30,
-                    avg(close_price) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS ma60,
-                    avg(volume) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_volume_mean_5,
-                    avg(amount_yuan) OVER (PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 5 PRECEDING AND 1 PRECEDING) AS previous_amount_mean_5
-                FROM t_index_bar AS bar
-                WHERE bar.index_code = ANY(CAST(:index_codes AS varchar[]))
-                  AND bar.trade_date BETWEEN :history_start AND :end_date
-            ),
-            returns AS (
-                SELECT
-                    bars.*,
-                    CASE WHEN previous_close IS NOT NULL AND previous_close <> 0
-                        THEN (close_price - previous_close) / previous_close * 100 END AS close_return
-                FROM bars
-            ),
-            metrics AS (
-                SELECT
-                    returns.*,
-                    stddev_pop(close_return) FILTER (WHERE close_return IS NOT NULL) OVER (
-                        PARTITION BY index_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
-                    ) AS volatility_20d
-                FROM returns
-            )
-            INSERT INTO t_index_factor_daily (
-                index_code, trade_date, source,
-                ma5, ma10, ma20, ma30, ma60,
-                return_1d, amplitude, volume_ratio, amount_ratio, volatility_20d,
-                turnover_rate, pe_ttm, pb, features, created_at, updated_at
-            )
-            SELECT
-                metrics.index_code,
-                metrics.trade_date,
-                'system:history_backfill',
-                metrics.ma5,
-                metrics.ma10,
-                metrics.ma20,
-                metrics.ma30,
-                metrics.ma60,
-                metrics.close_return,
-                CASE WHEN coalesce(metrics.previous_close, metrics.close_price) <> 0
-                    THEN (metrics.high_price - metrics.low_price) / coalesce(metrics.previous_close, metrics.close_price) * 100 END,
-                metrics.volume / NULLIF(metrics.previous_volume_mean_5, 0),
-                metrics.amount_yuan / NULLIF(metrics.previous_amount_mean_5, 0),
-                metrics.volatility_20d,
-                basic.turnover_rate,
-                basic.pe_ttm,
-                basic.pb,
-                jsonb_build_object(
-                    'history_days', metrics.history_days,
-                    'missing_windows', to_jsonb(array_remove(ARRAY[
-                        CASE WHEN metrics.history_days < 5 THEN 'ma5' END,
-                        CASE WHEN metrics.history_days < 10 THEN 'ma10' END,
-                        CASE WHEN metrics.history_days < 20 THEN 'ma20' END,
-                        CASE WHEN metrics.history_days < 30 THEN 'ma30' END,
-                        CASE WHEN metrics.history_days < 60 THEN 'ma60' END,
-                        CASE WHEN metrics.history_days < 21 THEN 'volatility_20d' END,
-                        CASE WHEN basic.index_code IS NULL THEN 'index_daily_basic' END
-                    ]::text[], NULL)),
-                    'source_tables', jsonb_build_array('t_index_bar', 't_index_daily_basic')
-                ),
-                now(),
-                now()
-            FROM metrics
-            LEFT JOIN t_index_daily_basic AS basic
-              ON basic.index_code = metrics.index_code
-             AND basic.trade_date = metrics.trade_date
-            WHERE metrics.trade_date BETWEEN :start_date AND :end_date
-            ON CONFLICT (index_code, trade_date) {conflict_clause}
-            RETURNING trade_date
-            """
-        ).bindparams(bindparam("index_codes", type_=ARRAY(String())))
-        rows = (
-            await self.session.execute(
-                statement,
-                {
-                    "index_codes": index_codes,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "history_start": history_start,
-                },
-            )
-        ).all()
-        written: dict[date, int] = {}
-        for (trade_date,) in rows:
-            written[trade_date] = written.get(trade_date, 0) + 1
-        return written
 
     async def load_sector_factor_inputs(self, *, trade_date: date, lookback_days: int = 30) -> dict:
         start_date = trade_date.fromordinal(trade_date.toordinal() - lookback_days)
@@ -1930,24 +1342,40 @@ class IndicatorRepository:
     async def upsert_daily_factors(self, rows: list[dict]) -> int:
         if not rows:
             return 0
+        normalized_rows: list[dict] = []
+        for source_row in rows:
+            row = dict(source_row)
+            features = row.pop("features", {}) or {}
+            row["local_source"] = row.pop("source", "system:daily_close")
+            row["return_1d_pct"] = row.pop("return_1d", None)
+            row["amplitude_1d_pct"] = row.pop("amplitude", None)
+            row["volume_ratio_5d"] = row.pop("volume_ratio", None)
+            row["amount_ratio_5d"] = row.pop("amount_ratio", None)
+            row["close_position_ratio"] = row.pop("close_position", None)
+            row["history_days"] = int(features.get("history_days") or row.get("history_days") or 0)
+            row["calculation_revision"] = "stock_daily_final_r1"
+            normalized_rows.append(row)
+        rows = normalized_rows
         for batch in _chunked(rows, _safe_batch_size(rows)):
             stmt = insert(StockFactorDaily).values(batch)
             await self.session.execute(
                 stmt.on_conflict_do_update(
-                    index_elements=[StockFactorDaily.stock_code, StockFactorDaily.trade_date, StockFactorDaily.source],
+                    index_elements=[StockFactorDaily.stock_code, StockFactorDaily.trade_date],
                     set_={
                         "ma5": stmt.excluded.ma5,
                         "ma10": stmt.excluded.ma10,
                         "ma20": stmt.excluded.ma20,
                         "ma30": stmt.excluded.ma30,
                         "ma60": stmt.excluded.ma60,
-                        "return_1d": stmt.excluded.return_1d,
-                        "amplitude": stmt.excluded.amplitude,
-                        "volume_ratio": stmt.excluded.volume_ratio,
-                        "amount_ratio": stmt.excluded.amount_ratio,
+                        "return_1d_pct": stmt.excluded.return_1d_pct,
+                        "amplitude_1d_pct": stmt.excluded.amplitude_1d_pct,
+                        "volume_ratio_5d": stmt.excluded.volume_ratio_5d,
+                        "amount_ratio_5d": stmt.excluded.amount_ratio_5d,
                         "volatility_20d": stmt.excluded.volatility_20d,
-                        "close_position": stmt.excluded.close_position,
-                        "features": stmt.excluded.features,
+                        "close_position_ratio": stmt.excluded.close_position_ratio,
+                        "history_days": stmt.excluded.history_days,
+                        "local_source": stmt.excluded.local_source,
+                        "calculated_at": func.now(),
                     },
                 )
             )
@@ -1968,34 +1396,14 @@ class IndicatorRepository:
                     ],
                     set_={
                         "vwap": stmt.excluded.vwap,
-                        "minute_return": stmt.excluded.minute_return,
-                        "volume_spike_ratio": stmt.excluded.volume_spike_ratio,
-                        "intraday_strength": stmt.excluded.intraday_strength,
-                        "features": stmt.excluded.features,
-                    },
-                )
-            )
-        return len(rows)
-
-    async def upsert_technical_snapshots(self, rows: list[dict]) -> int:
-        if not rows:
-            return 0
-        for batch in _chunked(rows, _safe_batch_size(rows)):
-            stmt = insert(TechnicalIndicatorSnapshot).values(batch)
-            await self.session.execute(
-                stmt.on_conflict_do_update(
-                    index_elements=[
-                        TechnicalIndicatorSnapshot.stock_code,
-                        TechnicalIndicatorSnapshot.snapshot_time,
-                        TechnicalIndicatorSnapshot.source,
-                    ],
-                    set_={
-                        "last_price": stmt.excluded.last_price,
-                        "change_pct": stmt.excluded.change_pct,
-                        "intraday_strength": stmt.excluded.intraday_strength,
-                        "volume_score": stmt.excluded.volume_score,
-                        "trend_score": stmt.excluded.trend_score,
-                        "factor_payload": stmt.excluded.factor_payload,
+                        "return_1m_pct": stmt.excluded.return_1m_pct,
+                        "return_5m_pct": stmt.excluded.return_5m_pct,
+                        "return_15m_pct": stmt.excluded.return_15m_pct,
+                        "ma5": stmt.excluded.ma5,
+                        "ma10": stmt.excluded.ma10,
+                        "ma20": stmt.excluded.ma20,
+                        "volume_ratio_20m": stmt.excluded.volume_ratio_20m,
+                        "intraday_position_ratio": stmt.excluded.intraday_position_ratio,
                     },
                 )
             )
@@ -2014,19 +1422,607 @@ class IndicatorRepository:
                         "sector_type": stmt.excluded.sector_type,
                         "source": stmt.excluded.source,
                         "fund_strength": stmt.excluded.fund_strength,
-                        "net_inflow_3d": stmt.excluded.net_inflow_3d,
-                        "net_inflow_5d": stmt.excluded.net_inflow_5d,
-                        "net_inflow_10d": stmt.excluded.net_inflow_10d,
+                        "main_net_inflow_yuan": stmt.excluded.main_net_inflow_yuan,
+                        "main_net_inflow_3d_yuan": stmt.excluded.main_net_inflow_3d_yuan,
+                        "main_net_inflow_5d_yuan": stmt.excluded.main_net_inflow_5d_yuan,
+                        "main_net_inflow_10d_yuan": stmt.excluded.main_net_inflow_10d_yuan,
                         "continuous_inflow_days": stmt.excluded.continuous_inflow_days,
+                        "component_count": stmt.excluded.component_count,
+                        "component_coverage_ratio": stmt.excluded.component_coverage_ratio,
                         "rising_stock_count": stmt.excluded.rising_stock_count,
+                        "falling_stock_count": stmt.excluded.falling_stock_count,
+                        "flat_stock_count": stmt.excluded.flat_stock_count,
                         "limit_up_stock_count": stmt.excluded.limit_up_stock_count,
                         "average_change_pct": stmt.excluded.average_change_pct,
                         "volatility_20d": stmt.excluded.volatility_20d,
-                        "tags": stmt.excluded.tags,
-                        "features": stmt.excluded.features,
+                        "quality_flags": stmt.excluded.quality_flags,
+                        "calculation_revision": stmt.excluded.calculation_revision,
                     },
                 )
             )
+        return len(rows)
+
+    async def rebuild_sector_final_metrics(self, *, trade_date: date) -> int:
+        """Fill typed trend/breadth/event fields after the base sector pass."""
+        result = await self.session.execute(
+            text(
+                """
+                WITH bar_series AS (
+                    SELECT bar.*,
+                        avg(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
+                        avg(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
+                        avg(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+                        avg(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS ma60,
+                        lag(close_price, 1) OVER (PARTITION BY sector_code ORDER BY trade_date) AS close1,
+                        lag(close_price, 5) OVER (PARTITION BY sector_code ORDER BY trade_date) AS close5,
+                        lag(close_price, 20) OVER (PARTITION BY sector_code ORDER BY trade_date) AS close20,
+                        max(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high20
+                    FROM t_sector_bar bar
+                    WHERE trade_date BETWEEN (:trade_date - INTERVAL '180 days')::date AND :trade_date
+                ),
+                current_bar AS (
+                    SELECT * FROM bar_series WHERE trade_date = :trade_date
+                ),
+                member_facts AS (
+                    SELECT component.sector_code, component.stock_code,
+                           bar.change_pct, factor.close_qfq, factor.ma20, factor.ma60,
+                           factor.high_20d, factor.low_20d, factor.high_60d, factor.low_60d
+                    FROM t_sector_component component
+                    JOIN t_stock stock ON stock.stock_code = component.stock_code
+                    LEFT JOIN t_daily_bar bar
+                      ON bar.stock_code = component.stock_code AND bar.trade_date = :trade_date
+                    LEFT JOIN t_stock_factor_daily factor
+                      ON factor.stock_code = component.stock_code AND factor.trade_date = :trade_date
+                    WHERE stock.status = 'active' AND stock.is_st IS FALSE
+                      AND stock.exchange IN ('SH','SZ','SSE','SZSE')
+                      AND coalesce(component.start_date, DATE '1900-01-01') <= :trade_date
+                      AND coalesce(component.end_date, DATE '2999-12-31') >= :trade_date
+                ),
+                breadth AS (
+                    SELECT sector_code,
+                           count(*) AS component_count,
+                           count(change_pct) AS covered_count,
+                           count(*) FILTER (WHERE change_pct > 0) AS rising_count,
+                           count(*) FILTER (WHERE change_pct < 0) AS falling_count,
+                           count(*) FILTER (WHERE change_pct = 0) AS flat_count,
+                           avg(change_pct) AS average_change,
+                           percentile_cont(0.5) WITHIN GROUP (ORDER BY change_pct) AS median_change,
+                           avg((close_qfq >= ma20)::int) FILTER (WHERE close_qfq IS NOT NULL AND ma20 IS NOT NULL) AS above_ma20,
+                           avg((close_qfq >= ma60)::int) FILTER (WHERE close_qfq IS NOT NULL AND ma60 IS NOT NULL) AS above_ma60,
+                           count(*) FILTER (WHERE close_qfq >= high_20d) AS high20_count,
+                           count(*) FILTER (WHERE close_qfq <= low_20d) AS low20_count,
+                           count(*) FILTER (WHERE close_qfq >= high_60d) AS high60_count,
+                           count(*) FILTER (WHERE close_qfq <= low_60d) AS low60_count
+                    FROM member_facts GROUP BY sector_code
+                ),
+                events AS (
+                    SELECT member.sector_code,
+                           count(DISTINCT event.stock_code) FILTER (WHERE event.event_type = 'limit_up') AS limit_up_count,
+                           count(DISTINCT event.stock_code) FILTER (WHERE event.event_type = 'limit_down') AS limit_down_count,
+                           count(DISTINCT event.stock_code) FILTER (WHERE event.event_type = 'limit_break') AS break_count,
+                           count(DISTINCT event.stock_code) FILTER (
+                               WHERE event.event_type = 'limit_up' AND daily.open_price = event.limit_price
+                                 AND coalesce(event.open_count, 0) = 0
+                           ) AS one_word_count
+                    FROM member_facts member
+                    LEFT JOIN t_limit_event_daily event
+                      ON event.stock_code = member.stock_code AND event.trade_date = :trade_date
+                    LEFT JOIN t_daily_bar daily
+                      ON daily.stock_code = member.stock_code AND daily.trade_date = :trade_date
+                    GROUP BY member.sector_code
+                ),
+                ranked AS (
+                    SELECT factor.sector_code,
+                           dense_rank() OVER (ORDER BY factor.fund_strength DESC NULLS LAST) AS fund_rank,
+                           dense_rank() OVER (
+                               ORDER BY (
+                                   coalesce(breadth.average_change, 0) * 8
+                                   + coalesce(events.limit_up_count, 0) * 3
+                                   + coalesce(factor.fund_strength, 0) * 0.35
+                                   + least(coalesce(factor.continuous_inflow_days, 0), 5) * 2
+                               ) DESC
+                           ) AS heat_rank,
+                           (coalesce(breadth.average_change, 0) * 8
+                            + coalesce(events.limit_up_count, 0) * 3
+                            + coalesce(factor.fund_strength, 0) * 0.35
+                            + least(coalesce(factor.continuous_inflow_days, 0), 5) * 2) AS heat_score
+                    FROM t_sector_factor_daily factor
+                    LEFT JOIN breadth USING (sector_code)
+                    LEFT JOIN events USING (sector_code)
+                    WHERE factor.trade_date = :trade_date
+                )
+                UPDATE t_sector_factor_daily factor
+                SET ma5 = current_bar.ma5, ma10 = current_bar.ma10,
+                    ma20 = current_bar.ma20, ma60 = current_bar.ma60,
+                    return_1d_pct = (current_bar.close_price / nullif(current_bar.close1, 0) - 1) * 100,
+                    return_5d_pct = (current_bar.close_price / nullif(current_bar.close5, 0) - 1) * 100,
+                    return_20d_pct = (current_bar.close_price / nullif(current_bar.close20, 0) - 1) * 100,
+                    drawdown_20d_pct = (current_bar.close_price / nullif(current_bar.high20, 0) - 1) * 100,
+                    main_net_inflow_yuan = flow.main_net_inflow_yuan,
+                    fund_rank = ranked.fund_rank,
+                    component_count = breadth.component_count,
+                    component_coverage_ratio = breadth.covered_count::double precision / nullif(breadth.component_count, 0),
+                    rising_stock_count = breadth.rising_count,
+                    falling_stock_count = breadth.falling_count,
+                    flat_stock_count = breadth.flat_count,
+                    average_change_pct = breadth.average_change,
+                    median_change_pct = breadth.median_change,
+                    above_ma20_ratio = breadth.above_ma20,
+                    above_ma60_ratio = breadth.above_ma60,
+                    new_high_20d_count = breadth.high20_count,
+                    new_low_20d_count = breadth.low20_count,
+                    new_high_60d_count = breadth.high60_count,
+                    new_low_60d_count = breadth.low60_count,
+                    limit_up_stock_count = events.limit_up_count,
+                    limit_down_stock_count = events.limit_down_count,
+                    limit_break_stock_count = events.break_count,
+                    one_word_limit_up_count = events.one_word_count,
+                    natural_limit_up_count = greatest(events.limit_up_count - events.one_word_count, 0),
+                    heat_score = ranked.heat_score,
+                    heat_rank = ranked.heat_rank,
+                    persistence_score = least(coalesce(factor.continuous_inflow_days, 0) * 20, 100),
+                    calculation_revision = 'sector_daily_final_r1',
+                    quality_flags = array_remove(ARRAY[
+                        CASE WHEN current_bar.sector_code IS NULL THEN 'sector_bar' END,
+                        CASE WHEN flow.sector_code IS NULL THEN 'sector_fund_flow' END,
+                        CASE WHEN breadth.covered_count < breadth.component_count * 0.8 THEN 'component_coverage' END
+                    ]::text[], NULL),
+                    updated_at = now()
+                FROM ranked
+                LEFT JOIN current_bar ON current_bar.sector_code = ranked.sector_code
+                LEFT JOIN breadth ON breadth.sector_code = ranked.sector_code
+                LEFT JOIN events ON events.sector_code = ranked.sector_code
+                LEFT JOIN t_sector_fund_flow_daily flow
+                  ON flow.sector_code = ranked.sector_code AND flow.trade_date = :trade_date
+                WHERE factor.sector_code = ranked.sector_code
+                  AND factor.trade_date = :trade_date
+                RETURNING factor.id
+                """
+            ),
+            {"trade_date": trade_date},
+        )
+        return len(result.all())
+
+    async def rebuild_sector_leaders(self, *, trade_date: date) -> int:
+        await self.session.execute(delete(SectorLeaderDaily).where(SectorLeaderDaily.trade_date == trade_date))
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    WITH candidates AS (
+                        SELECT component.sector_code, bar.stock_code, stock.stock_name,
+                               bar.change_pct, bar.amount_yuan,
+                               evidence.board_count,
+                               coalesce(evidence.board_count, 0) * 20
+                                 + coalesce(bar.change_pct, 0) * 3
+                                 + coalesce(factor.return_percentile_1d, 0) * 0.2 AS leader_score,
+                               row_number() OVER (
+                                   PARTITION BY component.sector_code
+                                   ORDER BY coalesce(evidence.board_count, 0) DESC,
+                                            bar.change_pct DESC NULLS LAST,
+                                            bar.amount_yuan DESC NULLS LAST,
+                                            bar.stock_code
+                               ) AS leader_rank
+                        FROM t_sector_component component
+                        JOIN t_daily_bar bar
+                          ON bar.stock_code = component.stock_code AND bar.trade_date = :trade_date
+                        JOIN t_stock stock ON stock.stock_code = bar.stock_code
+                        LEFT JOIN t_stock_factor_daily factor
+                          ON factor.stock_code = bar.stock_code AND factor.trade_date = :trade_date
+                        LEFT JOIN LATERAL (
+                            SELECT max(item.board_count) AS board_count
+                            FROM t_market_limit_up_evidence_daily item
+                            WHERE item.stock_code = bar.stock_code
+                              AND item.trade_date = :trade_date
+                        ) evidence ON true
+                        WHERE stock.status = 'active' AND stock.is_st IS FALSE
+                          AND stock.exchange IN ('SH','SZ','SSE','SZSE')
+                          AND coalesce(component.start_date, DATE '1900-01-01') <= :trade_date
+                          AND coalesce(component.end_date, DATE '2999-12-31') >= :trade_date
+                    )
+                    INSERT INTO t_sector_leader_daily (
+                        sector_code, trade_date, leader_rank, stock_code, stock_name,
+                        change_pct, amount_yuan, limit_board_count, leader_score,
+                        source, calculated_at
+                    )
+                    SELECT sector_code, :trade_date, leader_rank, stock_code, stock_name,
+                           change_pct, amount_yuan, board_count, leader_score,
+                           'system:sector_factor', now()
+                    FROM candidates WHERE leader_rank <= 5
+                    RETURNING id
+                    """
+                ),
+                {"trade_date": trade_date},
+            )
+        ).all()
+        return len(rows)
+
+    async def rebuild_index_factors(self, *, trade_date: date) -> int:
+        core_codes = CORE_INDEX_CANONICAL_CODES
+        bars = list(
+            (
+                await self.session.execute(
+                    select(IndexBar)
+                    .where(
+                        IndexBar.index_code.in_(core_codes),
+                        IndexBar.trade_date.between(trade_date - timedelta(days=550), trade_date),
+                    )
+                    .order_by(IndexBar.index_code, IndexBar.trade_date)
+                )
+            ).scalars().all()
+        )
+        basics = {
+            row.index_code: row
+            for row in (
+                await self.session.execute(
+                    select(IndexDailyBasic).where(
+                        IndexDailyBasic.index_code.in_(core_codes),
+                        IndexDailyBasic.trade_date == trade_date,
+                    )
+                )
+            ).scalars().all()
+        }
+        grouped: dict[str, list[IndexBar]] = {}
+        for bar in bars:
+            grouped.setdefault(bar.index_code, []).append(bar)
+
+        def mean_window(values: list[float], window: int) -> float | None:
+            chunk = values[-window:]
+            return sum(chunk) / len(chunk) if chunk else None
+
+        def ema(values: list[float], window: int) -> float | None:
+            if not values:
+                return None
+            alpha = 2.0 / (window + 1)
+            current = values[0]
+            for value in values[1:]:
+                current = alpha * value + (1 - alpha) * current
+            return current
+
+        rows: list[dict] = []
+        for code in core_codes:
+            series = grouped.get(code, [])
+            if not series or series[-1].trade_date != trade_date:
+                continue
+            closes = [float(row.close_price) for row in series if row.close_price is not None]
+            highs = [float(row.high_price) for row in series if row.high_price is not None]
+            lows = [float(row.low_price) for row in series if row.low_price is not None]
+            amounts = [float(row.amount_yuan) for row in series if row.amount_yuan is not None]
+            volumes = [float(row.volume) for row in series if row.volume is not None]
+            if not closes:
+                continue
+            current = series[-1]
+
+            def return_pct(window: int) -> float | None:
+                baseline_index = max(0, len(closes) - 1 - window)
+                baseline = closes[baseline_index]
+                return (closes[-1] / baseline - 1) * 100 if baseline else None
+
+            returns = [
+                (closes[index] / closes[index - 1] - 1) * 100
+                for index in range(1, len(closes)) if closes[index - 1]
+            ]
+            high20, high60 = max(highs[-20:]), max(highs[-60:])
+            low20, low60 = min(lows[-20:]), min(lows[-60:])
+            basic = basics.get(code)
+            ma20 = mean_window(closes, 20)
+            ma60 = mean_window(closes, 60)
+            rows.append({
+                "index_code": code,
+                "trade_date": trade_date,
+                "source": "system:index_factor",
+                **{f"ma{window}": mean_window(closes, window) for window in (5, 10, 20, 30, 60, 120, 250)},
+                **{f"ema{window}": ema(closes, window) for window in (5, 10, 20, 30, 60)},
+                **{f"return_{window}d_pct": return_pct(window) for window in (1, 5, 10, 20, 60)},
+                "amplitude_pct": (
+                    (float(current.high_price) - float(current.low_price))
+                    / float(current.close_price) * 100
+                    if current.high_price is not None and current.low_price is not None and current.close_price
+                    else None
+                ),
+                "volume_ratio_5d": volumes[-1] / (sum(volumes[-6:-1]) / len(volumes[-6:-1])) if len(volumes) > 1 and volumes[-6:-1] and sum(volumes[-6:-1]) else None,
+                "amount_ratio_5d": amounts[-1] / (sum(amounts[-6:-1]) / len(amounts[-6:-1])) if len(amounts) > 1 and amounts[-6:-1] and sum(amounts[-6:-1]) else None,
+                "volatility_20d": pstdev(returns[-20:]) if len(returns[-20:]) >= 2 else None,
+                "volatility_60d": pstdev(returns[-60:]) if len(returns[-60:]) >= 2 else None,
+                "high_20d": high20, "low_20d": low20,
+                "high_60d": high60, "low_60d": low60,
+                "drawdown_20d_pct": (closes[-1] / high20 - 1) * 100 if high20 else None,
+                "drawdown_60d_pct": (closes[-1] / high60 - 1) * 100 if high60 else None,
+                "trend_status": "bull" if ma20 and ma60 and closes[-1] > ma20 > ma60 else "bear" if ma20 and ma60 and closes[-1] < ma20 < ma60 else "range",
+                "turnover_rate_pct": basic.turnover_rate_pct if basic else None,
+                "pe_ttm": basic.pe_ttm if basic else None,
+                "pb": basic.pb if basic else None,
+                "calculation_revision": "index_daily_final_r1",
+                "quality_flags": [] if basic else ["valuation"],
+            })
+        if not rows:
+            return 0
+        for batch in _chunked(rows, _safe_batch_size(rows)):
+            statement = insert(IndexFactorDaily).values(batch)
+            await self.session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[IndexFactorDaily.index_code, IndexFactorDaily.trade_date],
+                    set_={
+                        column.name: getattr(statement.excluded, column.name)
+                        for column in IndexFactorDaily.__table__.columns
+                        if column.name not in {"id", "index_code", "trade_date", "created_at"}
+                    },
+                )
+            )
+        return len(rows)
+
+    async def rebuild_market_summary(self, *, trade_date: date) -> int:
+        rows = (
+            await self.session.execute(
+                text(
+                    """
+                    WITH cutoff AS (
+                        SELECT min(trade_date) AS date
+                        FROM (SELECT trade_date FROM t_trade_calendar
+                              WHERE market = 'CN' AND is_open IS TRUE AND trade_date <= :trade_date
+                              ORDER BY trade_date DESC LIMIT 6) d
+                    ),
+                    eligible AS (
+                        SELECT stock_code FROM t_stock, cutoff
+                        WHERE status = 'active' AND is_st IS FALSE
+                          AND exchange IN ('SH','SZ','SSE','SZSE')
+                          AND list_date IS NOT NULL AND list_date <= cutoff.date
+                    ),
+                    facts AS (
+                        SELECT eligible.stock_code, bar.change_pct, bar.amount_yuan,
+                               basic.id AS basic_id, basic.turnover_rate_pct,
+                               fund.id AS fund_id, fund.main_net_inflow_yuan,
+                               factor.id AS factor_id, factor.volatility_20d,
+                               factor.close_qfq, factor.ma5, factor.ma20, factor.ma60, factor.ma250,
+                               factor.high_20d, factor.low_20d, factor.high_60d, factor.low_60d,
+                               factor.high_250d, factor.low_250d
+                        FROM eligible
+                        LEFT JOIN t_daily_bar bar USING (stock_code)
+                        LEFT JOIN t_stock_daily_basic basic
+                          ON basic.stock_code = eligible.stock_code AND basic.trade_date = :trade_date
+                        LEFT JOIN t_stock_fund_flow_daily fund
+                          ON fund.stock_code = eligible.stock_code AND fund.trade_date = :trade_date
+                        LEFT JOIN t_stock_factor_daily factor
+                          ON factor.stock_code = eligible.stock_code AND factor.trade_date = :trade_date
+                        WHERE bar.trade_date = :trade_date
+                    ),
+                    aggregate_fact AS (
+                        SELECT (SELECT count(*) FROM eligible) AS eligible_count,
+                               count(*) AS daily_count,
+                               count(basic_id) AS basic_count,
+                               count(fund_id) AS fund_count,
+                               count(factor_id) AS factor_count,
+                               count(*) FILTER (WHERE change_pct > 0) AS up_count,
+                               count(*) FILTER (WHERE change_pct < 0) AS down_count,
+                               count(*) FILTER (WHERE change_pct = 0) AS flat_count,
+                               avg(change_pct) AS average_change,
+                               percentile_cont(0.5) WITHIN GROUP (ORDER BY change_pct) AS median_change,
+                               count(*) FILTER (WHERE change_pct >= 1) AS up1,
+                               count(*) FILTER (WHERE change_pct <= -1) AS down1,
+                               count(*) FILTER (WHERE change_pct >= 3) AS up3,
+                               count(*) FILTER (WHERE change_pct <= -3) AS down3,
+                               count(*) FILTER (WHERE change_pct >= 5) AS up5,
+                               count(*) FILTER (WHERE change_pct <= -5) AS down5,
+                               count(*) FILTER (WHERE change_pct >= 7) AS up7,
+                               count(*) FILTER (WHERE change_pct <= -7) AS down7,
+                               sum(amount_yuan) AS total_amount,
+                               avg(turnover_rate_pct) AS average_turnover,
+                               percentile_cont(0.5) WITHIN GROUP (ORDER BY turnover_rate_pct) AS median_turnover,
+                               avg(volatility_20d) AS average_volatility_20d,
+                               sum(main_net_inflow_yuan) AS main_net,
+                               avg((close_qfq >= ma5)::int) FILTER (WHERE close_qfq IS NOT NULL AND ma5 IS NOT NULL) AS above_ma5,
+                               avg((close_qfq >= ma20)::int) FILTER (WHERE close_qfq IS NOT NULL AND ma20 IS NOT NULL) AS above_ma20,
+                               avg((close_qfq >= ma60)::int) FILTER (WHERE close_qfq IS NOT NULL AND ma60 IS NOT NULL) AS above_ma60,
+                               avg((close_qfq >= ma250)::int) FILTER (WHERE close_qfq IS NOT NULL AND ma250 IS NOT NULL) AS above_ma250,
+                               count(*) FILTER (WHERE close_qfq >= high_20d) AS high20,
+                               count(*) FILTER (WHERE close_qfq <= low_20d) AS low20,
+                               count(*) FILTER (WHERE close_qfq >= high_60d) AS high60,
+                               count(*) FILTER (WHERE close_qfq <= low_60d) AS low60,
+                               count(*) FILTER (WHERE close_qfq >= high_250d) AS high250,
+                               count(*) FILTER (WHERE close_qfq <= low_250d) AS low250
+                        FROM facts
+                    ),
+                    events AS (
+                        SELECT count(*) FILTER (WHERE event_type = 'limit_up') AS limit_up,
+                               count(*) FILTER (WHERE event_type = 'limit_down') AS limit_down,
+                               count(*) FILTER (WHERE event_type = 'limit_break') AS limit_break,
+                               count(*) FILTER (WHERE event_type = 'limit_up' AND daily.open_price = event.limit_price
+                                   AND coalesce(event.open_count, 0) = 0) AS one_word
+                        FROM t_limit_event_daily event
+                        JOIN eligible USING (stock_code)
+                        LEFT JOIN t_daily_bar daily
+                          ON daily.stock_code = event.stock_code AND daily.trade_date = event.trade_date
+                        WHERE event.trade_date = :trade_date
+                    ),
+                    index_fact AS (
+                        SELECT count(*) AS ready_count,
+                               count(*) FILTER (WHERE return_1d_pct > 0) AS rising_count,
+                               avg(return_1d_pct) AS avg_return_1d,
+                               avg(amplitude_pct) AS avg_amplitude
+                        FROM t_index_factor_daily
+                        WHERE trade_date = :trade_date
+                          AND index_code = ANY(CAST(:core_index_codes AS varchar[]))
+                    ),
+                    event_completion AS (
+                        SELECT coalesce(bool_or(
+                            capability IN (
+                                'daily_market_close_stock_limit',
+                                'stock_limit_event_history_backfill'
+                            )
+                            AND status IN ('captured', 'complete_zero')
+                        ), false) AS limit_complete
+                        FROM t_provider_ingest_audit
+                        WHERE trade_date = :trade_date
+                          AND normalized_table = 't_limit_event_daily'
+                    ),
+                    board AS (
+                        SELECT max(board_count) AS highest_board
+                        FROM t_market_limit_up_evidence_daily WHERE trade_date = :trade_date
+                    ),
+                    previous_trade AS (
+                        SELECT max(trade_date) AS trade_date
+                        FROM t_trade_calendar
+                        WHERE market = 'CN' AND is_open IS TRUE AND trade_date < :trade_date
+                    ),
+                    promotion AS (
+                        SELECT count(DISTINCT previous.stock_code) AS previous_limit_up_count,
+                               count(DISTINCT current.stock_code) FILTER (
+                                   WHERE current.stock_code IS NOT NULL AND current.board_count >= 2
+                               ) AS promoted_count
+                        FROM t_limit_event_daily previous
+                        CROSS JOIN previous_trade previous_date
+                        LEFT JOIN t_market_limit_up_evidence_daily current
+                          ON current.stock_code = previous.stock_code
+                         AND current.trade_date = :trade_date
+                        WHERE previous.trade_date = previous_date.trade_date
+                          AND previous.event_type = 'limit_up'
+                    ),
+                    amount_history AS (
+                        SELECT avg(total_amount_yuan) FILTER (WHERE history_rank <= 5) AS average_5d,
+                               avg(total_amount_yuan) FILTER (WHERE history_rank <= 20) AS average_20d
+                        FROM (
+                            SELECT total_amount_yuan,
+                                   row_number() OVER (ORDER BY trade_date DESC) AS history_rank
+                            FROM t_market_summary_daily
+                            WHERE trade_date < :trade_date AND total_amount_yuan IS NOT NULL
+                            ORDER BY trade_date DESC
+                            LIMIT 20
+                        ) history
+                    ),
+                    north AS (
+                        SELECT trade_date, north_money_yuan FROM t_market_north_flow_daily
+                        WHERE trade_date <= :trade_date AND north_money_yuan IS NOT NULL
+                        ORDER BY trade_date DESC LIMIT 1
+                    ),
+                    margin AS (
+                        SELECT trade_date, sum(margin_total_balance_yuan) AS balance
+                        FROM t_margin_summary_daily WHERE trade_date <= :trade_date
+                        GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1
+                    )
+                    INSERT INTO t_market_summary_daily (
+                        trade_date, eligible_count, daily_bar_count, daily_basic_count,
+                        fund_flow_count, factor_count, up_count, down_count, flat_count,
+                        average_change_pct, median_change_pct,
+                        up_1pct_count, down_1pct_count, up_3pct_count, down_3pct_count,
+                        up_5pct_count, down_5pct_count, up_7pct_count, down_7pct_count,
+                        total_amount_yuan, amount_ratio_5d, amount_ratio_20d,
+                        average_turnover_pct, median_turnover_pct, average_volatility_20d_pct,
+                        main_net_inflow_yuan, main_net_inflow_ratio,
+                        above_ma5_ratio, above_ma20_ratio, above_ma60_ratio, above_ma250_ratio,
+                        new_high_20d_count, new_low_20d_count, new_high_60d_count,
+                        new_low_60d_count, new_high_250d_count, new_low_250d_count,
+                        limit_up_count, limit_down_count, limit_break_count,
+                        one_word_limit_up_count, natural_limit_up_count, highest_board_count,
+                        promotion_rate,
+                        core_index_ready_count, core_index_rising_count,
+                        core_index_average_return_1d_pct,
+                        core_index_average_amplitude_pct,
+                        north_flow_yuan, north_flow_disclosure_date,
+                        margin_balance_yuan, margin_disclosure_date,
+                        core_ready, quality_flags, calculation_revision, calculated_at
+                    )
+                    SELECT :trade_date, a.eligible_count, a.daily_count, a.basic_count,
+                           a.fund_count, a.factor_count, a.up_count, a.down_count, a.flat_count,
+                           a.average_change, a.median_change,
+                           a.up1, a.down1, a.up3, a.down3, a.up5, a.down5, a.up7, a.down7,
+                           a.total_amount,
+                           a.total_amount / nullif(amounts.average_5d, 0),
+                           a.total_amount / nullif(amounts.average_20d, 0),
+                           a.average_turnover, a.median_turnover, a.average_volatility_20d,
+                           a.main_net, a.main_net / nullif(a.total_amount, 0),
+                           a.above_ma5, a.above_ma20, a.above_ma60, a.above_ma250,
+                           a.high20, a.low20, a.high60, a.low60, a.high250, a.low250,
+                           CASE WHEN completion.limit_complete THEN e.limit_up END,
+                           CASE WHEN completion.limit_complete THEN e.limit_down END,
+                           CASE WHEN completion.limit_complete THEN e.limit_break END,
+                           CASE WHEN completion.limit_complete THEN e.one_word END,
+                           CASE WHEN completion.limit_complete
+                               THEN greatest(e.limit_up - e.one_word, 0) END,
+                           CASE WHEN completion.limit_complete THEN board.highest_board END,
+                           CASE WHEN completion.limit_complete
+                               THEN promotion.promoted_count::double precision
+                                 / nullif(promotion.previous_limit_up_count, 0) END,
+                           idx.ready_count, idx.rising_count, idx.avg_return_1d, idx.avg_amplitude,
+                           north.north_money_yuan, north.trade_date,
+                           margin.balance, margin.trade_date,
+                           a.daily_count >= a.eligible_count * 0.98
+                             AND a.basic_count >= a.daily_count * 0.98
+                             AND a.fund_count >= a.daily_count * 0.98
+                             AND a.factor_count >= a.daily_count * 0.98
+                             AND idx.ready_count = 7
+                             AND completion.limit_complete,
+                           array_remove(ARRAY[
+                               CASE WHEN a.daily_count < a.eligible_count * 0.98 THEN 'daily_bar_coverage' END,
+                               CASE WHEN a.basic_count < a.daily_count * 0.98 THEN 'daily_basic_coverage' END,
+                               CASE WHEN a.fund_count < a.daily_count * 0.98 THEN 'fund_flow_coverage' END,
+                               CASE WHEN a.factor_count < a.daily_count * 0.98 THEN 'factor_coverage' END,
+                               CASE WHEN idx.ready_count < 7 THEN 'core_index_coverage' END,
+                               CASE WHEN NOT completion.limit_complete THEN 'limit_event_audit' END,
+                               CASE WHEN north.trade_date IS NULL THEN 'north_flow_missing' END,
+                               CASE WHEN margin.trade_date IS NULL THEN 'margin_missing' END
+                           ]::text[], NULL),
+                           'market_summary_final_r1', now()
+                    FROM aggregate_fact a CROSS JOIN events e CROSS JOIN index_fact idx
+                    CROSS JOIN board CROSS JOIN promotion CROSS JOIN amount_history amounts
+                    CROSS JOIN event_completion completion
+                    LEFT JOIN north ON true LEFT JOIN margin ON true
+                    ON CONFLICT (trade_date) DO UPDATE SET
+                        eligible_count = EXCLUDED.eligible_count,
+                        daily_bar_count = EXCLUDED.daily_bar_count,
+                        daily_basic_count = EXCLUDED.daily_basic_count,
+                        fund_flow_count = EXCLUDED.fund_flow_count,
+                        factor_count = EXCLUDED.factor_count,
+                        up_count = EXCLUDED.up_count, down_count = EXCLUDED.down_count,
+                        flat_count = EXCLUDED.flat_count,
+                        average_change_pct = EXCLUDED.average_change_pct,
+                        median_change_pct = EXCLUDED.median_change_pct,
+                        up_1pct_count = EXCLUDED.up_1pct_count, down_1pct_count = EXCLUDED.down_1pct_count,
+                        up_3pct_count = EXCLUDED.up_3pct_count, down_3pct_count = EXCLUDED.down_3pct_count,
+                        up_5pct_count = EXCLUDED.up_5pct_count, down_5pct_count = EXCLUDED.down_5pct_count,
+                        up_7pct_count = EXCLUDED.up_7pct_count, down_7pct_count = EXCLUDED.down_7pct_count,
+                        total_amount_yuan = EXCLUDED.total_amount_yuan,
+                        amount_ratio_5d = EXCLUDED.amount_ratio_5d,
+                        amount_ratio_20d = EXCLUDED.amount_ratio_20d,
+                        average_turnover_pct = EXCLUDED.average_turnover_pct,
+                        median_turnover_pct = EXCLUDED.median_turnover_pct,
+                        average_volatility_20d_pct = EXCLUDED.average_volatility_20d_pct,
+                        main_net_inflow_yuan = EXCLUDED.main_net_inflow_yuan,
+                        main_net_inflow_ratio = EXCLUDED.main_net_inflow_ratio,
+                        above_ma5_ratio = EXCLUDED.above_ma5_ratio,
+                        above_ma20_ratio = EXCLUDED.above_ma20_ratio,
+                        above_ma60_ratio = EXCLUDED.above_ma60_ratio,
+                        above_ma250_ratio = EXCLUDED.above_ma250_ratio,
+                        new_high_20d_count = EXCLUDED.new_high_20d_count,
+                        new_low_20d_count = EXCLUDED.new_low_20d_count,
+                        new_high_60d_count = EXCLUDED.new_high_60d_count,
+                        new_low_60d_count = EXCLUDED.new_low_60d_count,
+                        new_high_250d_count = EXCLUDED.new_high_250d_count,
+                        new_low_250d_count = EXCLUDED.new_low_250d_count,
+                        limit_up_count = EXCLUDED.limit_up_count,
+                        limit_down_count = EXCLUDED.limit_down_count,
+                        limit_break_count = EXCLUDED.limit_break_count,
+                        one_word_limit_up_count = EXCLUDED.one_word_limit_up_count,
+                        natural_limit_up_count = EXCLUDED.natural_limit_up_count,
+                        highest_board_count = EXCLUDED.highest_board_count,
+                        promotion_rate = EXCLUDED.promotion_rate,
+                        core_index_ready_count = EXCLUDED.core_index_ready_count,
+                        core_index_rising_count = EXCLUDED.core_index_rising_count,
+                        core_index_average_return_1d_pct = EXCLUDED.core_index_average_return_1d_pct,
+                        core_index_average_amplitude_pct = EXCLUDED.core_index_average_amplitude_pct,
+                        north_flow_yuan = EXCLUDED.north_flow_yuan,
+                        north_flow_disclosure_date = EXCLUDED.north_flow_disclosure_date,
+                        margin_balance_yuan = EXCLUDED.margin_balance_yuan,
+                        margin_disclosure_date = EXCLUDED.margin_disclosure_date,
+                        core_ready = EXCLUDED.core_ready,
+                        quality_flags = EXCLUDED.quality_flags,
+                        calculation_revision = EXCLUDED.calculation_revision,
+                        calculated_at = now()
+                    RETURNING trade_date
+                    """
+                ).bindparams(bindparam("core_index_codes", type_=ARRAY(String()))),
+                {"trade_date": trade_date, "core_index_codes": list(CORE_INDEX_CANONICAL_CODES)},
+            )
+        ).all()
         return len(rows)
 
     async def commit(self) -> None:

@@ -4,11 +4,7 @@ from datetime import date, timedelta
 
 from app.modules.market_data.models import (
     DailyBar,
-    StockChipPerfDaily,
-    StockFactorDaily,
     StockFactorMinute,
-    StockTechnicalFactorDaily,
-    TechnicalIndicatorSnapshot,
 )
 from app.modules.market_data.stock_analysis import StockAnalysisService
 
@@ -29,8 +25,6 @@ def _daily_bar(trade_date: date, close_price: float) -> DailyBar:
         volume_hand=100,
         volume_share=10000,
         amount_yuan=close_price * 10000,
-        turnover_rate=None,
-        metadata_json={},
     )
 
 
@@ -114,7 +108,7 @@ class _FactorPageRepository:
         return []
 
 
-async def test_factor_page_keeps_series_history_but_limits_large_detail_documents() -> None:
+async def test_factor_page_reads_only_official_daily_minute_and_dynamic_snapshot_assets() -> None:
     repository = _FactorPageRepository()
     service = StockAnalysisService(repository)  # type: ignore[arg-type]
 
@@ -124,5 +118,6 @@ async def test_factor_page_keeps_series_history_but_limits_large_detail_document
     assert repository.limits["active_daily_factors"] == 250
     assert repository.limits[StockFactorMinute] == 400
     assert repository.limits["computed_technical_snapshots"] == 1
-    assert repository.limits[StockTechnicalFactorDaily] == 1
-    assert repository.limits[StockChipPerfDaily] == 1
+    assert set(result["missing"]) == {"technical_core", "technical_extended"}
+    assert "technical_factors" not in result
+    assert "chip_perf" not in result

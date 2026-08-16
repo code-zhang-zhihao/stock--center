@@ -5,10 +5,11 @@ from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta, timezone
 from statistics import median
 
-from sqlalchemy import Date, and_, bindparam, cast, func, or_, select, text
-from sqlalchemy.dialects.postgresql import ARRAY, insert
+from sqlalchemy import Date, and_, cast, func, or_, select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.market_data.index_contract import CORE_INDEX_CANONICAL_CODES
 from app.modules.market_data.models import (
     Announcement,
     DailyBar,
@@ -17,37 +18,29 @@ from app.modules.market_data.models import (
     LimitEventDaily,
     MarginSummaryDaily,
     MarketNorthFlowDaily,
+    MarketSummaryDaily,
     ProviderIngestAudit,
     SectorBasic,
     SectorComponent,
+    SectorFactorDaily,
+    SectorLeaderDaily,
     Stock,
     StockDailyBasic,
-    StockFactorDailyActive as StockFactorDaily,
+    StockFactorDaily,
     StockFundFlowDaily,
-    StockNorthHoldDaily,
     TradeCalendar,
 )
 from app.modules.market_insight.models import (
     MarketEmotionDaily,
     MarketEmotionModel,
     MarketLimitUpEvidenceDaily,
-    MarketSectorHeatDaily,
-    MarketSentimentDaily,
 )
 
 
 # The daily close pipeline settles exactly these seven broad/core indices.
-# Keep this list local to the insight read model rather than averaging any
-# additional index history that may later be backfilled into ``t_index_bar``.
-CORE_INDEX_CODES: tuple[str, ...] = (
-    "000001.SH",
-    "399001.SZ",
-    "399006.SZ",
-    "000300.SH",
-    "000905.SH",
-    "000852.SH",
-    "000016.SH",
-)
+# Reuse the canonical database contract rather than Provider symbols so future
+# extra index history cannot enter the insight read model.
+CORE_INDEX_CODES = CORE_INDEX_CANONICAL_CODES
 
 
 def _active_stock_filters() -> tuple:
@@ -91,7 +84,7 @@ class MarketInsightRepository:
     async def open_trade_dates_before(self, *, before_date: date, limit: int) -> list[date]:
         """Return at most ``limit`` CN open dates strictly before a date.
 
-        V2 baseline scoring only needs the percentile lookback before its
+        Baseline scoring only needs the percentile lookback before its
         first target date.  Reading a calendar-sized pre-window (previously
         620 natural days) made the initial aggregate unnecessarily large.
         """
@@ -248,71 +241,6 @@ class MarketInsightRepository:
             for row in rows
         }
 
-    async def sentiment_scores_before(
-        self,
-        *,
-        trade_date: date,
-        universe_code: str,
-        calculation_version: str,
-        limit: int,
-    ) -> list[float]:
-        rows = await self.session.execute(
-            select(MarketSentimentDaily.sentiment_score)
-            .where(
-                MarketSentimentDaily.trade_date < trade_date,
-                MarketSentimentDaily.universe_code == universe_code,
-                MarketSentimentDaily.calculation_version == calculation_version,
-                MarketSentimentDaily.status == "ready",
-                MarketSentimentDaily.sentiment_score.is_not(None),
-            )
-            .order_by(MarketSentimentDaily.trade_date.desc())
-            .limit(limit)
-        )
-        return [float(value) for value in rows.scalars().all() if value is not None]
-
-    async def upsert_sentiments(self, rows: list[dict]) -> int:
-        if not rows:
-            return 0
-        for offset in range(0, len(rows), 500):
-            statement = insert(MarketSentimentDaily).values(rows[offset : offset + 500])
-            await self.session.execute(
-                statement.on_conflict_do_update(
-                    index_elements=[
-                        MarketSentimentDaily.trade_date,
-                        MarketSentimentDaily.universe_code,
-                        MarketSentimentDaily.calculation_version,
-                    ],
-                    set_={
-                        "status": statement.excluded.status,
-                        "sentiment_score": statement.excluded.sentiment_score,
-                        "stage_code": statement.excluded.stage_code,
-                        "components": statement.excluded.components,
-                        "metrics": statement.excluded.metrics,
-                        "coverage": statement.excluded.coverage,
-                        "source_facts": statement.excluded.source_facts,
-                        "calculated_at": func.now(),
-                        "updated_at": func.now(),
-                    },
-                )
-            )
-        return len(rows)
-
-    async def latest_sentiment(
-        self,
-        *,
-        universe_code: str,
-        calculation_version: str,
-        trade_date: date | None = None,
-    ) -> MarketSentimentDaily | None:
-        statement = select(MarketSentimentDaily).where(
-            MarketSentimentDaily.universe_code == universe_code,
-            MarketSentimentDaily.calculation_version == calculation_version,
-        )
-        if trade_date is not None:
-            statement = statement.where(MarketSentimentDaily.trade_date == trade_date)
-        statement = statement.order_by(MarketSentimentDaily.trade_date.desc()).limit(1)
-        return (await self.session.execute(statement)).scalar_one_or_none()
-
     async def concept_metrics(self, trade_dates: list[date]) -> dict[date, list[dict]]:
         """Aggregate concept strength directly from canonical component facts.
 
@@ -338,7 +266,7 @@ class MarketInsightRepository:
             DailyBar.stock_code,
             DailyBar.change_pct,
             StockFundFlowDaily.stock_code.label("fund_flow_stock_code"),
-            StockFundFlowDaily.main_net_inflow,
+            StockFundFlowDaily.main_net_inflow_yuan,
             LimitEventDaily.stock_code.label("limit_up_stock_code"),
         )
         daily_rows = await self.session.execute(
@@ -370,7 +298,7 @@ class MarketInsightRepository:
             if not stock_memberships:
                 continue
             change_pct = _float_or_none(row["change_pct"])
-            main_net_inflow = _float_or_none(row["main_net_inflow"])
+            main_net_inflow = _float_or_none(row["main_net_inflow_yuan"])
             has_limit_up = row["limit_up_stock_code"] is not None
             has_fund_flow = row["fund_flow_stock_code"] is not None
             seen_sector_codes: set[str] = set()
@@ -467,7 +395,7 @@ class MarketInsightRepository:
                 DailyBar.change_pct.label("change_pct"),
                 DailyBar.close_price.label("close_price"),
                 DailyBar.amount_yuan.label("amount_yuan"),
-                StockFundFlowDaily.main_net_inflow.label("main_net_inflow"),
+                StockFundFlowDaily.main_net_inflow_yuan.label("main_net_inflow_yuan"),
                 LimitEventDaily.stock_code.label("limit_up_stock_code"),
             )
             .select_from(DailyBar)
@@ -509,7 +437,7 @@ class MarketInsightRepository:
                         "change_pct": _float_or_none(row["change_pct"]),
                         "close_price": _float_or_none(row["close_price"]),
                         "amount_yuan": _float_or_none(row["amount_yuan"]),
-                        "main_net_inflow": _float_or_none(row["main_net_inflow"]),
+                        "main_net_inflow": _float_or_none(row["main_net_inflow_yuan"]),
                         "is_limit_up": row["limit_up_stock_code"] is not None,
                     }
                 )
@@ -526,7 +454,7 @@ class MarketInsightRepository:
                 DailyBar.close_price.label("close_price"),
                 DailyBar.change_pct.label("change_pct"),
                 DailyBar.amount_yuan.label("amount_yuan"),
-                StockFundFlowDaily.main_net_inflow.label("main_net_inflow"),
+                StockFundFlowDaily.main_net_inflow_yuan.label("main_net_inflow_yuan"),
                 LimitEventDaily.limit_price.label("limit_price"),
                 LimitEventDaily.open_count.label("open_count"),
             )
@@ -553,7 +481,7 @@ class MarketInsightRepository:
                 "close_price": _float_or_none(row.close_price),
                 "change_pct": _float_or_none(row.change_pct),
                 "amount_yuan": _float_or_none(row.amount_yuan),
-                "main_net_inflow": _float_or_none(row.main_net_inflow),
+                "main_net_inflow": _float_or_none(row.main_net_inflow_yuan),
                 "limit_price": _float_or_none(row.limit_price),
                 "open_count": int(row.open_count or 0),
             }
@@ -661,35 +589,6 @@ class MarketInsightRepository:
                 result.setdefault(trade_date, set()).add(str(capability))
         return result
 
-    async def upsert_sector_heat_rows(self, rows: list[dict]) -> int:
-        if not rows:
-            return 0
-        for offset in range(0, len(rows), 500):
-            statement = insert(MarketSectorHeatDaily).values(rows[offset : offset + 500])
-            await self.session.execute(
-                statement.on_conflict_do_update(
-                    index_elements=[
-                        MarketSectorHeatDaily.trade_date,
-                        MarketSectorHeatDaily.sector_code,
-                        MarketSectorHeatDaily.calculation_version,
-                    ],
-                    set_={
-                        "sector_name": statement.excluded.sector_name,
-                        "status": statement.excluded.status,
-                        "heat_score": statement.excluded.heat_score,
-                        "heat_rank": statement.excluded.heat_rank,
-                        "metrics": statement.excluded.metrics,
-                        "components": statement.excluded.components,
-                        "leaders": statement.excluded.leaders,
-                        "coverage": statement.excluded.coverage,
-                        "source_facts": statement.excluded.source_facts,
-                        "calculated_at": func.now(),
-                        "updated_at": func.now(),
-                    },
-                )
-            )
-        return len(rows)
-
     async def upsert_limit_up_evidence_rows(self, rows: list[dict]) -> int:
         if not rows:
             return 0
@@ -718,18 +617,111 @@ class MarketInsightRepository:
             )
         return len(rows)
 
-    async def list_sector_heats(self, *, trade_date: date, calculation_version: str, limit: int) -> list[MarketSectorHeatDaily]:
-        rows = await self.session.execute(
-            select(MarketSectorHeatDaily)
-            .where(
-                MarketSectorHeatDaily.trade_date == trade_date,
-                MarketSectorHeatDaily.calculation_version == calculation_version,
-                MarketSectorHeatDaily.status == "ready",
+    async def refresh_market_summary_board_structure(self, trade_dates: list[date]) -> int:
+        """Finalize board height/promotion after evidence streaks are persisted."""
+        updated = 0
+        for trade_date in sorted(set(trade_dates)):
+            result = await self.session.execute(
+                text(
+                    """
+                    WITH previous_trade AS (
+                        SELECT max(trade_date) AS trade_date
+                        FROM t_trade_calendar
+                        WHERE market = 'CN' AND is_open IS TRUE AND trade_date < :trade_date
+                    ), previous_limit AS (
+                        SELECT count(DISTINCT event.stock_code) AS stock_count
+                        FROM t_limit_event_daily event
+                        CROSS JOIN previous_trade previous
+                        WHERE event.trade_date = previous.trade_date
+                          AND event.event_type = 'limit_up'
+                    ), current_board AS (
+                        SELECT max(board_count) AS highest_board,
+                               count(*) FILTER (WHERE board_count >= 2) AS promoted_count
+                        FROM t_market_limit_up_evidence_daily
+                        WHERE trade_date = :trade_date AND status = 'ready'
+                    )
+                    UPDATE t_market_summary_daily summary
+                    SET highest_board_count = current.highest_board,
+                        promotion_rate = current.promoted_count::double precision
+                            / nullif(previous.stock_count, 0),
+                        calculated_at = now()
+                    FROM current_board current CROSS JOIN previous_limit previous
+                    WHERE summary.trade_date = :trade_date
+                    RETURNING summary.trade_date
+                    """
+                ),
+                {"trade_date": trade_date},
             )
-            .order_by(MarketSectorHeatDaily.heat_rank.asc().nulls_last(), MarketSectorHeatDaily.sector_name)
-            .limit(limit)
+            updated += len(result.all())
+        return updated
+
+    async def list_sector_factors(self, *, trade_date: date, limit: int) -> list[dict]:
+        rows = list(
+            (
+                await self.session.execute(
+                    select(SectorFactorDaily)
+                    .where(
+                        SectorFactorDaily.trade_date == trade_date,
+                        SectorFactorDaily.heat_score.is_not(None),
+                    )
+                    .order_by(SectorFactorDaily.heat_rank.asc().nulls_last(), SectorFactorDaily.sector_name)
+                    .limit(limit)
+                )
+            ).scalars().all()
         )
-        return list(rows.scalars().all())
+        if not rows:
+            return []
+        sector_codes = [item.sector_code for item in rows]
+        leaders = await self.session.execute(
+            select(SectorLeaderDaily)
+            .where(
+                SectorLeaderDaily.trade_date == trade_date,
+                SectorLeaderDaily.sector_code.in_(sector_codes),
+            )
+            .order_by(SectorLeaderDaily.sector_code, SectorLeaderDaily.leader_rank)
+        )
+        leaders_by_sector: dict[str, list[dict]] = defaultdict(list)
+        for leader in leaders.scalars().all():
+            leaders_by_sector[leader.sector_code].append(
+                {
+                    "stock_code": leader.stock_code,
+                    "stock_name": leader.stock_name,
+                    "change_pct": _float_or_none(leader.change_pct),
+                    "amount_yuan": _float_or_none(leader.amount_yuan),
+                    "limit_board_count": leader.limit_board_count,
+                    "leader_score": _float_or_none(leader.leader_score),
+                    "is_limit_up": bool(leader.limit_board_count),
+                }
+            )
+        return [
+            {
+                "trade_date": item.trade_date,
+                "sector_code": item.sector_code,
+                "sector_name": item.sector_name,
+                "sector_type": item.sector_type,
+                "heat_score": _float_or_none(item.heat_score),
+                "heat_rank": item.heat_rank,
+                "metrics": {
+                    "average_change_pct": _float_or_none(item.average_change_pct),
+                    "median_change_pct": _float_or_none(item.median_change_pct),
+                    "priced_component_count": item.component_count,
+                    "component_coverage_ratio": _float_or_none(item.component_coverage_ratio),
+                    "rising_stock_count": item.rising_stock_count,
+                    "falling_stock_count": item.falling_stock_count,
+                    "limit_up_stock_count": item.limit_up_stock_count,
+                    "limit_down_stock_count": item.limit_down_stock_count,
+                    "limit_break_stock_count": item.limit_break_stock_count,
+                    "main_net_inflow_yuan": _float_or_none(item.main_net_inflow_yuan),
+                    "persistence_score": _float_or_none(item.persistence_score),
+                    "leader_strength_score": _float_or_none(item.leader_strength_score),
+                },
+                "leaders": leaders_by_sector.get(item.sector_code, []),
+                "quality_flags": list(item.quality_flags or []),
+                "calculation_revision": item.calculation_revision,
+                "calculated_at": item.updated_at,
+            }
+            for item in rows
+        ]
 
     async def list_limit_up_evidence(self, *, trade_date: date, calculation_version: str, limit: int) -> list[MarketLimitUpEvidenceDaily]:
         rows = await self.session.execute(
@@ -746,10 +738,9 @@ class MarketInsightRepository:
 
     async def review_row_counts(self, *, trade_date: date, calculation_version: str) -> dict[str, int]:
         sector_count = await self.session.execute(
-            select(func.count()).select_from(MarketSectorHeatDaily).where(
-                MarketSectorHeatDaily.trade_date == trade_date,
-                MarketSectorHeatDaily.calculation_version == calculation_version,
-                MarketSectorHeatDaily.status == "ready",
+            select(func.count()).select_from(SectorFactorDaily).where(
+                SectorFactorDaily.trade_date == trade_date,
+                SectorFactorDaily.heat_score.is_not(None),
             )
         )
         evidence_count = await self.session.execute(
@@ -764,7 +755,7 @@ class MarketInsightRepository:
             "limit_up_evidence_count": int(evidence_count.scalar_one() or 0),
         }
 
-    # V2 emotion model persistence -------------------------------------------------
+    # Emotion model persistence ----------------------------------------------------
 
     async def list_emotion_models(self) -> list[MarketEmotionModel]:
         rows = await self.session.execute(select(MarketEmotionModel).order_by(MarketEmotionModel.updated_at.desc()))
@@ -875,7 +866,7 @@ class MarketInsightRepository:
         return list(reversed(rows.scalars().all()))
 
     async def emotion_trend_history(self, *, model_code: str, limit: int = 60) -> list[dict]:
-        """Fetch only fields needed to draw the V2 score curve."""
+        """Fetch only fields needed to draw the official score curve."""
         rows = await self.session.execute(
             select(
                 MarketEmotionDaily.trade_date,
@@ -934,229 +925,54 @@ class MarketInsightRepository:
             for row in reversed(rows.all())
         ]
 
-    async def v2_market_metrics(
+    async def market_summary_metrics(
         self,
         trade_dates: list[date],
         *,
         progress_reporter: Callable[[dict], Awaitable[None]] | None = None,
     ) -> dict[date, dict]:
-        """Aggregate V2 inputs from a listing-day-aware eligible universe.
-
-        The sixth and twentieth open dates are resolved once per eligible
-        stock.  The market aggregate itself only reads the requested dates;
-        20-day high/low uses the existing ``(stock_code, trade_date DESC)``
-        index through a bounded LATERAL lookup.  It must not sort a broad
-        history range with a window function for every calibration run.
-        """
+        """Read the once-per-day official market aggregate for emotion scoring."""
         if not trade_dates:
             return {}
-        # Resolve listing-day cutoffs once per eligible stock.  Keeping the
-        # correlated trade-calendar lookup inside a DailyBar history scan made
-        # PostgreSQL execute it against millions of rows during calibration.
-        sixth_open_date = self._open_date_after_listing(offset=5)
-        twentieth_open_date = self._open_date_after_listing(offset=19)
-        eligible_stocks = (
-            select(
-                Stock.stock_code.label("stock_code"),
-                sixth_open_date.label("sixth_open_date"),
-                twentieth_open_date.label("twentieth_open_date"),
+        rows = (
+            await self.session.execute(
+                select(MarketSummaryDaily)
+                .where(MarketSummaryDaily.trade_date.in_(trade_dates))
+                .order_by(MarketSummaryDaily.trade_date)
             )
-            .where(Stock.list_date.is_not(None), *_active_stock_filters())
-            .cte("v2_eligible_stocks")
-        )
-        target_bars = (
-            select(
-                DailyBar.stock_code.label("stock_code"),
-                DailyBar.trade_date.label("trade_date"),
-                DailyBar.close_price.label("close_price"),
-                DailyBar.change_pct.label("change_pct"),
-                DailyBar.amount_yuan.label("amount_yuan"),
-                eligible_stocks.c.twentieth_open_date.label("twentieth_open_date"),
-            )
-            .select_from(DailyBar)
-            .join(eligible_stocks, eligible_stocks.c.stock_code == DailyBar.stock_code)
-            .where(
-                DailyBar.trade_date.in_(trade_dates),
-                DailyBar.trade_date >= eligible_stocks.c.sixth_open_date,
-            )
-            .cte("v2_target_bars")
-        )
-        rows = await self.session.execute(
-            select(
-                target_bars.c.trade_date.label("trade_date"),
-                func.count().label("daily_bar_count"),
-                func.count().filter(target_bars.c.change_pct > 0).label("up_count"),
-                func.count().filter(target_bars.c.change_pct < 0).label("down_count"),
-                func.count().filter(target_bars.c.change_pct == 0).label("flat_count"),
-                func.count().filter(target_bars.c.change_pct >= 5).label("wide_up_count"),
-                func.count().filter(target_bars.c.change_pct <= -5).label("wide_down_count"),
-                func.avg(target_bars.c.change_pct).label("average_change_pct"),
-                func.percentile_cont(0.5).within_group(target_bars.c.change_pct.asc()).label("median_change_pct"),
-                func.sum(target_bars.c.amount_yuan).label("total_amount_yuan"),
-                func.sum(StockFundFlowDaily.main_net_inflow).label("main_net_inflow"),
-                func.avg(StockFundFlowDaily.main_net_ratio).label("main_net_ratio"),
-                func.count().filter(
-                    func.coalesce(StockFactorDaily.basis_close_price, target_bars.c.close_price)
-                    >= StockFactorDaily.ma20
-                ).label("above_ma20_count"),
-                func.count().filter(
-                    func.coalesce(StockFactorDaily.basis_close_price, target_bars.c.close_price)
-                    >= StockFactorDaily.ma60
-                ).label("above_ma60_count"),
-                func.count(StockFactorDaily.id).label("factor_count"),
-                func.avg(StockFactorDaily.volatility_20d).label("volatility_20d"),
-                func.avg(StockFactorDaily.amount_ratio).label("amount_ratio"),
-                func.avg(StockDailyBasic.turnover_rate).label("turnover_rate"),
-            )
-            .select_from(target_bars)
-            .outerjoin(
-                StockFundFlowDaily,
-                and_(
-                    StockFundFlowDaily.stock_code == target_bars.c.stock_code,
-                    StockFundFlowDaily.trade_date == target_bars.c.trade_date,
-                ),
-            )
-            .outerjoin(
-                StockFactorDaily,
-                and_(
-                    StockFactorDaily.stock_code == target_bars.c.stock_code,
-                    StockFactorDaily.trade_date == target_bars.c.trade_date,
-                    StockFactorDaily.source == "system:daily_close",
-                ),
-            )
-            .outerjoin(
-                StockDailyBasic,
-                and_(
-                    StockDailyBasic.stock_code == target_bars.c.stock_code,
-                    StockDailyBasic.trade_date == target_bars.c.trade_date,
-                ),
-            )
-            .group_by(target_bars.c.trade_date)
-        )
-        result = {
-            row.trade_date: {
+        ).scalars().all()
+        result: dict[date, dict] = {}
+        for row in rows:
+            factor_count = int(row.factor_count or 0)
+            result[row.trade_date] = {
                 "daily_bar_count": int(row.daily_bar_count or 0),
                 "up_count": int(row.up_count or 0),
                 "down_count": int(row.down_count or 0),
                 "flat_count": int(row.flat_count or 0),
-                "wide_up_count": int(row.wide_up_count or 0),
-                "wide_down_count": int(row.wide_down_count or 0),
+                "wide_up_count": int(row.up_5pct_count or 0),
+                "wide_down_count": int(row.down_5pct_count or 0),
                 "average_change_pct": _float_or_none(row.average_change_pct),
                 "median_change_pct": _float_or_none(row.median_change_pct),
                 "total_amount_yuan": _float_or_none(row.total_amount_yuan),
-                "main_net_inflow": _float_or_none(row.main_net_inflow),
-                "main_net_ratio": _float_or_none(row.main_net_ratio),
-                "above_ma20_count": int(row.above_ma20_count or 0),
-                "above_ma60_count": int(row.above_ma60_count or 0),
-                "factor_count": int(row.factor_count or 0),
-                "twenty_day_stock_count": 0,
-                "new_high_20_count": 0,
-                "new_low_20_count": 0,
-                "volatility_20d": _float_or_none(row.volatility_20d),
-                "amount_ratio": _float_or_none(row.amount_ratio),
-                "turnover_rate": _float_or_none(row.turnover_rate),
+                "main_net_inflow": _float_or_none(row.main_net_inflow_yuan),
+                "main_net_ratio": _float_or_none(row.main_net_inflow_ratio),
+                "above_ma20_count": round((row.above_ma20_ratio or 0) * factor_count),
+                "above_ma60_count": round((row.above_ma60_ratio or 0) * factor_count),
+                "factor_count": factor_count,
+                "twenty_day_stock_count": factor_count,
+                "new_high_20_count": int(row.new_high_20d_count or 0),
+                "new_low_20_count": int(row.new_low_20d_count or 0),
+                "volatility_20d": _float_or_none(row.average_volatility_20d_pct),
+                "amount_ratio": _float_or_none(row.amount_ratio_5d),
+                "turnover_rate": _float_or_none(row.average_turnover_pct),
             }
-            for row in rows
-        }
-        # A per-target LATERAL lookup reads no more than twenty rows through
-        # DailyBar's stock/date index.  Keep this compact PostgreSQL shape
-        # explicit: SQLAlchemy's nested correlation form can instead
-        # materialise the target CTE repeatedly on some PostgreSQL versions.
-        high_low_statement = text(
-            """
-            WITH eligible AS MATERIALIZED (
-                SELECT
-                    stock.stock_code,
-                    (
-                        SELECT calendar.trade_date
-                        FROM t_trade_calendar AS calendar
-                        WHERE calendar.market = 'CN'
-                          AND calendar.is_open = TRUE
-                          AND calendar.trade_date >= stock.list_date
-                        ORDER BY calendar.trade_date
-                        OFFSET 5 LIMIT 1
-                    ) AS sixth_open_date,
-                    (
-                        SELECT calendar.trade_date
-                        FROM t_trade_calendar AS calendar
-                        WHERE calendar.market = 'CN'
-                          AND calendar.is_open = TRUE
-                          AND calendar.trade_date >= stock.list_date
-                        ORDER BY calendar.trade_date
-                        OFFSET 19 LIMIT 1
-                    ) AS twentieth_open_date
-                FROM t_stock AS stock
-                WHERE stock.list_date IS NOT NULL
-                  AND stock.status = 'active'
-                  AND stock.is_st = FALSE
-                  AND stock.exchange IN ('SH', 'SZ', 'SSE', 'SZSE')
-            ), target AS MATERIALIZED (
-                SELECT bar.stock_code, bar.trade_date, bar.close_price, eligible.twentieth_open_date
-                FROM t_daily_bar AS bar
-                JOIN eligible ON eligible.stock_code = bar.stock_code
-                WHERE bar.trade_date = ANY(:trade_dates)
-                  AND bar.trade_date >= eligible.sixth_open_date
+        if progress_reporter is not None:
+            await progress_reporter(
+                {"subphase": "official_market_summary", "summary_trade_date_count": len(result)}
             )
-            SELECT
-                target.trade_date,
-                count(*) FILTER (WHERE target.trade_date >= target.twentieth_open_date) AS twenty_day_stock_count,
-                count(*) FILTER (
-                    WHERE target.trade_date >= target.twentieth_open_date
-                      AND target.close_price >= high_low.high_20
-                ) AS new_high_20_count,
-                count(*) FILTER (
-                    WHERE target.trade_date >= target.twentieth_open_date
-                      AND target.close_price <= high_low.low_20
-                ) AS new_low_20_count
-            FROM target
-            JOIN LATERAL (
-                SELECT max(sample.close_price) AS high_20, min(sample.close_price) AS low_20
-                FROM (
-                    SELECT history.close_price
-                    FROM t_daily_bar AS history
-                    WHERE history.stock_code = target.stock_code
-                      AND history.trade_date <= target.trade_date
-                    ORDER BY history.trade_date DESC
-                    LIMIT 20
-                ) AS sample
-            ) AS high_low ON TRUE
-            GROUP BY target.trade_date
-            """
-        ).bindparams(bindparam("trade_dates", type_=ARRAY(Date())))
-        # Limit the index-probe part to 20 trade dates at a time.  This keeps
-        # memory and one database statement bounded on the remote PostgreSQL
-        # instance; a 370-date baseline can therefore surface progress every
-        # short batch rather than appearing stuck in a single giant query.
-        high_low_batch_size = 20
-        high_low_batch_total = (len(trade_dates) + high_low_batch_size - 1) // high_low_batch_size
-        for offset in range(0, len(trade_dates), high_low_batch_size):
-            high_low_batch_index = offset // high_low_batch_size + 1
-            high_low_rows = await self.session.execute(
-                high_low_statement,
-                {"trade_dates": trade_dates[offset : offset + high_low_batch_size]},
-            )
-            for row in high_low_rows:
-                if row.trade_date not in result:
-                    continue
-                result[row.trade_date].update(
-                    {
-                        "twenty_day_stock_count": int(row.twenty_day_stock_count or 0),
-                        "new_high_20_count": int(row.new_high_20_count or 0),
-                        "new_low_20_count": int(row.new_low_20_count or 0),
-                    }
-                )
-            if progress_reporter is not None:
-                await progress_reporter(
-                    {
-                        "subphase": "twenty_day_high_low",
-                        "high_low_batch_index": high_low_batch_index,
-                        "high_low_batch_total": high_low_batch_total,
-                        "high_low_batch_trade_date_count": len(trade_dates[offset : offset + high_low_batch_size]),
-                    }
-                )
         return result
 
-    async def v2_limit_event_rows(self, trade_dates: list[date]) -> dict[date, list[dict]]:
+    async def final_limit_event_rows(self, trade_dates: list[date]) -> dict[date, list[dict]]:
         if not trade_dates:
             return {}
         sixth_open_date = self._open_date_after_listing(offset=5)
@@ -1216,32 +1032,24 @@ class MarketInsightRepository:
             .scalar_subquery()
         )
 
-    async def v2_index_metrics(self, trade_dates: list[date]) -> dict[date, dict]:
+    async def market_summary_index_metrics(self, trade_dates: list[date]) -> dict[date, dict]:
         if not trade_dates:
             return {}
-        rows = await self.session.execute(
-            select(
-                IndexBar.trade_date,
-                func.count(IndexBar.id).label("index_count"),
-                func.avg(IndexBar.change_pct).label("average_change_pct"),
-                func.avg((IndexBar.high_price - IndexBar.low_price) / func.nullif(IndexBar.close_price, 0) * 100).label("amplitude_pct"),
+        rows = (
+            await self.session.execute(
+                select(MarketSummaryDaily).where(MarketSummaryDaily.trade_date.in_(trade_dates))
             )
-            .where(
-                IndexBar.trade_date.in_(trade_dates),
-                IndexBar.index_code.in_(CORE_INDEX_CODES),
-            )
-            .group_by(IndexBar.trade_date)
-        )
+        ).scalars().all()
         return {
             row.trade_date: {
-                "index_count": int(row.index_count or 0),
-                "core_index_change_pct": _float_or_none(row.average_change_pct),
-                "index_amplitude_pct": _float_or_none(row.amplitude_pct),
+                "index_count": int(row.core_index_ready_count or 0),
+                "core_index_change_pct": _float_or_none(row.core_index_average_return_1d_pct),
+                "index_amplitude_pct": _float_or_none(row.core_index_average_amplitude_pct),
             }
             for row in rows
         }
 
-    async def v2_north_flows(self, trade_dates: list[date]) -> dict[date, dict]:
+    async def final_north_flows(self, trade_dates: list[date]) -> dict[date, dict]:
         if not trade_dates:
             return {}
         rows = await self.session.execute(
@@ -1249,24 +1057,23 @@ class MarketInsightRepository:
         )
         return {
             row.trade_date: {
-                "north_money": _float_or_none(row.north_money),
+                "north_money": _float_or_none(row.north_money_yuan),
                 "source": row.source,
-                "value_unit": (row.metadata_json or {}).get("value_unit", "provider_reported"),
+                "value_unit": "yuan",
             }
             for row in rows.scalars().all()
         }
 
-    async def v2_theme_metrics(self, trade_dates: list[date]) -> dict[date, list[dict]]:
+    async def final_theme_metrics(self, trade_dates: list[date]) -> dict[date, list[dict]]:
         if not trade_dates:
             return {}
         rows = await self.session.execute(
-            select(MarketSectorHeatDaily)
+            select(SectorFactorDaily)
             .where(
-                MarketSectorHeatDaily.trade_date.in_(trade_dates),
-                MarketSectorHeatDaily.calculation_version == "v1",
-                MarketSectorHeatDaily.status == "ready",
+                SectorFactorDaily.trade_date.in_(trade_dates),
+                SectorFactorDaily.heat_score.is_not(None),
             )
-            .order_by(MarketSectorHeatDaily.trade_date, MarketSectorHeatDaily.heat_rank.asc().nulls_last())
+            .order_by(SectorFactorDaily.trade_date, SectorFactorDaily.heat_rank.asc().nulls_last())
         )
         result: dict[date, list[dict]] = {}
         for row in rows.scalars().all():
@@ -1275,17 +1082,17 @@ class MarketInsightRepository:
                     "sector_code": row.sector_code,
                     "heat_score": _float_or_none(row.heat_score),
                     "heat_rank": int(row.heat_rank) if row.heat_rank is not None else None,
-                    "limit_up_stock_count": int((row.metrics or {}).get("limit_up_stock_count") or 0),
-                    "priced_component_count": int((row.metrics or {}).get("priced_component_count") or 0),
-                    "average_change_pct": _float_or_none((row.metrics or {}).get("average_change_pct")),
+                    "limit_up_stock_count": int(row.limit_up_stock_count or 0),
+                    "priced_component_count": int(row.component_count or 0),
+                    "average_change_pct": _float_or_none(row.average_change_pct),
                 }
             )
         return result
 
-    async def v2_external_confirmations(self, *, up_to: date) -> dict:
-        latest_hold = (
+    async def final_external_confirmations(self, *, up_to: date) -> dict:
+        latest_north = (
             await self.session.execute(
-                select(func.max(StockNorthHoldDaily.trade_date)).where(StockNorthHoldDaily.trade_date <= up_to)
+                select(func.max(MarketNorthFlowDaily.trade_date)).where(MarketNorthFlowDaily.trade_date <= up_to)
             )
         ).scalar_one_or_none()
         latest_margin = (
@@ -1293,12 +1100,17 @@ class MarketInsightRepository:
                 select(func.max(MarginSummaryDaily.trade_date)).where(MarginSummaryDaily.trade_date <= up_to)
             )
         ).scalar_one_or_none()
-        payload: dict = {"north_hold_latest_trade_date": latest_hold, "margin_latest_trade_date": latest_margin}
+        payload: dict = {"north_flow_latest_trade_date": latest_north, "margin_latest_trade_date": latest_margin}
+        if latest_north is not None:
+            north = await self.session.execute(
+                select(MarketNorthFlowDaily.north_money_yuan).where(MarketNorthFlowDaily.trade_date == latest_north)
+            )
+            payload["north_flow_yuan"] = _float_or_none(north.scalar_one_or_none())
         if latest_margin is not None:
             total = await self.session.execute(
-                select(func.sum(MarginSummaryDaily.rzrqye)).where(MarginSummaryDaily.trade_date == latest_margin)
+                select(func.sum(MarginSummaryDaily.margin_total_balance_yuan)).where(MarginSummaryDaily.trade_date == latest_margin)
             )
-            payload["margin_rzrqye"] = _float_or_none(total.scalar_one_or_none())
+            payload["margin_balance_yuan"] = _float_or_none(total.scalar_one_or_none())
         return payload
 
     async def commit(self) -> None:

@@ -26,6 +26,7 @@ from app.modules.market_data.contracts import CanonicalMappingResult
 from app.modules.market_data.providers import MootdxProvider, normalize_symbol, parse_date, safe_float, safe_int
 from app.modules.market_data.partitioning import ensure_market_partitions
 from app.modules.market_data.repository import MarketDataRepository
+from app.modules.market_data.stock_factor_contract import map_stk_factor_pro_record
 from app.modules.market_data.tushare.contracts import TushareApiRequest
 from app.modules.market_data.tushare.adapters import TushareMarketAdapter, TushareStockDailyAdapter
 from app.modules.market_data.tushare_runtime import TushareProviderFactory, TushareRuntimeError
@@ -38,6 +39,11 @@ from app.modules.realtime_market.tickflow_runtime import (
 
 logger = logging.getLogger(__name__)
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _million_yuan(value: Any) -> float | None:
+    parsed = safe_float(value)
+    return parsed * 1_000_000 if parsed is not None else None
 
 
 class DailyMarketCloseIngestError(RuntimeError):
@@ -59,23 +65,16 @@ class DailyMarketCloseIngestRequest(BaseModel):
     sync_lhb: bool = True
     sync_index_bars: bool = True
     sync_index_daily_basic: bool = True
-    sync_north_hold: bool = False
     # Scheduler defaults opt in through migration 67.  Keeping request-level
     # defaults off makes ad-hoc/narrow repair payloads explicit and prevents a
     # surprise Provider call when callers construct this model directly.
     sync_market_north_flow: bool = False
     sync_delayed_external_confirmations: bool = False
-    sync_market_stats: bool = True
     sync_sector_bars: bool = True
     sync_sector_moneyflow: bool = True
     sync_minute: bool = True
     calculate_daily_factors: bool = True
     calculate_minute_factors: bool = True
-    calculate_technical_snapshot: bool = False
-    calculate_stock_fund_factors: bool = True
-    calculate_external_technical_factors: bool = False
-    merge_external_technical_factors: bool = False
-    assemble_daily_factors_v2: bool = False
     calculate_sector_factors: bool = True
     fail_on_enrichment_error: bool = False
     enrichment_block_concurrency: int = Field(default=4, ge=1, le=10)
@@ -100,10 +99,8 @@ class DailyMarketCloseIngestResult(BaseModel):
     lhb_seat_rows: int = 0
     index_bar_rows: int = 0
     index_daily_basic_rows: int = 0
-    north_hold_rows: int = 0
     market_north_flow_rows: int = 0
     delayed_external_confirmation_rows: int = 0
-    market_stat_rows: int = 0
     sector_bar_rows: int = 0
     sector_moneyflow_rows: int = 0
     minute_target_count: int = 0
@@ -113,10 +110,12 @@ class DailyMarketCloseIngestResult(BaseModel):
     minute_batch_count: int = 0
     minute_batches: list[dict] = Field(default_factory=list)
     daily_factor_rows: int = 0
-    daily_factor_v2_rows: int = 0
+    qfq_rebased_rows: int = 0
     minute_factor_rows: int = 0
-    technical_snapshot_rows: int = 0
     sector_factor_rows: int = 0
+    sector_leader_rows: int = 0
+    index_factor_rows: int = 0
+    market_summary_rows: int = 0
     enrichment_blocks: list[dict] = Field(default_factory=list)
     stage_timings: dict[str, int] = Field(default_factory=dict)
     block_status: dict[str, dict] = Field(default_factory=dict)
@@ -374,7 +373,6 @@ class DailyMarketCloseIngestService:
                 payload.sync_adjust_factor,
                 payload.sync_stock_moneyflow,
                 payload.sync_index_bars,
-                payload.sync_north_hold,
             )
         ):
             result.stage_timings["core_fact_blocks"] = int((perf_counter() - core_started) * 1000)
@@ -431,54 +429,26 @@ class DailyMarketCloseIngestService:
                 await self.repository.commit()
 
         indicator_repository = IndicatorRepository(self.repository.session)
-        active_factor_set = await self.repository.active_stock_factor_set()
-        write_legacy_daily_factors = payload.calculate_daily_factors and active_factor_set != "stock_daily_v2"
-        if payload.calculate_daily_factors and not write_legacy_daily_factors:
-            result.warnings.append("stock_daily_v2 已启用，跳过 V1 日频因子重复写入")
-        if write_legacy_daily_factors:
+        if payload.calculate_daily_factors:
             factor_started = perf_counter()
-            for codes in self._chunks(daily_targets, 500):
-                written = await indicator_repository.backfill_daily_factors_set_based(
-                    codes,
-                    start_date=trade_date,
-                    end_date=trade_date,
-                    history_start=trade_date.fromordinal(trade_date.toordinal() - 100),
-                    fund_history_start=trade_date.fromordinal(trade_date.toordinal() - 20),
-                    only_missing=False,
-                    calculate_stock_fund=payload.calculate_stock_fund_factors,
-                    include_external_technical=payload.calculate_external_technical_factors,
-                )
-                result.daily_factor_rows += written.get(trade_date, 0)
-                await self.repository.commit()
-            result.stage_timings["daily_factors"] = int((perf_counter() - factor_started) * 1000)
-
-        if payload.merge_external_technical_factors:
-            merge_started = perf_counter()
-            for codes in self._chunks(daily_targets, 1000):
-                result.daily_factor_rows += await indicator_repository.merge_external_technical_features(
-                    codes,
-                    trade_date=trade_date,
-                )
-                await self.repository.commit()
-            result.stage_timings["external_technical_merge"] = int(
-                (perf_counter() - merge_started) * 1000
+            result.qfq_rebased_rows = await indicator_repository.rebase_qfq_history_for_adjustment_changes(
+                trade_date=trade_date
             )
-
-        if payload.assemble_daily_factors_v2:
-            v2_started = perf_counter()
+            if result.qfq_rebased_rows:
+                await self.repository.commit()
             for codes in self._chunks(daily_targets, 500):
-                result.daily_factor_v2_rows += await indicator_repository.assemble_stock_daily_factors_v2(
+                result.daily_factor_rows += await indicator_repository.assemble_stock_daily_factors_final(
                     codes,
                     trade_date=trade_date,
                     history_start=trade_date.fromordinal(trade_date.toordinal() - 550),
                 )
                 await self.repository.commit()
-            await indicator_repository.refresh_stock_daily_v2_fund_percentiles(
+            await indicator_repository.refresh_stock_daily_final_percentiles(
                 start_date=trade_date,
                 end_date=trade_date,
             )
             await self.repository.commit()
-            result.stage_timings["daily_factors_v2"] = int((perf_counter() - v2_started) * 1000)
+            result.stage_timings["daily_factors"] = int((perf_counter() - factor_started) * 1000)
 
         if payload.calculate_minute_factors and minute_targets:
             factor_started = perf_counter()
@@ -490,27 +460,33 @@ class DailyMarketCloseIngestService:
                 await self.repository.commit()
             result.stage_timings["minute_factors"] = int((perf_counter() - factor_started) * 1000)
 
-        if payload.calculate_technical_snapshot:
-            snapshot_started = perf_counter()
-            for codes in self._chunks(daily_targets, 500):
-                written = await indicator_repository.backfill_technical_snapshots_set_based(
-                    codes,
-                    start_date=trade_date,
-                    end_date=trade_date,
-                    only_missing=False,
-                )
-                result.technical_snapshot_rows += written.get(trade_date, 0)
-                await self.repository.commit()
-            result.stage_timings["technical_snapshots"] = int(
-                (perf_counter() - snapshot_started) * 1000
-            )
 
         if payload.calculate_sector_factors:
             sector_factor_started = perf_counter()
             indicator = IndicatorEngineService(indicator_repository)
             result.sector_factor_rows = await indicator.calculate_sector_factors(trade_date=trade_date)
+            result.sector_factor_rows = await indicator_repository.rebuild_sector_final_metrics(
+                trade_date=trade_date
+            )
+            result.sector_leader_rows = await indicator_repository.rebuild_sector_leaders(
+                trade_date=trade_date
+            )
+            await self.repository.commit()
             result.stage_timings["sector_factors"] = int(
                 (perf_counter() - sector_factor_started) * 1000
+            )
+
+        if payload.calculate_daily_factors:
+            market_derived_started = perf_counter()
+            result.index_factor_rows = await indicator_repository.rebuild_index_factors(
+                trade_date=trade_date
+            )
+            result.market_summary_rows = await indicator_repository.rebuild_market_summary(
+                trade_date=trade_date
+            )
+            await self.repository.commit()
+            result.stage_timings["index_and_market_summary"] = int(
+                (perf_counter() - market_derived_started) * 1000
             )
 
         if payload.sync_minute and result.minute_target_count:
@@ -537,16 +513,14 @@ class DailyMarketCloseIngestService:
         await self._finalize_readiness(result, universe_count=len(universe))
         result.stage_timings["total"] = int((perf_counter() - run_started) * 1000)
         logger.info(
-            "daily close ingest finished: trade_date=%s status=%s daily=%s minute_complete=%s/%s factors=%s/%s/%s/%s",
+            "daily close ingest finished: trade_date=%s status=%s daily=%s minute_complete=%s/%s factors=%s/%s",
             trade_date,
             result.status,
             result.daily_rows,
             result.minute_complete_count,
             result.minute_target_count,
             result.daily_factor_rows,
-            result.daily_factor_v2_rows,
             result.minute_factor_rows,
-            result.technical_snapshot_rows,
         )
         return result
 
@@ -593,13 +567,6 @@ class DailyMarketCloseIngestService:
                 "target": "index_bar_rows",
                 "fail_on_error": payload.fail_on_enrichment_error,
                 "operation": lambda service: service._sync_index_bars(trade_date, result),
-            },
-            {
-                "label": "north hold",
-                "enabled": payload.sync_north_hold,
-                "target": "north_hold_rows",
-                "fail_on_error": payload.fail_on_enrichment_error,
-                "operation": lambda service: service._sync_north_hold(trade_date, universe_set, result),
             },
         ]
         enabled_specs = [spec for spec in specs if spec["enabled"]]
@@ -739,19 +706,6 @@ class DailyMarketCloseIngestService:
                 ),
             },
             {
-                "label": "market stats",
-                "enabled": payload.sync_market_stats,
-                "target": "market_stat_rows",
-                "mode": self._enhancement_mode(payload),
-                "range_start_date": payload.enhancement_start_date or trade_date,
-                "range_end_date": payload.enhancement_end_date or trade_date,
-                "operation": lambda service: service._sync_market_stats(
-                    trade_date,
-                    start_date=payload.enhancement_start_date,
-                    end_date=payload.enhancement_end_date,
-                ),
-            },
-            {
                 "label": "market north flow",
                 "enabled": payload.sync_market_north_flow,
                 "target": "market_north_flow_rows",
@@ -761,13 +715,13 @@ class DailyMarketCloseIngestService:
                 "operation": lambda service: service._sync_market_north_flow(trade_date),
             },
             {
-                "label": "delayed external confirmations",
+                "label": "delayed margin confirmation",
                 "enabled": payload.sync_delayed_external_confirmations,
                 "target": "delayed_external_confirmation_rows",
                 "mode": "recent_open_dates",
                 "range_start_date": None,
                 "range_end_date": trade_date,
-                "operation": lambda service: service._sync_delayed_external_confirmations(trade_date, universe_set),
+                "operation": lambda service: service._sync_delayed_margin_confirmations(trade_date),
             },
             {
                 "label": "sector moneyflow",
@@ -1040,7 +994,7 @@ class DailyMarketCloseIngestService:
                     "metadata_json": {
                         "provider": "tushare",
                         "api_name": "adj_factor",
-                        "schema_version": "canonical_v2",
+                        "schema_version": "canonical_final_r1",
                     },
                 }
             )
@@ -1061,32 +1015,18 @@ class DailyMarketCloseIngestService:
         )
         rows = []
         for record in response.records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
-            row_date = parse_date(record.get("trade_date"))
-            if not stock_code or row_date is None or stock_code not in universe:
+            row = map_stk_factor_pro_record(record)
+            if row is None or row["stock_code"] not in universe or row["trade_date"] != trade_date:
                 continue
-            factors = {
-                key: value
-                for key, value in record.items()
-                if key not in {"ts_code", "trade_date"} and value is not None
-            }
-            rows.append(
-                {
-                    "stock_code": stock_code,
-                    "trade_date": row_date,
-                    "source": "tushare:stk_factor_pro",
-                    "factors": factors,
-                    "metadata_json": {"provider": "tushare", "api_name": "stk_factor_pro"},
-                }
-            )
+            rows.append(row)
         await self._capture_raw_summary(
             "daily_market_close_stock_technical_factor_pro",
             trade_date,
             response.raw_payload,
             len(rows),
-            normalized_table="t_stock_technical_factor_daily",
+            normalized_table="t_stock_factor_daily",
         )
-        return await self.repository.upsert_stock_technical_factor_rows(rows)
+        return await self.repository.upsert_stock_factor_professional_rows(rows)
 
     async def _sync_stock_moneyflow(self, trade_date: date, universe: set[str]) -> int:
         response = await self._tushare_response("moneyflow", {"trade_date": trade_date}, capability="daily_market_close_stock_moneyflow")
@@ -1185,7 +1125,7 @@ class DailyMarketCloseIngestService:
                         "sell_amount": sell,
                         "net_amount": safe_float(record.get("net_buy")) or self._net(buy, sell),
                         "rank": safe_int(record.get("rank")),
-                        "metadata_json": {"provider": "tushare", "api_name": "top_inst", "raw": record},
+                        "metadata_json": {"provider": "tushare", "api_name": "top_inst"},
                     }
                 )
         await self._capture_raw_summary("daily_market_close_lhb_seats", trade_date, seat_response.raw_payload, len(seats), normalized_table="t_lhb_seat_detail")
@@ -1431,51 +1371,12 @@ class DailyMarketCloseIngestService:
         self._log_upsert_summary(mapping, upserted, "t_index_daily_basic")
         return upserted
 
-    async def _sync_north_hold(self, trade_date: date, universe: set[str], result: DailyMarketCloseIngestResult) -> int:
-        response = await self._tushare_response("hk_hold", {"trade_date": trade_date}, capability="daily_market_close_north_hold")
-        records = list(response.records)
-        used_date = trade_date
-        if not records:
-            for fallback_date in await self.repository.recent_open_trade_dates(up_to=trade_date, limit=5):
-                if fallback_date == trade_date:
-                    continue
-                fallback = await self._tushare_response("hk_hold", {"trade_date": fallback_date}, capability="daily_market_close_north_hold")
-                if fallback.records:
-                    records = list(fallback.records)
-                    used_date = fallback_date
-                    result.warnings.append(f"north_hold {trade_date.isoformat()} 无数据，已使用最近可用日 {fallback_date.isoformat()}")
-                    break
-        if not records:
-            result.warnings.append(f"north_hold_unavailable_for_trade_date: {trade_date.isoformat()}")
-        rows = []
-        for record in records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or record.get("code") or ""))
-            row_date = parse_date(record.get("trade_date"))
-            exchange = str(record.get("exchange") or record.get("market") or "ALL")
-            if stock_code and row_date and stock_code in universe:
-                rows.append(
-                    {
-                        "stock_code": stock_code,
-                        "stock_name": record.get("name"),
-                        "trade_date": row_date,
-                        "exchange": exchange,
-                        "source": "tushare:hk_hold",
-                        "hold_volume": safe_float(record.get("vol") or record.get("hold_vol")),
-                        "hold_ratio": safe_float(record.get("ratio") or record.get("hold_ratio")),
-                        "hold_market_value": safe_float(record.get("amount") or record.get("hold_amount")),
-                        "hold_volume_change": safe_float(record.get("vol_change") or record.get("hold_vol_chg")),
-                        "metadata_json": {"provider": "tushare", "api_name": "hk_hold", "raw": record},
-                    }
-                )
-        await self._capture_raw_summary("daily_market_close_north_hold", trade_date, {"api_name": "hk_hold", "used_date": used_date.isoformat(), "row_count": len(records)}, len(rows), normalized_table="t_stock_north_hold_daily")
-        return await self.repository.upsert_north_hold_rows(rows)
-
     async def _sync_market_north_flow(self, trade_date: date) -> int:
-        """Persist the market-level northbound flow published by Tushare.
+        """Persist market-level Stock Connect flow in canonical yuan.
 
-        Provider values intentionally retain their provider unit.  The unit is
-        stored beside the source data rather than guessing a conversion during
-        a market-emotion calculation.
+        Tushare ``moneyflow_hsgt`` publishes these values in millions of yuan.
+        Conversion occurs at the adapter boundary so downstream emotion and
+        report calculations never need provider-unit knowledge.
         """
         response = await self._tushare_response(
             "moneyflow_hsgt",
@@ -1491,17 +1392,17 @@ class DailyMarketCloseIngestService:
                 {
                     "trade_date": row_date,
                     "source": "tushare:moneyflow_hsgt",
-                    "hgt": safe_float(record.get("hgt")),
-                    "sgt": safe_float(record.get("sgt")),
-                    "north_money": safe_float(record.get("north_money")),
-                    "ggt_ss": safe_float(record.get("ggt_ss")),
-                    "ggt_sz": safe_float(record.get("ggt_sz")),
-                    "south_money": safe_float(record.get("south_money")),
+                    "hgt_yuan": _million_yuan(record.get("hgt")),
+                    "sgt_yuan": _million_yuan(record.get("sgt")),
+                    "north_money_yuan": _million_yuan(record.get("north_money")),
+                    "ggt_ss_yuan": _million_yuan(record.get("ggt_ss")),
+                    "ggt_sz_yuan": _million_yuan(record.get("ggt_sz")),
+                    "south_money_yuan": _million_yuan(record.get("south_money")),
                     "metadata_json": {
                         "provider": "tushare",
                         "api_name": "moneyflow_hsgt",
-                        "value_unit": "provider_reported",
-                        "raw": record,
+                        "unit_normalized": "yuan",
+                        "source_unit": "million_yuan",
                     },
                 }
             )
@@ -1517,54 +1418,11 @@ class DailyMarketCloseIngestService:
         )
         return await self.repository.upsert_market_north_flow_rows(rows)
 
-    async def _sync_delayed_external_confirmations(self, trade_date: date, universe: set[str]) -> int:
-        """Fill the last five published days of delayed north-hold and margin facts.
-
-        These facts are intentionally not a same-day completion condition.  A
-        provider may publish them one or more trade days later; saving the
-        actual ``trade_date`` makes that lag visible to the V2 report.
-        """
+    async def _sync_delayed_margin_confirmations(self, trade_date: date) -> int:
+        """Fill delayed market-level margin summaries for recent open dates."""
         dates = sorted(await self.repository.recent_open_trade_dates(up_to=trade_date, limit=5))
-        north_rows: list[dict] = []
         margin_rows: list[dict] = []
         for observed_date in dates:
-            hold_response = await self._tushare_response(
-                "hk_hold",
-                {"trade_date": observed_date},
-                capability="daily_market_close_delayed_north_hold",
-            )
-            mapped_hold: list[dict] = []
-            for record in hold_response.records:
-                stock_code = normalize_symbol(str(record.get("ts_code") or record.get("code") or ""))
-                row_date = parse_date(record.get("trade_date"))
-                if not stock_code or row_date is None or stock_code not in universe:
-                    continue
-                mapped_hold.append(
-                    {
-                        "stock_code": stock_code,
-                        "stock_name": record.get("name"),
-                        "trade_date": row_date,
-                        "exchange": str(record.get("exchange") or record.get("market") or "ALL"),
-                        "source": "tushare:hk_hold",
-                        "hold_volume": safe_float(record.get("vol") or record.get("hold_vol")),
-                        "hold_ratio": safe_float(record.get("ratio") or record.get("hold_ratio")),
-                        "hold_market_value": safe_float(record.get("amount") or record.get("hold_amount")),
-                        "hold_volume_change": safe_float(record.get("vol_change") or record.get("hold_vol_chg")),
-                        "metadata_json": {"provider": "tushare", "api_name": "hk_hold", "raw": record},
-                    }
-                )
-            north_rows.extend(mapped_hold)
-            await self._capture_raw_summary(
-                "daily_market_close_delayed_north_hold",
-                observed_date,
-                hold_response.raw_payload,
-                len(mapped_hold),
-                normalized_table="t_stock_north_hold_daily",
-                status="captured" if mapped_hold else "failed",
-                error_code=None if mapped_hold else "hk_hold_not_published",
-                error_message=None if mapped_hold else "hk_hold 未返回该披露日数据",
-            )
-
             margin_records: list[dict] = []
             for exchange in ("SSE", "SZSE"):
                 response = await self._tushare_response(
@@ -1584,13 +1442,12 @@ class DailyMarketCloseIngestService:
                         "trade_date": row_date,
                         "exchange": exchange,
                         "source": "tushare:margin",
-                        "rzye": safe_float(record.get("rzye")),
-                        "rz_mre": safe_float(record.get("rzmre") or record.get("rz_mre")),
-                        "rzche": safe_float(record.get("rzche")),
-                        "rqye": safe_float(record.get("rqye")),
-                        "rq_mcl": safe_float(record.get("rqmcl") or record.get("rq_mcl")),
-                        "rzrqye": safe_float(record.get("rzrqye")),
-                        "metadata_json": {"provider": "tushare", "api_name": "margin", "raw": record},
+                        "financing_balance_yuan": safe_float(record.get("rzye")),
+                        "financing_buy_yuan": safe_float(record.get("rzmre") or record.get("rz_mre")),
+                        "financing_repay_yuan": safe_float(record.get("rzche")),
+                        "securities_lending_balance_yuan": safe_float(record.get("rqye")),
+                        "securities_lending_sell_shares": safe_float(record.get("rqmcl") or record.get("rq_mcl")),
+                        "margin_total_balance_yuan": safe_float(record.get("rzrqye")),
                     }
                 )
             margin_rows.extend(mapped_margin)
@@ -1604,50 +1461,8 @@ class DailyMarketCloseIngestService:
                 error_code=None if mapped_margin else "margin_not_published",
                 error_message=None if mapped_margin else "margin 未返回该披露日数据",
             )
-        north_upserted = await self.repository.upsert_north_hold_rows(north_rows)
         margin_upserted = await self.repository.upsert_margin_summary_rows(margin_rows)
-        return north_upserted + margin_upserted
-
-    async def _sync_market_stats(self, trade_date: date, *, start_date: date | None = None, end_date: date | None = None) -> int:
-        request_start_date = start_date or trade_date
-        request_end_date = end_date or trade_date
-        rows = []
-        for exchange in ("SH", "SZ"):
-            params = {"exchange": exchange}
-            if request_start_date != request_end_date:
-                params.update({"start_date": request_start_date, "end_date": request_end_date})
-            else:
-                params["trade_date"] = trade_date
-            response = await self._tushare_response("daily_info", params, capability="daily_market_close_market_stats")
-            mapping = self.tushare_market_adapter.map_market_daily_stat(
-                response.records,
-                start_date=request_start_date,
-                end_date=request_end_date,
-                default_exchange=exchange,
-            )
-            self._log_mapping_summary(mapping)
-            rows.extend(mapping.rows)
-        await self._capture_raw_summary(
-            "daily_market_close_market_stats",
-            trade_date,
-            {
-                "api_name": "daily_info",
-                "exchanges": ["SH", "SZ"],
-                "mode": "date_range" if request_start_date != request_end_date else "single_date",
-                "start_date": request_start_date.isoformat(),
-                "end_date": request_end_date.isoformat(),
-            },
-            len(rows),
-            normalized_table="t_market_daily_stat",
-        )
-        upserted = await self.repository.upsert_market_daily_stat_rows(rows)
-        logger.info(
-            "provider canonical upsert: provider=tushare api=daily_info capability=market_daily_stat table=t_market_daily_stat range=%s mapped=%s upserted=%s",
-            {"start_date": request_start_date.isoformat(), "end_date": request_end_date.isoformat()},
-            len(rows),
-            upserted,
-        )
-        return upserted
+        return margin_upserted
 
     async def _sync_sector_bars(self, trade_date: date, result: DailyMarketCloseIngestResult) -> int:
         sector_map = await self.repository.tushare_ths_sector_map()
@@ -1827,69 +1642,6 @@ class DailyMarketCloseIngestService:
             select(DailyBar.stock_code).where(DailyBar.trade_date == trade_date, DailyBar.source == "tushare:daily")
         )
         return list(rows.scalars().all())
-
-    def _daily_rows(self, records: list[dict]) -> list[dict]:
-        rows = []
-        for record in records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
-            trade_date = parse_date(record.get("trade_date"))
-            if not stock_code or trade_date is None:
-                continue
-            amount = safe_float(record.get("amount"))
-            volume = safe_int(record.get("vol"))
-            rows.append(
-                {
-                    "stock_code": stock_code,
-                    "trade_date": trade_date,
-                    "source": "tushare:daily",
-                    "adjust_mode": "none",
-                    "open_price": safe_float(record.get("open")),
-                    "high_price": safe_float(record.get("high")),
-                    "low_price": safe_float(record.get("low")),
-                    "close_price": safe_float(record.get("close")),
-                    "pre_close_price": safe_float(record.get("pre_close")),
-                    "change_amount": safe_float(record.get("change")),
-                    "change_pct": safe_float(record.get("pct_chg")),
-                    "volume_hand": volume,
-                    "volume_share": volume * 100 if volume is not None else None,
-                    "amount_yuan": amount * 1000 if amount is not None else None,
-                    "turnover_rate": None,
-                    "metadata_json": {"provider": "tushare", "api_name": "daily"},
-                }
-            )
-        return rows
-
-    def _daily_basic_rows(self, records: list[dict]) -> list[dict]:
-        rows = []
-        for record in records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
-            trade_date = parse_date(record.get("trade_date"))
-            if not stock_code or trade_date is None:
-                continue
-            rows.append(
-                {
-                    "stock_code": stock_code,
-                    "trade_date": trade_date,
-                    "source": "tushare:daily_basic",
-                    "turnover_rate": safe_float(record.get("turnover_rate")),
-                    "turnover_rate_f": safe_float(record.get("turnover_rate_f")),
-                    "volume_ratio": safe_float(record.get("volume_ratio")),
-                    "pe": safe_float(record.get("pe")),
-                    "pe_ttm": safe_float(record.get("pe_ttm")),
-                    "pb": safe_float(record.get("pb")),
-                    "ps": safe_float(record.get("ps")),
-                    "ps_ttm": safe_float(record.get("ps_ttm")),
-                    "dv_ratio": safe_float(record.get("dv_ratio")),
-                    "dv_ttm": safe_float(record.get("dv_ttm")),
-                    "total_share": safe_float(record.get("total_share")),
-                    "float_share": safe_float(record.get("float_share")),
-                    "free_share": safe_float(record.get("free_share")),
-                    "total_mv": safe_float(record.get("total_mv")),
-                    "circ_mv": safe_float(record.get("circ_mv")),
-                    "metadata_json": {"provider": "tushare", "api_name": "daily_basic", "schema_version": "canonical_v2"},
-                }
-            )
-        return rows
 
     @staticmethod
     def _to_ts_code(stock_code: str) -> str:
@@ -2114,25 +1866,12 @@ class DailyMarketCloseIngestService:
                 "payload_sha256": hashlib.sha256(encoded).hexdigest(),
                 "normalized_table": normalized_table
                 or ("t_daily_bar" if capability.endswith("daily") else "t_stock_daily_basic"),
-                "schema_version": "canonical_v2",
+                "schema_version": "canonical_final_r1",
                 "status": audit_status,
                 "error_code": error_code,
                 "error_message": error_message,
             }
         )
-
-    @staticmethod
-    def _compact_raw_payload(payload: dict, *, row_count: int) -> dict:
-        """Keep audit metadata for large responses without duplicating canonical facts."""
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-        data = payload.get("data")
-        fields = data.get("fields") if isinstance(data, dict) else payload.get("fields")
-        return {
-            "row_count": row_count,
-            "sha256": hashlib.sha256(encoded).hexdigest(),
-            "raw_payload_keys": sorted(payload.keys()),
-            "fields": fields if isinstance(fields, list) else None,
-        }
 
     @staticmethod
     def _net(buy: float | None, sell: float | None) -> float | None:
@@ -2170,7 +1909,6 @@ class DailyMarketCloseIngestService:
         universe_count: int | None = None,
     ) -> dict[str, Any]:
         counts = await self.repository.daily_close_asset_counts(trade_date)
-        active_factor_set = await self.repository.active_stock_factor_set()
         raw_capabilities = set(counts.pop("raw_capabilities", set()))
         active_count = int(universe_count or counts.get("active_stock") or 0)
         daily_count = int(counts.get("daily_bar") or 0)
@@ -2182,8 +1920,7 @@ class DailyMarketCloseIngestService:
             "daily_basic": min(1.0, int(counts.get("daily_basic") or 0) / daily_denominator),
             "stock_moneyflow": min(1.0, int(counts.get("stock_moneyflow") or 0) / daily_denominator),
             "adjust_factors": min(1.0, int(counts.get("adjust_factor") or 0) / daily_denominator),
-            "daily_factors": min(1.0, int(counts.get("daily_factor") or 0) / daily_denominator),
-            "daily_factors_v2": min(1.0, int(counts.get("daily_factor_v2_ready") or 0) / daily_denominator),
+            "daily_factors": min(1.0, int(counts.get("daily_factor_ready") or 0) / daily_denominator),
             "stock_technical": min(
                 1.0,
                 int(counts.get("stock_technical") or 0) / daily_denominator,
@@ -2222,28 +1959,18 @@ class DailyMarketCloseIngestService:
             "stock_moneyflow": coverage["stock_moneyflow"] >= 0.95,
             "adjust_factors": coverage["adjust_factors"] >= 0.95,
             "index_bars": coverage["index_bars"] >= 0.85,
-            (
-                "daily_factors_v2" if active_factor_set == "stock_daily_v2" else "daily_factors"
-            ): (
-                coverage["daily_factors_v2"] >= 0.95
-                if active_factor_set == "stock_daily_v2"
-                else coverage["daily_factors"] >= 0.95
-            ),
         }
         enhancement_checks = {
+            "daily_factors": coverage["daily_factors"] >= 0.95,
             "stock_events": event_complete,
-            "stock_technical": coverage["stock_technical"] >= 0.95,
             "lhb": lhb_complete,
             "index_daily_basic": coverage["index_daily_basic"] >= 0.85,
             "sector_bars": coverage["sector_bars"] >= 0.90,
             "sector_moneyflow": sector_moneyflow_complete,
             "sector_factors": int(counts.get("sector_factor") or 0) > 0,
+            "market_summary": int(counts.get("market_summary") or 0) > 0,
         }
-        if active_factor_set != "stock_daily_v2":
-            enhancement_checks["daily_factors_v2"] = coverage["daily_factors_v2"] >= 0.95
-        optional_checks = {
-            "market_stats": int(counts.get("market_stat") or 0) > 0,
-        }
+        optional_checks = {"stock_technical": coverage["stock_technical"] >= 0.95}
         block_status: dict[str, dict] = {}
         for name, complete in {**core_checks, **enhancement_checks}.items():
             block_status[name] = {
@@ -2258,7 +1985,6 @@ class DailyMarketCloseIngestService:
                             "stock_events": "limit_event",
                             "index_bars": "index_bar",
                             "daily_factors": "daily_factor",
-                            "daily_factors_v2": "daily_factor_v2_ready",
                             "stock_technical": "stock_technical",
                             "lhb": "lhb_event",
                             "index_daily_basic": "index_daily_basic",
@@ -2271,9 +1997,9 @@ class DailyMarketCloseIngestService:
                     or 0
                 ),
             }
-        block_status["market_stats"] = {
-            "status": "complete" if optional_checks["market_stats"] else "deferred",
-            "rows": int(counts.get("market_stat") or 0),
+        block_status["stock_technical"] = {
+            "status": "complete" if optional_checks["stock_technical"] else "deferred",
+            "rows": int(counts.get("stock_technical") or 0),
         }
         core_ready = all(core_checks.values())
         enhancement_ready = all(enhancement_checks.values())
@@ -2296,7 +2022,6 @@ class DailyMarketCloseIngestService:
                 else "blocked"
             ),
             "missing_blocks": missing_blocks,
-            "active_factor_set": active_factor_set,
         }
 
     async def _finalize_readiness(

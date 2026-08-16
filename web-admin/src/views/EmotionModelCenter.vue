@@ -4,13 +4,13 @@
       <div>
         <div class="eyebrow">可配置 / 可审计</div>
         <h1>情绪模型</h1>
-        <p>V2 将“短线接力环境”和“大盘风险偏好”拆分评分。发布前必须完成 250 个交易日基线校准；历史评分永远保留其参数快照。</p>
+        <p>正式双分模型将“短线接力环境”和“大盘风险偏好”拆分评分。发布前必须完成 250 个交易日基线校准；历史评分永远保留其参数快照。</p>
       </div>
       <n-button type="primary" @click="openCreate()"><template #icon><Plus :size="16" /></template>新建草稿</n-button>
     </header>
 
     <n-alert type="info" :show-icon="true" class="page-alert">
-      当前页面不触发行情请求。校准仅调用已沉淀的日线、事件、因子和概念热度事实，并通过“生成每日市场报告与 V2 情绪事实”任务后台执行。
+      当前页面不触发行情请求。校准只读取市场汇总、事件和正式板块因子，并通过“生成每日市场报告与双分情绪事实”任务后台执行。
     </n-alert>
 
     <n-spin :show="loading">
@@ -91,7 +91,7 @@
       </section>
     </n-spin>
 
-    <n-modal v-model:show="createOpen" preset="card" title="新建 V2 情绪模型草稿" style="width: min(520px, calc(100vw - 28px))">
+    <n-modal v-model:show="createOpen" preset="card" title="新建双分情绪模型草稿" style="width: min(520px, calc(100vw - 28px))">
       <n-form label-placement="top"><n-form-item label="模型代码"><n-input v-model:value="createForm.model_code" placeholder="例如 cn_a_emotion_v2_test" /></n-form-item><n-form-item label="模型名称"><n-input v-model:value="createForm.model_name" placeholder="例如 A 股短线情绪实验版" /></n-form-item><n-form-item label="克隆来源"><n-select v-model:value="createForm.clone_from" clearable :options="models.map((item) => ({ label: `${item.model_name} (${item.model_code})`, value: item.model_code }))" placeholder="不选则使用默认参数" /></n-form-item></n-form>
       <template #footer><div class="modal-actions"><n-button @click="createOpen = false">取消</n-button><n-button type="primary" :loading="creating" @click="create">创建草稿</n-button></div></template>
     </n-modal>
@@ -250,7 +250,7 @@ function openCreate(cloneFrom?: string) { createForm.model_code = ''; createForm
 async function create() { if (!createForm.model_code || !createForm.model_name) { message.warning('请填写模型代码和名称'); return; } creating.value = true; try { const model = await marketInsightApi.createEmotionModel(createForm); createOpen.value = false; await load(); const created = models.value.find((item) => item.model_code === model.model_code); if (created) selectModel(created); message.success('草稿已创建'); } catch (error) { message.error(error instanceof Error ? error.message : '创建草稿失败'); } finally { creating.value = false; } }
 async function saveDraft() { if (!selected.value || parameterError.value) { message.warning(parameterError.value || '没有可保存的草稿'); return; } saving.value = true; try { await marketInsightApi.updateEmotionModel(selected.value.model_code, { ...form, parameter_json: clone(parameters) }); await load(); message.success('草稿已保存'); } catch (error) { message.error(error instanceof Error ? error.message : '保存草稿失败'); } finally { saving.value = false; } }
 async function calibrate() { if (!selected.value) return; if (isDraft.value && parameterError.value) { message.warning(parameterError.value); return; } calibrating.value = true; try { if (isDraft.value) await saveDraft(); const job = await marketInsightApi.calibrateEmotionModel(selected.value.model_code); await schedulerApi.runJob(job.job_code, job.payload, true); message.success('基线校准已在后台启动，可在调度中心查看进度'); await load(); } catch (error) { message.error(error instanceof Error ? error.message : '启动校准失败'); } finally { calibrating.value = false; } }
-async function activate() { if (!selected.value) return; activating.value = true; try { await marketInsightApi.activateEmotionModel(selected.value.model_code); await load(); message.success('V2 情绪模型已启用，后续 22:15 任务将计算双分'); } catch (error) { message.error(error instanceof Error ? error.message : '启用模型失败'); } finally { activating.value = false; } }
+async function activate() { if (!selected.value) return; activating.value = true; try { await marketInsightApi.activateEmotionModel(selected.value.model_code); await load(); message.success('双分情绪模型已启用，后续 22:15 任务将计算正式结果'); } catch (error) { message.error(error instanceof Error ? error.message : '启用模型失败'); } finally { activating.value = false; } }
 onMounted(() => { void load(); });
 </script>
 

@@ -58,8 +58,8 @@
 
         <section class="surface emotion-v2-surface">
           <div class="panel-heading">
-            <div><span class="panel-kicker">V2 双分情绪</span><h2>接力环境、风险偏好与周期</h2></div>
-            <span class="muted">{{ emotion?.model?.model_name || '等待管理员启用 V2 模型' }}</span>
+            <div><span class="panel-kicker">正式双分情绪</span><h2>接力环境、风险偏好与周期</h2></div>
+            <span class="muted">{{ emotion?.model?.model_name || '等待管理员启用情绪模型' }}</span>
           </div>
           <template v-if="emotion?.available">
             <div class="emotion-v2-summary">
@@ -72,35 +72,10 @@
             <div class="emotion-scorecard-grid">
               <article v-for="card in emotionScorecards" :key="card.key" class="emotion-card"><div class="emotion-card-head"><strong>{{ card.label }}</strong><b>{{ formatScore(card.score) }}</b></div><div class="emotion-metric-list"><div v-for="item in Object.entries(card.items)" :key="item[0]" class="emotion-metric"><span>{{ item[1].label || item[0] }}</span><b>{{ item[1].available ? `${formatScore(item[1].score)} 分` : '暂缺' }}</b><small>原始 {{ formatRaw(item[1].raw_value) }} {{ item[1].unit || '' }} · 120 日分位 {{ formatPercent(item[1].percentile_120d) }} · 贡献 {{ formatScore(item[1].contribution) }}</small></div></div></article>
             </div>
-            <details class="emotion-details"><summary>查看全部 V2 指标、来源与公式</summary><div class="emotion-details-table"><article v-for="metric in emotionMetrics" :key="metric.key"><strong>{{ metric.value.label || metric.key }}</strong><span>原始 {{ formatRaw(metric.value.raw_value) }} {{ metric.value.unit || '' }}</span><span>分位 {{ formatPercent(metric.value.percentile_120d) }} · 得分 {{ formatScore(metric.value.score) }}</span><small>{{ metric.value.formula || '-' }} · 来源 {{ metric.value.source || '-' }} · {{ metric.value.freshness || '-' }}</small></article></div></details>
-            <div class="external-confirmation"><b>辅助确认（不参与评分）</b><span>北向持仓最新披露日 {{ String(emotion.external_confirmations?.north_hold_latest_trade_date || '未披露') }}</span><span>两融最新披露日 {{ String(emotion.external_confirmations?.margin_latest_trade_date || '未披露') }}</span></div>
+            <details class="emotion-details"><summary>查看全部指标、来源与公式</summary><div class="emotion-details-table"><article v-for="metric in emotionMetrics" :key="metric.key"><strong>{{ metric.value.label || metric.key }}</strong><span>原始 {{ formatRaw(metric.value.raw_value) }} {{ metric.value.unit || '' }}</span><span>分位 {{ formatPercent(metric.value.percentile_120d) }} · 得分 {{ formatScore(metric.value.score) }}</span><small>{{ metric.value.formula || '-' }} · 来源 {{ metric.value.source || '-' }} · {{ metric.value.freshness || '-' }}</small></article></div></details>
+            <div class="external-confirmation"><b>辅助确认（不参与评分）</b><span>市场级北向资金最新披露日 {{ String(emotion.external_confirmations?.north_flow_latest_trade_date || '未披露') }}</span><span>两融最新披露日 {{ String(emotion.external_confirmations?.margin_latest_trade_date || '未披露') }}</span></div>
           </template>
           <n-alert v-else type="info" :show-icon="true">{{ emotionUnavailableLabel }}</n-alert>
-        </section>
-
-        <section class="surface sentiment-surface">
-          <div class="panel-heading">
-            <div><span class="panel-kicker">规则化市场状态</span><h2>今日情绪分与阶段</h2></div>
-            <span class="muted">{{ sentiment?.calculation_version ? `计算版本 ${sentiment.calculation_version}` : '等待每日情绪任务' }}</span>
-          </div>
-          <template v-if="sentiment?.available">
-            <div class="sentiment-layout">
-              <div class="sentiment-score"><strong>{{ formatScore(sentiment.sentiment_score) }}</strong><span>情绪分 / 100</span></div>
-              <div class="stage-card"><span>当前阶段</span><strong>{{ sentiment.stage_label || '-' }}</strong><small>{{ sentiment.trade_date }} · 覆盖 {{ formatPercent(sentiment.coverage?.daily_bar_coverage_pct) }}</small></div>
-              <div class="sentiment-facts">
-                <span>昨日涨停溢价 <b :class="changeClass(sentiment.metrics?.previous_limit_up_premium_pct)">{{ formatPercent(sentiment.metrics?.previous_limit_up_premium_pct) }}</b></span>
-                <span>成交额 / 5 日均值 <b>{{ formatRatio(sentiment.metrics?.amount_vs_5d_average) }}</b></span>
-                <span>最高连板 <b>{{ formatInteger(sentiment.metrics?.highest_board_count) }} 板</b></span>
-              </div>
-            </div>
-            <div class="component-grid">
-              <article v-for="component in sentimentComponents" :key="component.key" :title="component.formula" class="component-card" :class="{ unavailable: !component.available }">
-                <span>{{ component.label }}</span><strong>{{ component.available ? formatScore(component.score) : '暂缺' }}</strong><small>权重 {{ formatWeight(component.weight) }} · 原始值 {{ formatRaw(component.raw_value) }}</small>
-              </article>
-            </div>
-            <p class="panel-note">评分只使用已完成的日线、涨跌停/炸板与交易日历。阶段中的“主升期”还要求连续两日高分、至少 3 板高度和昨日涨停正溢价；LLM 不参与评分。</p>
-          </template>
-          <n-alert v-else type="info" :show-icon="true">{{ sentimentUnavailableLabel }}</n-alert>
         </section>
 
         <section class="surface theme-surface">
@@ -189,13 +164,12 @@ import { NAlert, NButton, NEmpty, NInput, NSpin, NTag, useMessage } from 'naive-
 import { RefreshCw } from 'lucide-vue-next';
 import { marketInsightApi } from '@/api/market-insight';
 import { realtimeMarketApi } from '@/api/realtime-market';
-import type { MarketDailyReview, MarketDailySentiment, MarketEmotionDaily, MarketEmotionScorecard } from '@/types/market-insight';
+import type { MarketDailyReview, MarketEmotionDaily, MarketEmotionScorecard } from '@/types/market-insight';
 import type { PostCloseMarketStructure } from '@/types/realtime-market';
 
 const message = useMessage();
 const loading = ref(false);
 const structure = ref<PostCloseMarketStructure | null>(null);
-const sentiment = ref<MarketDailySentiment | null>(null);
 const emotion = ref<MarketEmotionDaily | null>(null);
 const dailyReview = ref<MarketDailyReview | null>(null);
 const requestedTradeDate = ref('');
@@ -207,7 +181,6 @@ const summary = computed(() => structure.value?.summary || null);
 const reportTradeDate = computed(() => (
   structure.value?.trade_date
   || emotion.value?.trade_date
-  || sentiment.value?.trade_date
   || dailyReview.value?.trade_date
   || activeTradeDate.value
   || null
@@ -221,7 +194,7 @@ const reportBlocks = computed(() => [
   },
   {
     key: 'emotion',
-    label: 'V2 双分情绪',
+    label: '双分情绪',
     complete: Boolean(emotion.value?.available),
     detail: emotion.value?.available ? `${emotion.value.primary_stage_label} · ${emotion.value.status === 'degraded' ? '降级可用' : '完整'}` : '等待模型或当日计算完成',
   },
@@ -233,41 +206,28 @@ const reportBlocks = computed(() => [
   },
 ]);
 const completedReportBlockCount = computed(() => reportBlocks.value.filter((item) => item.complete).length);
-const reportStage = computed(() => (
-  emotion.value?.available ? emotion.value.primary_stage_label : sentiment.value?.available ? sentiment.value.stage_label || '规则状态待定' : '待完成'
-));
+const reportStage = computed(() => emotion.value?.available ? emotion.value.primary_stage_label : '待完成');
 const reportStageDetail = computed(() => (
   emotion.value?.available
     ? `短线 ${formatScore(emotion.value.short_term_score)} · 风险偏好 ${formatScore(emotion.value.market_risk_on_score)}`
-    : sentiment.value?.available
-      ? `V1 情绪分 ${formatScore(sentiment.value.sentiment_score)}`
-      : '不以缺失数据推断市场阶段'
+    : '不以缺失数据推断市场阶段'
 ));
 const unavailableLabel = computed(() => ({
   daily_bar_unavailable: '所选报告日尚无日线事实，无法确定盘后结构。',
   limit_event_ingest_incomplete: '涨跌停/炸板事件尚未完成入库，系统不会把零行误判为无事件。',
   post_close_structure_load_failed: '盘后事件事实暂时无法读取，请稍后重试。',
 }[String(structure.value?.reason)] || '等待最近交易日的涨跌停事件事实。'));
-const sentimentComponents = computed(() => Object.entries(sentiment.value?.components || {}).map(([key, component]) => ({ key, ...component })));
 const emotionScorecards = computed(() => Object.entries(emotion.value?.scorecards || {}).map(([key, card]) => ({ key, ...(card as MarketEmotionScorecard) })));
 const emotionMetrics = computed(() => Object.entries(emotion.value?.metrics || {}).map(([key, value]) => ({ key, value })));
 const emotionUnavailableLabel = computed(() => {
-  if (emotion.value?.reason === 'market_emotion_model_not_active') return '尚未启用 V2 情绪模型。请先在“情绪模型”完成 250 日基线校准，并由管理员确认启用。';
-  if (emotion.value?.reason === 'market_emotion_not_calculated') return '已启用 V2 模型，但当日双分尚未由 22:15 盘后任务计算。';
+  if (emotion.value?.reason === 'market_emotion_model_not_active') return '尚未启用情绪模型。请先在“情绪模型”完成 250 日基线校准，并由管理员确认启用。';
+  if (emotion.value?.reason === 'market_emotion_not_calculated') return '已启用情绪模型，但当日双分尚未由 22:15 盘后任务计算。';
   if (emotion.value?.status === 'pending') return '当日日线或涨跌停事件完成门槛不足，系统不会用零值生成双分。';
-  return '等待 V2 双分情绪事实完成。';
-});
-const sentimentUnavailableLabel = computed(() => {
-  const reasons = sentiment.value?.coverage?.unavailable_reasons || [];
-  if (reasons.includes('daily_bar_coverage_below_threshold')) return '日线覆盖率尚未达到 95%，不会生成不完整的情绪分。';
-  if (reasons.includes('limit_event_ingest_incomplete')) return '涨跌停/炸板 Raw 完成标记尚未到位，情绪分保持待完成。';
-  return sentiment.value?.reason === 'market_sentiment_not_calculated'
-    ? '每日情绪任务尚未运行。可在调度中心执行“计算每日市场情绪事实”，历史首次使用时请按日期范围回填。'
-    : '等待每日市场情绪事实完成。';
+  return '等待双分情绪事实完成。';
 });
 const dailyReviewUnavailableLabel = computed(() => {
-  if (dailyReview.value?.reason === 'market_sentiment_pending') return '市场情绪事实尚未完成，热点与涨停证据保持待生成。';
-  if (dailyReview.value?.reason === 'sector_heat_not_calculated') return '每日市场报告任务尚未生成概念热度；可在调度中心执行“生成每日市场报告事实”。';
+  if (dailyReview.value?.reason === 'market_emotion_pending') return '市场情绪事实尚未完成，涨停证据保持待生成。';
+  if (dailyReview.value?.reason === 'sector_heat_not_calculated') return '正式板块因子尚未生成概念热度。';
   if (dailyReview.value?.reason === 'limit_up_evidence_incomplete') return '涨停关联证据尚未全部沉淀，请等待任务完成。';
   return '等待每日市场报告事实完成。';
 });
@@ -291,21 +251,15 @@ async function loadReview(silent = false) {
     // avoiding a mixed latest/latest-1 report during an ingest boundary.
     const factTradeDate = selectedTradeDate || (structureResult.status === 'fulfilled' ? structureResult.value.trade_date || undefined : undefined);
     const factParams = factTradeDate ? { trade_date: factTradeDate } : undefined;
-    const [sentimentResult, emotionResult, reviewResult] = await Promise.allSettled([
-      marketInsightApi.dailySentiment(factParams),
+    const [emotionResult, reviewResult] = await Promise.allSettled([
       marketInsightApi.emotionDaily(factParams),
       marketInsightApi.dailyReview(factParams),
     ]);
     if (sequence !== loadSequence) return;
-    if (sentimentResult.status === 'fulfilled') {
-      sentiment.value = sentimentResult.value;
-    } else if (!silent) {
-      message.warning(sentimentResult.reason instanceof Error ? sentimentResult.reason.message : '读取每日情绪事实失败');
-    }
     if (emotionResult.status === 'fulfilled') {
       emotion.value = emotionResult.value;
     } else if (!silent) {
-      message.warning(emotionResult.reason instanceof Error ? emotionResult.reason.message : '读取 V2 双分情绪失败');
+      message.warning(emotionResult.reason instanceof Error ? emotionResult.reason.message : '读取双分情绪失败');
     }
     if (reviewResult.status === 'fulfilled') {
       dailyReview.value = reviewResult.value;

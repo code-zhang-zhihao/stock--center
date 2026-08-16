@@ -287,24 +287,42 @@ export interface StockAnalysisMinuteSeries extends StockAnalysisSeries<StockMinu
 export interface StockDailyFactor {
   stock_code: string;
   trade_date: string;
-  source: string;
+  price_basis: 'qfq';
+  price_status: 'ready' | 'partial' | 'missing';
+  technical_core_status: 'ready' | 'partial' | 'missing';
+  technical_extended_status: 'ready' | 'partial' | 'missing';
+  valuation_status: 'ready' | 'partial' | 'missing';
+  fund_status: 'ready' | 'partial' | 'missing';
+  quality_flags: string[];
+  price_source: string | null;
+  technical_source: string | null;
+  basic_source: string | null;
+  fund_source: string | null;
+  calculation_revision: string;
+  history_days: number;
   ma5: number | null;
   ma10: number | null;
   ma20: number | null;
   ma30: number | null;
   ma60: number | null;
-  return_1d: number | null;
-  amplitude: number | null;
-  volume_ratio: number | null;
-  amount_ratio: number | null;
+  return_1d_pct: number | null;
+  amplitude_1d_pct: number | null;
+  volume_ratio_5d: number | null;
+  amount_ratio_5d: number | null;
   volatility_20d: number | null;
-  close_position: number | null;
-  features: Record<string, unknown>;
-  factor_set_version: string;
-  price_basis: 'bfq' | 'qfq' | 'hfq';
-  factor_status: 'ready' | 'partial' | 'failed';
-  source_map: Record<string, string>;
-  missing_factors: string[];
+  close_position_ratio: number | null;
+  macd: number | null;
+  rsi6: number | null;
+  kdj_j: number | null;
+  boll_upper: number | null;
+  atr: number | null;
+  main_net_amount_ratio: number | null;
+  super_large_net_amount_ratio: number | null;
+  continuous_main_inflow_days: number | null;
+  main_net_inflow_3d_yuan: number | null;
+  main_net_inflow_5d_yuan: number | null;
+  main_net_inflow_10d_yuan: number | null;
+  main_net_inflow_percentile: number | null;
 }
 
 export interface StockMinuteFactor {
@@ -313,32 +331,14 @@ export interface StockMinuteFactor {
   bar_time: string;
   source: string;
   vwap: number | null;
-  minute_return: number | null;
-  volume_spike_ratio: number | null;
-  intraday_strength: number | null;
-  features: Record<string, unknown>;
-}
-
-export interface StockTechnicalFactor {
-  stock_code: string;
-  trade_date: string;
-  source: string;
-  factors: Record<string, unknown>;
-}
-
-export interface StockChipPerf {
-  stock_code: string;
-  trade_date: string;
-  source: string;
-  his_low: number | null;
-  his_high: number | null;
-  cost_5pct: number | null;
-  cost_15pct: number | null;
-  cost_50pct: number | null;
-  cost_85pct: number | null;
-  cost_95pct: number | null;
-  weight_avg: number | null;
-  winner_rate: number | null;
+  return_1m_pct: number | null;
+  return_5m_pct: number | null;
+  return_15m_pct: number | null;
+  ma5: number | null;
+  ma10: number | null;
+  ma20: number | null;
+  volume_ratio_20m: number | null;
+  intraday_position_ratio: number | null;
 }
 
 export interface StockAnalysisFactors {
@@ -347,17 +347,13 @@ export interface StockAnalysisFactors {
   minute_factors: StockMinuteFactor[];
   minute_factor_trade_date?: string | null;
   technical_snapshots: TechnicalSnapshot[];
-  technical_factors: StockTechnicalFactor[];
-  chip_perf: StockChipPerf[];
   latest: {
     daily_factor: StockDailyFactor | null;
-    technical_factor: StockTechnicalFactor | null;
-    chip_perf: StockChipPerf | null;
     technical_snapshot: TechnicalSnapshot | null;
   };
   missing: {
-    technical_factor: boolean;
-    chip_perf: boolean;
+    technical_core: boolean;
+    technical_extended: boolean;
   };
 }
 
@@ -365,24 +361,21 @@ export interface StockFundFlow {
   stock_code: string;
   trade_date: string;
   source: string;
-  main_net_inflow: number | null;
+  main_net_inflow_yuan: number | null;
   main_net_ratio: number | null;
-  big_order_net_inflow: number | null;
+  big_order_net_inflow_yuan: number | null;
   big_order_net_ratio: number | null;
-  super_large_net_inflow: number | null;
-  medium_net_inflow: number | null;
-  small_net_inflow: number | null;
-  small_buy_amount: number | null;
-  small_sell_amount: number | null;
-  medium_buy_amount: number | null;
-  medium_sell_amount: number | null;
-  large_buy_amount: number | null;
-  large_sell_amount: number | null;
-  super_large_buy_amount: number | null;
-  super_large_sell_amount: number | null;
-  close_price: number | null;
-  change_pct: number | null;
-  rank: number | null;
+  super_large_net_inflow_yuan: number | null;
+  medium_net_inflow_yuan: number | null;
+  small_net_inflow_yuan: number | null;
+  small_buy_amount_yuan: number | null;
+  small_sell_amount_yuan: number | null;
+  medium_buy_amount_yuan: number | null;
+  medium_sell_amount_yuan: number | null;
+  large_buy_amount_yuan: number | null;
+  large_sell_amount_yuan: number | null;
+  super_large_buy_amount_yuan: number | null;
+  super_large_sell_amount_yuan: number | null;
 }
 
 export interface StockFundFlowSeries {

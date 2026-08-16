@@ -78,9 +78,9 @@ def test_sector_moneyflow_adapter_converts_amounts_to_yuan():
     assert result.mapped_count == 1
     row = result.rows[0]
     assert row["sector_code"] == "ths_concept_885001.TI"
-    assert row["net_buy_amount"] == 10000
-    assert row["net_sell_amount"] == 5000
-    assert row["main_net_inflow"] == 5000
+    assert row["net_buy_amount_yuan"] == 100000000
+    assert row["net_sell_amount_yuan"] == 50000000
+    assert row["main_net_inflow_yuan"] == 50000000
     assert row["metadata_json"]["unit_normalized"] == "yuan"
 
 

@@ -18,10 +18,8 @@ from app.modules.market_data.models import (
     MarketUniverseMember,
     MarketNorthFlowDaily,
     LimitEventDaily,
-    MarketDailyStat,
     MinuteBar,
     MarginSummaryDaily,
-    ProviderRawRecord,
     ProviderIngestAudit,
     QuoteSnapshot,
     SectorBasic,
@@ -30,17 +28,17 @@ from app.modules.market_data.models import (
     SectorFactorDaily,
     SectorFundFlowDaily,
     Stock,
-    StockChipPerfDaily,
     StockDailyBasic,
     StockAdjustFactor,
     StockFactorDaily,
-    StockFactorDailyV2,
     StockFundFlowDaily,
-    StockNorthHoldDaily,
-    StockTechnicalFactorDaily,
     TradeCalendar,
 )
 from app.modules.market_data.partitioning import ensure_market_partition, partition_date_from_child_name
+from app.modules.market_data.stock_factor_contract import (
+    STK_FACTOR_PRO_COUNT_COLUMNS,
+    STK_FACTOR_PRO_QFQ_COLUMNS,
+)
 
 
 MAX_POSTGRES_QUERY_PARAMS = 30000
@@ -73,9 +71,18 @@ def _without_raw_metadata(rows: list[dict]) -> list[dict]:
             metadata = row.get(key)
             if isinstance(metadata, dict) and "raw" in metadata:
                 row[key] = {name: value for name, value in metadata.items() if name != "raw"}
-                row[key].setdefault("schema_version", "canonical_v2")
+                row[key].setdefault("schema_version", "canonical_final_r1")
         sanitized.append(row)
     return sanitized
+
+
+def _rows_for_model(model, rows: list[dict]) -> list[dict]:
+    """Keep only mapped columns/properties, dropping obsolete payload fields."""
+    allowed = set(model.__mapper__.attrs.keys())
+    return [
+        {key: value for key, value in row.items() if key in allowed}
+        for row in _without_raw_metadata(rows)
+    ]
 
 
 class MarketDataRepository:
@@ -196,10 +203,11 @@ class MarketDataRepository:
 
     async def existing_stock_technical_factor_dates(self, *, stock_code: str, start_date: date, end_date: date) -> set[date]:
         result = await self.session.execute(
-            select(StockTechnicalFactorDaily.trade_date).where(
-                StockTechnicalFactorDaily.stock_code == stock_code,
-                StockTechnicalFactorDaily.trade_date >= start_date,
-                StockTechnicalFactorDaily.trade_date <= end_date,
+            select(StockFactorDaily.trade_date).where(
+                StockFactorDaily.stock_code == stock_code,
+                StockFactorDaily.trade_date >= start_date,
+                StockFactorDaily.trade_date <= end_date,
+                StockFactorDaily.technical_source == "tushare:stk_factor_pro",
             )
         )
         return set(result.scalars().all())
@@ -273,12 +281,36 @@ class MarketDataRepository:
     ) -> int:
         if not stock_codes:
             return 0
+        if fact_kind == "stock_technical_factor_pro":
+            cleared = 0
+            reset_values = {
+                column_name: None for column_name in set(STK_FACTOR_PRO_QFQ_COLUMNS.values()) | set(STK_FACTOR_PRO_COUNT_COLUMNS)
+            }
+            reset_values.update(
+                {
+                    "technical_source": None,
+                    "technical_core_status": "missing",
+                    "technical_extended_status": "missing",
+                    "calculated_at": func.now(),
+                }
+            )
+            for codes in _chunked(stock_codes, 1000):
+                result = await self.session.execute(
+                    update(StockFactorDaily)
+                    .where(
+                        StockFactorDaily.stock_code.in_(codes),
+                        StockFactorDaily.trade_date >= start_date,
+                        StockFactorDaily.trade_date <= end_date,
+                    )
+                    .values(**reset_values)
+                )
+                cleared += int(result.rowcount or 0)
+            return cleared
         model = {
             "daily": DailyBar,
             "daily_basic": StockDailyBasic,
             "adjust_factor": StockAdjustFactor,
             "moneyflow": StockFundFlowDaily,
-            "stock_technical_factor_pro": StockTechnicalFactorDaily,
         }.get(fact_kind)
         if model is None:
             raise ValueError(f"unsupported stock fact kind: {fact_kind}")
@@ -387,15 +419,6 @@ class MarketDataRepository:
         )
         return list(result.scalars().all())
 
-    async def active_stock_factor_set(self) -> str:
-        value = await self.session.scalar(
-            text(
-                "SELECT factor_set_code FROM t_factor_set_version "
-                "WHERE status = 'active' ORDER BY version_no DESC LIMIT 1"
-            )
-        )
-        return str(value or "stock_daily_v1")
-
     async def daily_close_asset_counts(self, trade_date: date) -> dict[str, int | set[str]]:
         """Read the small count/marker set used by repair and report readiness."""
         start = datetime.combine(trade_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -415,24 +438,20 @@ class MarketDataRepository:
                         (SELECT count(DISTINCT stock_code) FROM t_stock_fund_flow_daily WHERE trade_date = :trade_date) AS stock_moneyflow,
                         (SELECT count(*) FROM t_limit_event_daily WHERE trade_date = :trade_date) AS limit_event,
                         (SELECT count(*) FROM t_lhb_event WHERE trade_date = :trade_date) AS lhb_event,
-                        (SELECT count(DISTINCT stock_code) FROM t_stock_technical_factor_daily WHERE trade_date = :trade_date) AS stock_technical,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily
+                            WHERE trade_date = :trade_date AND technical_extended_status = 'ready') AS stock_technical,
                         (SELECT count(DISTINCT stock_code) FROM t_stock_adjust_factor WHERE trade_date = :trade_date) AS adjust_factor,
                         (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily
-                            WHERE trade_date = :trade_date AND source = 'system:daily_close') AS daily_factor,
-                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily_v2
-                            WHERE trade_date = :trade_date AND factor_set_version = 'stock_daily_v2') AS daily_factor_v2,
-                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily_v2
-                            WHERE trade_date = :trade_date AND factor_set_version = 'stock_daily_v2'
-                              AND factor_status = 'ready') AS daily_factor_v2_ready,
-                        (SELECT count(DISTINCT stock_code) FROM t_technical_indicator_snapshot
-                            WHERE snapshot_time >= :snapshot_start AND snapshot_time < :snapshot_end
-                              AND source = 'system:daily_close') AS technical_snapshot,
+                            WHERE trade_date = :trade_date) AS daily_factor,
+                        (SELECT count(DISTINCT stock_code) FROM t_stock_factor_daily
+                            WHERE trade_date = :trade_date AND price_status = 'ready'
+                              AND technical_core_status = 'ready') AS daily_factor_ready,
                         (SELECT count(DISTINCT index_code) FROM t_index_bar WHERE trade_date = :trade_date) AS index_bar,
                         (SELECT count(DISTINCT index_code) FROM t_index_daily_basic WHERE trade_date = :trade_date) AS index_daily_basic,
                         (SELECT count(DISTINCT sector_code) FROM t_sector_bar WHERE trade_date = :trade_date) AS sector_bar,
                         (SELECT count(DISTINCT sector_code) FROM t_sector_fund_flow_daily WHERE trade_date = :trade_date) AS sector_moneyflow,
                         (SELECT count(DISTINCT sector_code) FROM t_sector_factor_daily WHERE trade_date = :trade_date) AS sector_factor,
-                        (SELECT count(*) FROM t_market_daily_stat WHERE trade_date = :trade_date) AS market_stat,
+                        (SELECT count(*) FROM t_market_summary_daily WHERE trade_date = :trade_date) AS market_summary,
                         (SELECT count(*) FROM t_sector_basic
                             WHERE source LIKE 'tushare:%'
                               AND sector_code LIKE 'ths_%'
@@ -464,18 +483,6 @@ class MarketDataRepository:
                         ProviderIngestAudit.trade_date == trade_date,
                         ProviderIngestAudit.status.in_(("captured", "complete_zero")),
                         ProviderIngestAudit.capability.in_(tracked_capabilities),
-                    )
-                )
-            ).scalars().all()
-        )
-        # Keep V1 completion markers readable during the seven-day shadow window.
-        capabilities.update(
-            (
-                await self.session.execute(
-                    select(ProviderRawRecord.capability).where(
-                        ProviderRawRecord.record_key == trade_date.isoformat(),
-                        ProviderRawRecord.status == "captured",
-                        ProviderRawRecord.capability.in_(tracked_capabilities),
                     )
                 )
             ).scalars().all()
@@ -1022,16 +1029,16 @@ class MarketDataRepository:
         end_date: date | None = None,
         limit: int = 60,
     ) -> list[dict]:
-        """Read the currently activated typed factor set through its compatibility view."""
+        """Read the single official typed QFQ factor table."""
         rows = (
             await self.session.execute(
                 text(
                     """
                     SELECT *
-                    FROM v_stock_factor_daily_active
+                    FROM t_stock_factor_daily
                     WHERE stock_code = :stock_code
                       AND (CAST(:end_date AS date) IS NULL OR trade_date <= CAST(:end_date AS date))
-                      AND factor_status = 'ready'
+                      AND price_status = 'ready'
                     ORDER BY trade_date DESC
                     LIMIT :limit
                     """
@@ -1048,30 +1055,30 @@ class MarketDataRepository:
         end_date: date | None = None,
         limit: int = 1,
     ) -> list[dict]:
-        """Build the legacy technical-snapshot response without persisting duplicate rows."""
+        """Build the technical-snapshot response without persisting duplicate rows."""
         rows = (
             await self.session.execute(
                 text(
                     """
                     WITH factors AS (
                         SELECT *
-                        FROM v_stock_factor_daily_active
+                        FROM t_stock_factor_daily
                         WHERE stock_code = :stock_code
                           AND (CAST(:end_date AS date) IS NULL OR trade_date <= CAST(:end_date AS date))
-                          AND factor_status = 'ready'
+                          AND price_status = 'ready'
                         ORDER BY trade_date DESC
                         LIMIT :limit
                     )
                     SELECT
                         factor.stock_code,
                         (factor.trade_date::timestamp + time '15:00') AT TIME ZONE 'Asia/Shanghai' AS snapshot_time,
-                        ('computed:' || factor.factor_set_version)::varchar AS source,
+                        ('computed:' || factor.calculation_revision)::varchar AS source,
                         bar.close_price AS last_price,
                         bar.change_pct,
-                        coalesce(minute.intraday_strength, factor.close_position) AS intraday_strength,
+                        coalesce(minute.intraday_position_ratio, factor.close_position_ratio) AS intraday_strength,
                         CASE
-                            WHEN minute.volume_spike_ratio IS NULL THEN NULL
-                            ELSE least(greatest(minute.volume_spike_ratio * 20, 0), 100)
+                            WHEN minute.volume_ratio_20m IS NULL THEN NULL
+                            ELSE least(greatest(minute.volume_ratio_20m * 20, 0), 100)
                         END AS volume_score,
                         CASE
                             WHEN factor.ma5 IS NULL OR factor.ma10 IS NULL THEN NULL
@@ -1079,7 +1086,7 @@ class MarketDataRepository:
                                 50
                                 + CASE WHEN factor.ma5 > factor.ma10 THEN 20 ELSE 0 END
                                 + CASE WHEN factor.ma20 IS NOT NULL AND factor.ma10 > factor.ma20 THEN 20 ELSE 0 END
-                                + CASE WHEN factor.return_1d > 0 THEN 10 ELSE 0 END,
+                                + CASE WHEN factor.return_1d_pct > 0 THEN 10 ELSE 0 END,
                                 100
                             )
                         END AS trend_score,
@@ -1087,11 +1094,14 @@ class MarketDataRepository:
                             'daily_factor_trade_date', factor.trade_date::text,
                             'minute_factor_bar_time', minute.bar_time,
                             'price_source', 't_daily_bar',
-                            'factor_set_version', factor.factor_set_version,
                             'price_basis', factor.price_basis,
-                            'factor_status', factor.factor_status,
-                            'source_map', factor.source_map,
-                            'missing_factors', factor.missing_factors,
+                            'price_status', factor.price_status,
+                            'technical_core_status', factor.technical_core_status,
+                            'technical_extended_status', factor.technical_extended_status,
+                            'valuation_status', factor.valuation_status,
+                            'fund_status', factor.fund_status,
+                            'quality_flags', factor.quality_flags,
+                            'calculation_revision', factor.calculation_revision,
                             'computed', true
                         ) AS factor_payload,
                         greatest(factor.updated_at, bar.updated_at, minute.created_at) AS created_at
@@ -1100,7 +1110,7 @@ class MarketDataRepository:
                       ON bar.stock_code = factor.stock_code
                      AND bar.trade_date = factor.trade_date
                     LEFT JOIN LATERAL (
-                        SELECT intraday_strength, volume_spike_ratio, bar_time, created_at
+                        SELECT intraday_position_ratio, volume_ratio_20m, bar_time, created_at
                         FROM t_stock_factor_minute
                         WHERE stock_code = factor.stock_code
                           AND trade_date = factor.trade_date
@@ -1118,7 +1128,7 @@ class MarketDataRepository:
     async def upsert_daily_bars(self, rows: list[dict]) -> int:
         if not rows:
             return 0
-        rows = _without_raw_metadata(rows)
+        rows = _rows_for_model(DailyBar, rows)
         for batch in _chunked(rows, _safe_batch_size(rows)):
             insert_stmt = insert(DailyBar).values(batch)
             await self.session.execute(
@@ -1137,8 +1147,6 @@ class MarketDataRepository:
                         "volume_hand": insert_stmt.excluded.volume_hand,
                         "volume_share": insert_stmt.excluded.volume_share,
                         "amount_yuan": insert_stmt.excluded.amount_yuan,
-                        "turnover_rate": insert_stmt.excluded.turnover_rate,
-                        DailyBar.metadata_json: insert_stmt.excluded.metadata,
                     },
                 )
             )
@@ -1163,7 +1171,7 @@ class MarketDataRepository:
     async def upsert_minute_bars(self, rows: list[dict]) -> int:
         if not rows:
             return 0
-        rows = _without_raw_metadata(rows)
+        rows = _rows_for_model(MinuteBar, rows)
         shanghai = ZoneInfo("Asia/Shanghai")
         for row in rows:
             if row.get("trade_date") is None:
@@ -1191,7 +1199,6 @@ class MarketDataRepository:
                         "volume_hand": insert_stmt.excluded.volume_hand,
                         "volume_share": insert_stmt.excluded.volume_share,
                         "amount_yuan": insert_stmt.excluded.amount_yuan,
-                        MinuteBar.metadata_json: insert_stmt.excluded.metadata,
                     },
                 )
             )
@@ -1204,24 +1211,21 @@ class MarketDataRepository:
             conflict_attrs=["stock_code", "trade_date"],
             update_attrs=[
                 "source",
-                "close_price",
-                "turnover_rate",
-                "turnover_rate_f",
-                "volume_ratio",
+                "turnover_rate_pct",
+                "turnover_rate_free_pct",
+                "provider_volume_ratio",
                 "pe",
                 "pe_ttm",
                 "pb",
                 "ps",
                 "ps_ttm",
-                "dv_ratio",
-                "dv_ttm",
-                "total_share",
-                "float_share",
-                "free_share",
-                "total_mv",
-                "circ_mv",
-                "limit_status",
-                "metadata_json",
+                "dividend_yield_pct",
+                "dividend_yield_ttm_pct",
+                "total_share_shares",
+                "float_share_shares",
+                "free_share_shares",
+                "total_market_value_yuan",
+                "circulating_market_value_yuan",
             ],
         )
 
@@ -1230,29 +1234,106 @@ class MarketDataRepository:
             StockAdjustFactor,
             rows,
             conflict_attrs=["stock_code", "trade_date", "source"],
-            update_attrs=["adj_factor", "metadata_json"],
+            update_attrs=["adj_factor"],
         )
 
-    async def upsert_stock_technical_factor_rows(self, rows: list[dict]) -> int:
-        return await self.upsert_rows(
-            StockTechnicalFactorDaily,
-            rows,
-            conflict_attrs=["stock_code", "trade_date"],
-        )
-
-    async def upsert_stock_chip_perf_rows(self, rows: list[dict]) -> int:
-        return await self.upsert_rows(
-            StockChipPerfDaily,
-            rows,
-            conflict_attrs=["stock_code", "trade_date"],
-        )
-
-    async def upsert_market_daily_stat_rows(self, rows: list[dict]) -> int:
-        return await self.upsert_rows(
-            MarketDailyStat,
-            rows,
-            conflict_attrs=["trade_date", "ts_code", "exchange"],
-        )
+    async def upsert_stock_factor_professional_rows(self, rows: list[dict]) -> int:
+        """Merge typed Pro indicators without overwriting local factor groups."""
+        if not rows:
+            return 0
+        normalized = _rows_for_model(StockFactorDaily, rows)
+        deduped = {
+            (row["stock_code"], row["trade_date"]): row
+            for row in normalized
+        }
+        rows = list(deduped.values())
+        total = 0
+        for batch in _chunked(rows, _safe_batch_size(rows)):
+            statement = insert(StockFactorDaily).values(batch)
+            merged_flags = StockFactorDaily.quality_flags
+            merged_flags = case(
+                (
+                    statement.excluded.price_status == "ready",
+                    func.array_remove(merged_flags, "price"),
+                ),
+                else_=func.array_append(func.array_remove(merged_flags, "price"), "price"),
+            )
+            merged_flags = case(
+                (
+                    statement.excluded.technical_core_status == "ready",
+                    func.array_remove(
+                        func.array_remove(merged_flags, "technical_core"),
+                        "technical_pro_missing_local_core_fallback",
+                    ),
+                ),
+                else_=func.array_append(
+                    func.array_remove(merged_flags, "technical_core"),
+                    "technical_core",
+                ),
+            )
+            merged_flags = case(
+                (
+                    statement.excluded.technical_extended_status == "ready",
+                    func.array_remove(merged_flags, "technical_extended"),
+                ),
+                else_=func.array_append(
+                    func.array_remove(merged_flags, "technical_extended"),
+                    "technical_extended",
+                ),
+            )
+            update_values = {
+                "price_basis": statement.excluded.price_basis,
+                "price_status": case(
+                    (statement.excluded.price_status == "ready", "ready"),
+                    else_=StockFactorDaily.price_status,
+                ),
+                "technical_core_status": case(
+                    (statement.excluded.technical_core_status == "ready", "ready"),
+                    else_=StockFactorDaily.technical_core_status,
+                ),
+                "technical_extended_status": case(
+                    (statement.excluded.technical_extended_status == "ready", "ready"),
+                    else_=StockFactorDaily.technical_extended_status,
+                ),
+                "quality_flags": merged_flags,
+                "price_source": case(
+                    (statement.excluded.price_status == "ready", statement.excluded.price_source),
+                    else_=func.coalesce(StockFactorDaily.price_source, statement.excluded.price_source),
+                ),
+                "technical_source": case(
+                    (
+                        or_(
+                            statement.excluded.technical_core_status == "ready",
+                            statement.excluded.technical_extended_status == "ready",
+                        ),
+                        statement.excluded.technical_source,
+                    ),
+                    else_=func.coalesce(StockFactorDaily.technical_source, statement.excluded.technical_source),
+                ),
+                "calculated_at": func.now(),
+                **{
+                    column: func.coalesce(
+                        getattr(statement.excluded, column),
+                        getattr(StockFactorDaily, column),
+                    )
+                    for column in dict.fromkeys(STK_FACTOR_PRO_QFQ_COLUMNS.values())
+                },
+                **{
+                    column: func.coalesce(
+                        getattr(statement.excluded, column),
+                        getattr(StockFactorDaily, column),
+                    )
+                    for column in STK_FACTOR_PRO_COUNT_COLUMNS
+                },
+            }
+            result = await self.session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[StockFactorDaily.stock_code, StockFactorDaily.trade_date],
+                    set_=update_values,
+                )
+            )
+            total += int(result.rowcount or 0)
+        return total
 
     async def upsert_index_daily_basic_rows(self, rows: list[dict]) -> int:
         return await self.upsert_rows(
@@ -1296,13 +1377,6 @@ class MarketDataRepository:
             conflict_attrs=["index_code", "trade_date"],
         )
 
-    async def upsert_north_hold_rows(self, rows: list[dict]) -> int:
-        return await self.upsert_rows(
-            StockNorthHoldDaily,
-            rows,
-            conflict_attrs=["stock_code", "trade_date", "exchange"],
-        )
-
     async def upsert_market_north_flow_rows(self, rows: list[dict]) -> int:
         return await self.upsert_rows(
             MarketNorthFlowDaily,
@@ -1323,7 +1397,7 @@ class MarketDataRepository:
                 MarketNorthFlowDaily.source == source,
                 MarketNorthFlowDaily.trade_date >= start_date,
                 MarketNorthFlowDaily.trade_date <= end_date,
-                MarketNorthFlowDaily.north_money.is_not(None),
+                MarketNorthFlowDaily.north_money_yuan.is_not(None),
             )
         )
         return set(rows.scalars().all())
@@ -1461,31 +1535,18 @@ class MarketDataRepository:
                 StockDailyBasic.trade_date == trade_date,
             ),
             "adjust_factor": delete(StockAdjustFactor).where(StockAdjustFactor.trade_date == trade_date),
-            "stock_technical_factor": delete(StockTechnicalFactorDaily).where(
-                StockTechnicalFactorDaily.trade_date == trade_date,
-            ),
-            "stock_chip_perf": delete(StockChipPerfDaily).where(
-                StockChipPerfDaily.trade_date == trade_date,
-            ),
             "stock_fund_flow": delete(StockFundFlowDaily).where(StockFundFlowDaily.trade_date == trade_date),
             "limit_event": delete(LimitEventDaily).where(LimitEventDaily.trade_date == trade_date),
             "lhb_event": delete(LhbEvent).where(LhbEvent.trade_date == trade_date),
             "lhb_seat": delete(LhbSeatDetail).where(LhbSeatDetail.trade_date == trade_date),
             "index_bar": delete(IndexBar).where(IndexBar.trade_date == trade_date),
             "index_daily_basic": delete(IndexDailyBasic).where(IndexDailyBasic.trade_date == trade_date),
-            "market_daily_stat": delete(MarketDailyStat).where(MarketDailyStat.trade_date == trade_date),
-            "north_hold": delete(StockNorthHoldDaily).where(StockNorthHoldDaily.trade_date == trade_date),
             "sector_bar": delete(SectorBar).where(SectorBar.trade_date == trade_date),
             "sector_fund_flow": delete(SectorFundFlowDaily).where(SectorFundFlowDaily.trade_date == trade_date),
             "sector_factor": delete(SectorFactorDaily).where(SectorFactorDaily.trade_date == trade_date),
             "minute": delete(MinuteBar).where(MinuteBar.trade_date == trade_date, MinuteBar.source == "mootdx"),
             "daily_factor": delete(StockFactorDaily).where(
                 StockFactorDaily.trade_date == trade_date,
-                StockFactorDaily.source == "system:daily_close",
-            ),
-            "daily_factor_v2": delete(StockFactorDailyV2).where(
-                StockFactorDailyV2.trade_date == trade_date,
-                StockFactorDailyV2.factor_set_version == "stock_daily_v2",
             ),
             "minute_factor": delete(StockFactorMinute).where(
                 StockFactorMinute.trade_date == trade_date,
@@ -1497,10 +1558,6 @@ class MarketDataRepository:
             result = await self.session.execute(statement)
             deleted[name] = int(result.rowcount or 0)
         return deleted
-
-    async def insert_raw(self, row: dict) -> ProviderRawRecord:
-        result = await self.session.execute(insert(ProviderRawRecord).values(**row).returning(ProviderRawRecord))
-        return result.scalar_one()
 
     async def insert_ingest_audit(self, row: dict) -> ProviderIngestAudit:
         result = await self.session.execute(
@@ -1530,7 +1587,7 @@ class MarketDataRepository:
     ) -> int:
         if not rows:
             return 0
-        rows = _without_raw_metadata(rows)
+        rows = _rows_for_model(model, rows)
         deduped: dict[tuple, dict] = {}
         for row in rows:
             key = tuple(row.get(attr) for attr in conflict_attrs)

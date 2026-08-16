@@ -189,10 +189,10 @@
             <Metric label="20日均线" hint="近20日收盘均价" :value="formatNumber(latestDailyFactor?.ma20 ?? null)" />
             <Metric label="30日均线" hint="近30日收盘均价" :value="formatNumber(latestDailyFactor?.ma30 ?? null)" />
             <Metric label="60日均线" hint="近60日收盘均价" :value="formatNumber(latestDailyFactor?.ma60 ?? null)" />
-            <Metric label="当日涨跌" hint="相对昨收" :value="formatPercent(latestDailyFactor?.return_1d ?? null)" :tone="numberTone(latestDailyFactor?.return_1d ?? null)" />
-            <Metric label="日内振幅" hint="最高与最低价差" :value="formatPercent(latestDailyFactor?.amplitude ?? null)" />
+            <Metric label="当日涨跌" hint="QFQ 相对昨收" :value="formatPercent(latestDailyFactor?.return_1d_pct ?? null)" :tone="numberTone(latestDailyFactor?.return_1d_pct ?? null)" />
+            <Metric label="日内振幅" hint="最高与最低价差" :value="formatPercent(latestDailyFactor?.amplitude_1d_pct ?? null)" />
             <Metric label="20日波动率" hint="近20日收益波动" :value="formatPercent(latestDailyFactor?.volatility_20d ?? null)" />
-            <Metric label="收盘位置" hint="当日区间内位置" :value="formatRatioPercent(latestDailyFactor?.close_position ?? null)" />
+            <Metric label="收盘位置" hint="当日区间内位置" :value="formatRatioPercent(latestDailyFactor?.close_position_ratio ?? null)" />
           </div>
           <div class="factor-section-label">专业技术指标</div>
           <div class="factor-grid">
@@ -202,7 +202,7 @@
             <Metric label="布林上轨" hint="20日波动通道" :value="formatNumber(technicalNumber('bollUpper'))" />
             <Metric label="ATR" hint="平均真实波幅" :value="formatNumber(technicalNumber('atr'))" />
           </div>
-          <p v-if="factors?.missing.technical_factor" class="muted-hint">专业技术因子待晚间增强/修复任务补齐。</p>
+          <p v-if="factors?.missing.technical_extended" class="muted-hint">扩展专业技术指标尚未完整；核心策略因子可按自身输入状态继续使用。</p>
         </section>
 
         <section class="panel factor-panel">
@@ -214,13 +214,13 @@
             <span>{{ latestDailyFactor?.trade_date || '-' }}</span>
           </div>
           <div class="factor-grid">
-            <Metric label="主力净额占比" hint="主力净额 / 成交额" :value="formatRatioPercent(featureNumber('main_net_ratio'))" :tone="numberTone(featureNumber('main_net_ratio'))" />
-            <Metric label="超大单净额占比" hint="超大单净额 / 成交额" :value="formatRatioPercent(featureNumber('super_large_net_ratio'))" :tone="numberTone(featureNumber('super_large_net_ratio'))" />
-            <Metric label="连续主力流入" hint="连续净流入交易日" :value="formatDays(featureNumber('continuous_main_inflow_days'))" />
-            <Metric label="3日主力净额" hint="近3个交易日累计" :value="formatMoney(featureNumber('main_net_inflow_3d'))" :tone="numberTone(featureNumber('main_net_inflow_3d'))" />
-            <Metric label="5日主力净额" hint="近5个交易日累计" :value="formatMoney(featureNumber('main_net_inflow_5d'))" :tone="numberTone(featureNumber('main_net_inflow_5d'))" />
-            <Metric label="10日主力净额" hint="近10个交易日累计" :value="formatMoney(featureNumber('main_net_inflow_10d'))" :tone="numberTone(featureNumber('main_net_inflow_10d'))" />
-            <Metric label="资金强度分位" hint="当日全市场横截面" :value="formatRatioPercent(featureNumber('fund_strength_percentile'))" />
+            <Metric label="主力净额占比" hint="主力净额 / 成交额" :value="formatRatioPercent(latestDailyFactor?.main_net_amount_ratio ?? null)" :tone="numberTone(latestDailyFactor?.main_net_amount_ratio ?? null)" />
+            <Metric label="超大单净额占比" hint="超大单净额 / 成交额" :value="formatRatioPercent(latestDailyFactor?.super_large_net_amount_ratio ?? null)" :tone="numberTone(latestDailyFactor?.super_large_net_amount_ratio ?? null)" />
+            <Metric label="连续主力流入" hint="连续净流入交易日" :value="formatDays(latestDailyFactor?.continuous_main_inflow_days ?? null)" />
+            <Metric label="3日主力净额" hint="近3个交易日累计" :value="formatMoney(latestDailyFactor?.main_net_inflow_3d_yuan ?? null)" :tone="numberTone(latestDailyFactor?.main_net_inflow_3d_yuan ?? null)" />
+            <Metric label="5日主力净额" hint="近5个交易日累计" :value="formatMoney(latestDailyFactor?.main_net_inflow_5d_yuan ?? null)" :tone="numberTone(latestDailyFactor?.main_net_inflow_5d_yuan ?? null)" />
+            <Metric label="10日主力净额" hint="近10个交易日累计" :value="formatMoney(latestDailyFactor?.main_net_inflow_10d_yuan ?? null)" :tone="numberTone(latestDailyFactor?.main_net_inflow_10d_yuan ?? null)" />
+            <Metric label="资金强度分位" hint="当日全市场横截面 0–100" :value="formatNumber(latestDailyFactor?.main_net_inflow_percentile ?? null)" />
           </div>
         </section>
 
@@ -342,7 +342,7 @@ const latestAmount = computed(() => latestQuote.value?.amount_yuan ?? overview.v
 const latestQuoteTime = computed(() => latestQuote.value ? formatQuoteTime(latestQuote.value.quote_time) : (overview.value?.latest_daily_bar?.trade_date || '-'));
 const sectorTags = computed<StockSectorTag[]>(() => overview.value?.sectors.items || []);
 const fundWindowItems = computed(() => (fundFlow.value?.items || []).slice(-fundWindowDays.value));
-const fundWindowNetInflow = computed(() => fundWindowItems.value.reduce((total, item) => total + Number(item.main_net_inflow || 0), 0));
+const fundWindowNetInflow = computed(() => fundWindowItems.value.reduce((total, item) => total + Number(item.main_net_inflow_yuan || 0), 0));
 const fundWindowDirection = computed(() => {
   if (fundWindowNetInflow.value > 0) return `近 ${fundWindowItems.value.length} 日净流入`;
   if (fundWindowNetInflow.value < 0) return `近 ${fundWindowItems.value.length} 日净流出`;
@@ -407,7 +407,7 @@ const fundFlowOption = computed<EChartsOption>(() => {
   const items = fundWindowItems.value;
   let cumulative = 0;
   const cumulativeMainNet = items.map((item) => {
-    cumulative += Number(item.main_net_inflow || 0);
+    cumulative += Number(item.main_net_inflow_yuan || 0);
     return cumulative;
   });
   return {
@@ -421,8 +421,8 @@ const fundFlowOption = computed<EChartsOption>(() => {
         name: '主力净流入',
         type: 'bar',
         data: items.map((item) => ({
-          value: item.main_net_inflow || 0,
-          itemStyle: { color: Number(item.main_net_inflow || 0) >= 0 ? '#d92d20' : '#07845f' },
+          value: item.main_net_inflow_yuan || 0,
+          itemStyle: { color: Number(item.main_net_inflow_yuan || 0) >= 0 ? '#d92d20' : '#07845f' },
         })),
       },
       { name: '累计主力净额', type: 'line', smooth: true, data: cumulativeMainNet, itemStyle: { color: '#2563eb' } },
@@ -434,7 +434,7 @@ const minuteFactorOption = computed<EChartsOption>(() => {
   const items = factors.value?.minute_factors || [];
   const labels = items.map((item) => formatBarTime(item.bar_time));
   const volumeSpikes = items.map((item) => {
-    const value = item.volume_spike_ratio;
+    const value = item.volume_ratio_20m;
     if (value === null || value === undefined) return null;
     return {
       value,
@@ -454,7 +454,7 @@ const minuteFactorOption = computed<EChartsOption>(() => {
       { type: 'value', gridIndex: 1, name: '倍数', min: 0, splitNumber: 2, axisLabel: { formatter: (value: number) => `${value}x` } },
     ],
     series: [
-      { name: '分钟收益', type: 'line', showSymbol: false, data: items.map((item) => item.minute_return), lineStyle: { color: '#d92d20', width: 2 }, areaStyle: { color: 'rgba(217, 45, 32, 0.08)' } },
+      { name: '1分钟收益', type: 'line', showSymbol: false, data: items.map((item) => item.return_1m_pct), lineStyle: { color: '#d92d20', width: 2 }, areaStyle: { color: 'rgba(217, 45, 32, 0.08)' } },
       {
         name: '放量倍数', type: 'bar', xAxisIndex: 1, yAxisIndex: 1, data: volumeSpikes,
         markLine: { silent: true, symbol: 'none', lineStyle: { color: '#98a2b3', type: 'dashed' }, label: { formatter: '20分钟均量' }, data: [{ yAxis: 1 }] },
@@ -653,33 +653,15 @@ function stopAutoRefresh() {
   realtimeEventSource = null;
 }
 
-function featureValue(key: string) {
-  return latestDailyFactor.value?.features?.[key] ?? null;
-}
-
-function featureNumber(key: string) {
-  const value = featureValue(key);
-  return typeof value === 'number' ? value : null;
-}
-
-function technicalValue(key: string) {
-  const tech = latestDailyFactor.value?.features?.tushare_technical;
-  if (tech && typeof tech === 'object' && key in tech) {
-    return (tech as Record<string, unknown>)[key];
-  }
-  const raw = factors.value?.latest.technical_factor?.factors?.[key];
-  return raw ?? null;
-}
-
 function technicalNumber(key: 'macd' | 'rsi6' | 'kdj' | 'bollUpper' | 'atr') {
-  const sourceKey: Record<typeof key, string> = {
-    macd: 'macd_bfq',
-    rsi6: 'rsi_bfq_6',
-    kdj: 'kdj_bfq',
-    bollUpper: 'boll_upper_bfq',
-    atr: 'atr_bfq',
+  const valueByKey: Record<typeof key, number | null | undefined> = {
+    macd: latestDailyFactor.value?.macd,
+    rsi6: latestDailyFactor.value?.rsi6,
+    kdj: latestDailyFactor.value?.kdj_j,
+    bollUpper: latestDailyFactor.value?.boll_upper,
+    atr: latestDailyFactor.value?.atr,
   };
-  const value = technicalValue(sourceKey[key]);
+  const value = valueByKey[key];
   return typeof value === 'number' ? value : null;
 }
 

@@ -3,15 +3,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from app.modules.market_insight.models import MarketLimitUpEvidenceDaily, MarketSectorHeatDaily
+from app.modules.indicator_engine.repository import IndicatorRepository
+from app.modules.market_insight.emotion_service import LIMIT_EVENT_COMPLETION_CAPABILITIES, MarketEmotionService
+from app.modules.market_insight.models import MarketLimitUpEvidenceDaily
 from app.modules.market_insight.repository import MarketInsightRepository
-from app.modules.market_insight.service import (
-    LIMIT_EVENT_COMPLETION_CAPABILITIES,
-    MARKET_SENTIMENT_CALCULATION_VERSION,
-    MarketSentimentService,
-    _number_or_none,
-    _validate_calculation_version,
-)
+
+
+MARKET_REVIEW_CALCULATION_REVISION = "market_review_final_r1"
+
+
+def _number_or_none(value):
+    return float(value) if value is not None else None
+
+
+def _validate_calculation_revision(value: str) -> str:
+    normalized = str(value or "").strip()
+    if not normalized or len(normalized) > 80:
+        raise ValueError("复盘计算修订号不能为空且不得超过 80 个字符")
+    return normalized
 
 
 MIN_CONCEPT_COMPONENTS = 3
@@ -60,56 +69,53 @@ class MarketDailyReviewService:
         self,
         *,
         trade_dates: list[date],
-        sentiment_rows: list[dict],
-        calculation_version: str = MARKET_SENTIMENT_CALCULATION_VERSION,
+        emotion_rows: list[dict],
+        calculation_version: str = MARKET_REVIEW_CALCULATION_REVISION,
     ) -> MarketDailyReviewCalculation:
-        calculation_version = _validate_calculation_version(calculation_version)
+        calculation_version = _validate_calculation_revision(calculation_version)
         target_dates = sorted(set(trade_dates))
         if not target_dates:
             return MarketDailyReviewCalculation(calculation_version, [], 0, 0, 0, 0)
 
-        sentiment_status = {
+        emotion_status = {
             item["trade_date"]: item["status"] == "ready"
-            for item in sentiment_rows
+            or item["status"] == "degraded"
+            for item in emotion_rows
             if isinstance(item.get("trade_date"), date)
         }
-        metric_rows = await self.repository.concept_metrics(target_dates)
-        sector_rows, heat_lookup = _build_sector_heat_rows(
-            target_dates=target_dates,
-            metrics_by_date=metric_rows,
-            sentiment_status=sentiment_status,
-            calculation_version=calculation_version,
-        )
-        leader_sector_codes = sorted(
-            {
-                row["sector_code"]
-                for row in sector_rows
-                if row["status"] == "ready" and (row["heat_rank"] or 0) <= LEADER_CONTEXT_SECTOR_LIMIT
-            }
-        )
-        leader_candidates = await self.repository.concept_leader_candidates(
-            trade_dates=target_dates,
-            sector_codes=leader_sector_codes,
-        )
-        _attach_sector_leaders(sector_rows, leader_candidates)
+        sector_rows: list[dict] = []
+        heat_lookup: dict[tuple[date, str], dict] = {}
+        for item_date in target_dates:
+            current = await self.repository.list_sector_factors(trade_date=item_date, limit=2000)
+            sector_rows.extend(current)
+            for row in current:
+                heat_lookup[(item_date, row["sector_code"])] = {
+                    "sector_code": row["sector_code"],
+                    "sector_name": row["sector_name"],
+                    "heat_score": row["heat_score"],
+                    "heat_rank": row["heat_rank"],
+                }
 
         limit_rows = await self.repository.limit_up_market_rows(target_dates)
         evidence_rows = await self._build_limit_up_evidence_rows(
             target_dates=target_dates,
             limit_rows=limit_rows,
             heat_lookup=heat_lookup,
-            sentiment_status=sentiment_status,
+            sentiment_status=emotion_status,
             calculation_version=calculation_version,
         )
-        sector_count = await self.repository.upsert_sector_heat_rows(sector_rows)
         evidence_count = await self.repository.upsert_limit_up_evidence_rows(evidence_rows)
-        if sector_count or evidence_count:
+        if evidence_count:
+            await self.repository.refresh_market_summary_board_structure(target_dates)
+            indicator_repository = IndicatorRepository(self.repository.session)
+            for item_date in target_dates:
+                await indicator_repository.rebuild_sector_leaders(trade_date=item_date)
             await self.repository.commit()
-        ready_dates = sum(1 for item in target_dates if sentiment_status.get(item, False))
+        ready_dates = sum(1 for item in target_dates if emotion_status.get(item, False))
         return MarketDailyReviewCalculation(
             calculation_version=calculation_version,
             requested_trade_dates=target_dates,
-            sector_heat_rows=sector_count,
+            sector_heat_rows=len(sector_rows),
             limit_up_evidence_rows=evidence_count,
             ready_trade_dates=ready_dates,
             pending_trade_dates=len(target_dates) - ready_dates,
@@ -206,23 +212,20 @@ class MarketDailyReviewService:
         self,
         *,
         trade_date: date | None = None,
-        calculation_version: str = MARKET_SENTIMENT_CALCULATION_VERSION,
+        calculation_version: str = MARKET_REVIEW_CALCULATION_REVISION,
         sector_limit: int = 12,
         evidence_limit: int = 40,
     ) -> dict:
-        calculation_version = _validate_calculation_version(calculation_version)
-        sentiment = await MarketSentimentService(self.repository).read(
-            trade_date=trade_date,
-            calculation_version=calculation_version,
-        )
-        resolved_date = sentiment.get("trade_date")
+        calculation_version = _validate_calculation_revision(calculation_version)
+        emotion = await MarketEmotionService(self.repository).read(trade_date=trade_date)
+        resolved_date = emotion.get("trade_date")
         if not resolved_date:
             return {
                 "available": False,
-                "reason": "market_sentiment_not_calculated",
+                "reason": "market_emotion_not_calculated",
                 "trade_date": trade_date.isoformat() if trade_date else None,
                 "calculation_version": calculation_version,
-                "sentiment": sentiment,
+                "emotion": emotion,
                 "sectors": [],
                 "limit_up_evidence": [],
             }
@@ -231,22 +234,19 @@ class MarketDailyReviewService:
             trade_date=resolved_trade_date,
             calculation_version=calculation_version,
         )
-        sectors = await self.repository.list_sector_heats(
-            trade_date=resolved_trade_date,
-            calculation_version=calculation_version,
-            limit=sector_limit,
-        )
+        sectors = await self.repository.list_sector_factors(trade_date=resolved_trade_date, limit=sector_limit)
         evidence = await self.repository.list_limit_up_evidence(
             trade_date=resolved_trade_date,
             calculation_version=calculation_version,
             limit=evidence_limit,
         )
-        expected_evidence_count = int((sentiment.get("metrics") or {}).get("limit_up_count") or 0)
+        limit_metric = (emotion.get("metrics") or {}).get("all_qualified_limit_up_count") or {}
+        expected_evidence_count = int(limit_metric.get("raw_value") or 0) if isinstance(limit_metric, dict) else int(limit_metric or 0)
         sector_ready = counts["sector_heat_count"] > 0
         evidence_ready = counts["limit_up_evidence_count"] >= expected_evidence_count
         reasons = []
-        if not sentiment.get("available"):
-            reasons.append("market_sentiment_pending")
+        if not emotion.get("available"):
+            reasons.append("market_emotion_pending")
         if not sector_ready:
             reasons.append("sector_heat_not_calculated")
         if not evidence_ready:
@@ -256,7 +256,7 @@ class MarketDailyReviewService:
             "reason": reasons[0] if reasons else None,
             "trade_date": resolved_date,
             "calculation_version": calculation_version,
-            "sentiment": sentiment,
+            "emotion": emotion,
             "coverage": {
                 **counts,
                 "limit_up_evidence_expected_count": expected_evidence_count,
@@ -264,7 +264,7 @@ class MarketDailyReviewService:
                 "limit_up_evidence_ready": evidence_ready,
                 "unavailable_reasons": reasons,
             },
-            "sectors": [serialize_sector_heat_model(item) for item in sectors],
+            "sectors": [serialize_sector_factor(item) for item in sectors],
             "limit_up_evidence": [serialize_limit_up_evidence_model(item) for item in evidence],
         }
 
@@ -463,21 +463,17 @@ def _serialize_announcement(item: dict) -> dict:
     return {**item, "published_at": value.isoformat() if hasattr(value, "isoformat") else value}
 
 
-def serialize_sector_heat_model(row: MarketSectorHeatDaily) -> dict:
+def serialize_sector_factor(row: dict) -> dict:
+    value = dict(row)
+    trade_date = value.get("trade_date")
+    calculated_at = value.get("calculated_at")
     return {
-        "trade_date": row.trade_date.isoformat(),
-        "sector_code": row.sector_code,
-        "sector_name": row.sector_name,
-        "calculation_version": row.calculation_version,
-        "status": row.status,
-        "heat_score": _number_or_none(row.heat_score),
-        "heat_rank": row.heat_rank,
-        "metrics": row.metrics or {},
-        "components": row.components or {},
-        "leaders": row.leaders or [],
-        "coverage": row.coverage or {},
-        "source_facts": row.source_facts or {},
-        "calculated_at": row.calculated_at.isoformat() if hasattr(row.calculated_at, "isoformat") else row.calculated_at,
+        **value,
+        "trade_date": trade_date.isoformat() if hasattr(trade_date, "isoformat") else trade_date,
+        "status": "ready",
+        "components": {},
+        "coverage": {"quality_flags": value.pop("quality_flags", [])},
+        "calculated_at": calculated_at.isoformat() if hasattr(calculated_at, "isoformat") else calculated_at,
     }
 
 

@@ -16,7 +16,7 @@ def test_market_north_flow_backfill_defaults_to_compact_250_day_windows():
     assert payload.only_missing is True
 
 
-def test_market_north_flow_mapping_filters_requested_dates_and_preserves_provider_unit():
+def test_market_north_flow_mapping_filters_requested_dates_and_normalizes_to_yuan():
     target_date = date(2026, 7, 24)
     rows = _map_records(
         [
@@ -35,8 +35,10 @@ def test_market_north_flow_mapping_filters_requested_dates_and_preserves_provide
     assert len(rows) == 1
     assert rows[0]["trade_date"] == target_date
     assert rows[0]["source"] == NORTH_FLOW_SOURCE
-    assert rows[0]["north_money"] == 15.7
-    assert rows[0]["metadata_json"]["value_unit"] == "provider_reported"
+    assert rows[0]["north_money_yuan"] == 15_700_000
+    assert rows[0]["hgt_yuan"] == 12_500_000
+    assert "north_money" not in rows[0]
+    assert "metadata_json" not in rows[0]
 
 
 def test_market_north_flow_windows_are_trade_date_bounded():

@@ -36,14 +36,11 @@ def test_core_and_enrichment_do_not_repeat_minute_or_full_daily_factor_work() ->
 
     assert core["sync_minute"] is False
     assert core["calculate_minute_factors"] is False
-    assert core["calculate_daily_factors"] is True
+    assert core["calculate_daily_factors"] is False
     assert core["calculate_sector_factors"] is False
     assert core["sync_stock_limit_status"] is False
     assert core["sync_sector_bars"] is False
-    assert enrichment["calculate_daily_factors"] is False
-    assert enrichment["merge_external_technical_factors"] is False
-    assert enrichment["assemble_daily_factors_v2"] is True
-    assert core["calculate_technical_snapshot"] is False
+    assert enrichment["calculate_daily_factors"] is True
     assert enrichment["calculate_sector_factors"] is True
     assert enrichment["sync_stock_limit_status"] is True
     assert enrichment["sync_sector_bars"] is True
@@ -60,17 +57,11 @@ def test_late_limit_and_sector_facts_run_in_enrichment_not_core() -> None:
         sync_lhb=False,
         sync_index_bars=False,
         sync_index_daily_basic=False,
-        sync_north_hold=False,
-        sync_market_stats=False,
         sync_sector_bars=True,
         sync_sector_moneyflow=False,
         sync_minute=False,
         calculate_daily_factors=False,
         calculate_minute_factors=False,
-        calculate_technical_snapshot=False,
-        calculate_stock_fund_factors=False,
-        calculate_external_technical_factors=False,
-        merge_external_technical_factors=False,
         calculate_sector_factors=False,
     )
     service = object.__new__(DailyMarketCloseIngestService)
@@ -121,9 +112,7 @@ def test_readiness_marks_late_events_and_sector_bars_as_enhancement() -> None:
                 "stock_moneyflow": 100,
                 "adjust_factor": 100,
                 "daily_factor": 100,
-                "daily_factor_v2": 100,
-                "daily_factor_v2_ready": 100,
-                "technical_snapshot": 100,
+                "daily_factor_ready": 0,
                 "stock_technical": 0,
                 "index_bar": 7,
                 "index_daily_basic": 0,
@@ -133,12 +122,9 @@ def test_readiness_marks_late_events_and_sector_bars_as_enhancement() -> None:
                 "lhb_event": 0,
                 "sector_moneyflow": 0,
                 "sector_factor": 0,
-                "market_stat": 0,
+                "market_summary": 0,
                 "raw_capabilities": set(),
             }
-
-        async def active_stock_factor_set(self):
-            return "stock_daily_v1"
 
     service = object.__new__(DailyMarketCloseIngestService)
     service.repository = Repository()
@@ -147,6 +133,7 @@ def test_readiness_marks_late_events_and_sector_bars_as_enhancement() -> None:
 
     assert readiness["core_ready"] is True
     assert readiness["report_quality"] == "degraded"
+    assert readiness["block_status"]["daily_factors"]["status"] == "missing"
     assert readiness["block_status"]["stock_events"]["status"] == "missing"
     assert readiness["block_status"]["sector_bars"]["status"] == "missing"
 
@@ -159,17 +146,29 @@ def test_provider_payload_compaction_never_keeps_response_rows() -> None:
             "items": [[f"{index:06d}.SZ", "20260724"] for index in range(501)],
         },
     }
-    compact = DailyMarketCloseIngestService._compact_raw_payload(large, row_count=501)
+    class Repository:
+        async def insert_ingest_audit(self, row):
+            self.row = row
 
-    assert compact["row_count"] == 501
-    assert len(compact["sha256"]) == 64
-    assert "data" not in compact
-    assert "items" not in compact
+    service = object.__new__(DailyMarketCloseIngestService)
+    service.repository = Repository()
+    asyncio.run(
+        service._capture_raw_summary(
+            "daily_market_close_daily",
+            date(2026, 7, 24),
+            large,
+            501,
+            normalized_table="t_daily_bar",
+        )
+    )
 
-    small = {"data": {"items": [["000001.SZ", "20260724"]]}}
-    small_compact = DailyMarketCloseIngestService._compact_raw_payload(small, row_count=1)
-    assert small_compact["row_count"] == 1
-    assert "data" not in small_compact
+    audit = service.repository.row
+    assert audit["response_row_count"] == 501
+    assert len(audit["payload_sha256"]) == 64
+    assert audit["requested_fields"] == ["ts_code", "trade_date"]
+    assert "payload" not in audit
+    assert "data" not in audit
+    assert "items" not in audit
 
 
 def test_sector_daily_uses_one_trade_date_request_and_keeps_available_rows() -> None:

@@ -1,4 +1,4 @@
-"""Auditable V2 post-close dual-score market emotion.
+"""Auditable post-close dual-score market emotion.
 
 The service has no Provider, HTTP or LLM dependency.  It transforms settled
 canonical/derived facts into immutable per-model daily observations.  All
@@ -19,12 +19,20 @@ from fastapi.encoders import jsonable_encoder
 
 from app.modules.market_insight.models import MarketEmotionDaily, MarketEmotionModel
 from app.modules.market_insight.repository import MarketInsightRepository
-from app.modules.market_insight.service import (
-    LIMIT_EVENT_COMPLETION_CAPABILITIES,
-    MARKET_SENTIMENT_UNIVERSE_CODE,
-    MIN_DAILY_BAR_COVERAGE_PCT,
-    _pct,
-)
+
+
+MARKET_SENTIMENT_UNIVERSE_CODE = "cn_a_active_non_st"
+MIN_DAILY_BAR_COVERAGE_PCT = 95.0
+LIMIT_EVENT_COMPLETION_CAPABILITIES = {
+    "daily_market_close_stock_limit",
+    "stock_limit_event_history_backfill",
+}
+
+
+def _pct(numerator: int | float | None, denominator: int | float | None) -> float | None:
+    if numerator is None or not denominator:
+        return None
+    return round(float(numerator) / float(denominator) * 100, 4)
 
 
 EMOTION_MODEL_CODE_DEFAULT = "cn_a_emotion_v2"
@@ -63,7 +71,7 @@ METRIC_META: dict[str, dict[str, str]] = {
     "leader_strength": {"label": "龙头强度", "unit": "分", "direction": "positive", "formula": "当日最高概念热度分"},
     "amount_vs_5d_average": {"label": "成交额相对 5 日均值", "unit": "倍", "direction": "positive", "formula": "全市场成交额 ÷ 前 5 个有效交易日均额"},
     "main_net_inflow_strength": {"label": "全市场主力资金净流入", "unit": "元", "direction": "positive", "formula": "合格股票主力净流入合计"},
-    "north_money": {"label": "北向资金净流入", "unit": "Provider 原始单位", "direction": "positive", "formula": "moneyflow_hsgt.north_money；未发布不以零替代"},
+    "north_money": {"label": "北向资金净流入", "unit": "元", "direction": "positive", "formula": "moneyflow_hsgt.north_money 按官方百万元口径转换为元；未发布不以零替代"},
     "above_ma20_ratio": {"label": "站上 MA20 比例", "unit": "%", "direction": "positive", "formula": "收盘价≥MA20 股票数 ÷ 已有日频因子股票数 × 100"},
     "above_ma60_ratio": {"label": "站上 MA60 比例", "unit": "%", "direction": "positive", "formula": "收盘价≥MA60 股票数 ÷ 已有日频因子股票数 × 100"},
     "new_high_low_spread": {"label": "20 日创新高减创新低", "unit": "百分点", "direction": "positive", "formula": "20 日创新高占比 − 20 日创新低占比"},
@@ -101,7 +109,7 @@ class EmotionCalculation:
 
 
 class MarketEmotionService:
-    """Compute/read V2 emotion without changing legacy V1 reports."""
+    """Compute and read the single official dual-score emotion result."""
 
     def __init__(self, repository: MarketInsightRepository) -> None:
         self.repository = repository
@@ -313,7 +321,7 @@ class MarketEmotionService:
         """Evaluate persisted scores against later settled market facts.
 
         This is intentionally a read-only research view.  It uses the raw
-        inputs retained on each already-scored V2 row, so a revised canonical
+        inputs retained on each already-scored row, so a revised canonical
         fact cannot silently change an old validation result, and no future
         observation can flow back into that date's score or stage.
         """
@@ -442,9 +450,9 @@ class MarketEmotionService:
     async def _resolve_model(self, *, model_code: str | None, mode: str) -> MarketEmotionModel:
         model = await self.repository.get_emotion_model(model_code) if model_code else await self.repository.active_emotion_model()
         if model is None:
-            raise ValueError("没有可用 V2 情绪模型；请先创建草稿并完成基线校准")
+            raise ValueError("没有可用情绪模型；请先创建草稿并完成基线校准")
         if mode == "daily" and model.status != "active":
-            raise ValueError("日常计算只能使用已启用的 V2 情绪模型")
+            raise ValueError("日常计算只能使用已启用的情绪模型")
         if mode == "baseline" and model.status not in {"draft", "calibrating", "ready"}:
             raise ValueError("基线校准只能使用草稿、校准中或待发布模型")
         return model
@@ -479,7 +487,7 @@ class MarketEmotionService:
         mode: str,
         progress_reporter: Callable[[dict], Awaitable[None]] | None,
     ) -> dict[str, Any]:
-        """Load V2 fact blocks sequentially and make each block observable.
+        """Load emotion fact blocks sequentially and make each block observable.
 
         A single AsyncSession must not execute these aggregates concurrently.
         The checkpoints identify the exact slow block without compromising the
@@ -502,15 +510,15 @@ class MarketEmotionService:
         loaders: tuple[tuple[str, Callable[[], Awaitable[Any]]], ...] = (
             (
                 "market",
-                lambda: self.repository.v2_market_metrics(all_dates, progress_reporter=market_progress),
+                lambda: self.repository.market_summary_metrics(all_dates, progress_reporter=market_progress),
             ),
-            ("events", lambda: self.repository.v2_limit_event_rows(all_dates)),
+            ("events", lambda: self.repository.final_limit_event_rows(all_dates)),
             ("completion", lambda: self.repository.limit_event_completion_capabilities(all_dates)),
             ("premiums", lambda: self.repository.previous_limit_up_premiums(all_dates)),
-            ("themes", lambda: self.repository.v2_theme_metrics(all_dates)),
-            ("north", lambda: self.repository.v2_north_flows(all_dates)),
-            ("indices", lambda: self.repository.v2_index_metrics(all_dates)),
-            ("external_confirmations", lambda: self.repository.v2_external_confirmations(up_to=all_dates[-1])),
+            ("themes", lambda: self.repository.final_theme_metrics(all_dates)),
+            ("north", lambda: self.repository.final_north_flows(all_dates)),
+            ("indices", lambda: self.repository.market_summary_index_metrics(all_dates)),
+            ("external_confirmations", lambda: self.repository.final_external_confirmations(up_to=all_dates[-1])),
         )
         inputs: dict[str, Any] = {}
         for index, (block, loader) in enumerate(loaders, start=1):
@@ -944,7 +952,7 @@ def _forward_validation(*, rows: list[dict], target_dates: list[date], raw_by_da
                     )
 
     return {
-        "method_version": "v2_persisted_forward_outcome",
+        "method_version": "final_persisted_forward_outcome_r1",
         "eligible_score_days": eligible_score_days,
         "short_term": {
             "t_plus_1": _forward_outcome_summary(samples["short_term"][1]),
@@ -1159,7 +1167,7 @@ def _metric_source(key: str) -> str:
     if key in {"north_money"}:
         return "t_market_north_flow_daily"
     if key in {"theme_limit_up_density", "theme_persistence", "leader_strength"}:
-        return "t_market_sector_heat_daily(v1)"
+        return "t_sector_factor_daily"
     if key in {"core_index_trend", "index_amplitude"}:
         return "t_index_bar"
     if key in {"natural_limit_up_count", "qualified_limit_down_count", "limit_break_rate", "board_promotion_rate", "board_structure", "previous_limit_up_premium"}:
@@ -1169,12 +1177,12 @@ def _metric_source(key: str) -> str:
 
 def _serialize_external_confirmations(values: dict, trade_date: date) -> dict:
     result = dict(values or {})
-    for key in ("north_hold_latest_trade_date", "margin_latest_trade_date"):
+    for key in ("north_flow_latest_trade_date", "margin_latest_trade_date"):
         value = result.get(key)
         result[key] = value.isoformat() if hasattr(value, "isoformat") else value
     result["as_of_trade_date"] = trade_date.isoformat()
     result["scoring_included"] = False
-    result["note"] = "北向持仓与两融按实际披露日展示，仅作延迟确认，不参与当日核心分数"
+    result["note"] = "市场级北向资金与两融按实际披露日展示，仅作延迟确认，不阻塞核心报告"
     return result
 
 

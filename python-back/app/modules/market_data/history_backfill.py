@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.market_data.providers import normalize_symbol, parse_date
 from app.modules.market_data.repository import MarketDataRepository, STOCK_LIMIT_EVENT_HISTORY_CAPABILITY
+from app.modules.market_data.stock_factor_contract import map_stk_factor_pro_record
 from app.modules.market_data.tushare.adapters import TushareStockDailyAdapter
 from app.modules.market_data.tushare.contracts import TushareApiRequest
 from app.modules.market_data.tushare_runtime import TushareProviderFactory
@@ -343,7 +344,7 @@ class StockDailyBackfillService:
                                 "response_row_count": raw_count,
                                 "normalized_row_count": len(rows),
                                 "normalized_table": "t_limit_event_daily",
-                                "schema_version": "canonical_v2",
+                                "schema_version": "canonical_final_r1",
                                 "status": "captured" if rows else "complete_zero",
                             }
                         )
@@ -568,7 +569,7 @@ class StockDailyBackfillService:
                                 "normalized_row_count": mapped_count,
                                 "payload_sha256": self._payload_sha256(response.records),
                                 "normalized_table": self._normalized_table(fact_kind),
-                                "schema_version": "stock_daily_asset_v2",
+                                "schema_version": "stock_daily_final_r1",
                                 "status": "captured" if raw_count else "complete_zero",
                             }
                         )
@@ -631,7 +632,7 @@ class StockDailyBackfillService:
                                     "response_row_count": 0,
                                     "normalized_row_count": 0,
                                     "normalized_table": self._normalized_table(fact_kind),
-                                    "schema_version": "stock_daily_asset_v2",
+                                    "schema_version": "stock_daily_final_r1",
                                     "status": "failed",
                                     "error_code": type(exc).__name__,
                                     "error_message": str(exc)[:1000],
@@ -786,7 +787,7 @@ class StockDailyBackfillService:
             "daily_basic": "t_stock_daily_basic",
             "adjust_factor": "t_stock_adjust_factor",
             "moneyflow": "t_stock_fund_flow_daily",
-            "stock_technical_factor_pro": "t_stock_technical_factor_daily",
+            "stock_technical_factor_pro": "t_stock_factor_daily",
         }[fact_kind]
 
     @staticmethod
@@ -819,32 +820,15 @@ class StockDailyBackfillService:
         rows: list[dict[str, Any]] = []
         warnings: list[str] = []
         for record in records:
-            stock_code = normalize_symbol(str(record.get("ts_code") or ""))
-            trade_date = parse_date(record.get("trade_date"))
-            if not stock_code or trade_date is None:
+            row = map_stk_factor_pro_record(record)
+            if row is None:
                 if len(warnings) < 20:
                     warnings.append(f"missing stock_code/trade_date: {record}")
                 continue
+            trade_date = row["trade_date"]
             if trade_date < start_date or trade_date > end_date:
                 continue
-            factors = {
-                key: value
-                for key, value in record.items()
-                if key not in {"ts_code", "trade_date"} and value is not None
-            }
-            rows.append(
-                {
-                    "stock_code": stock_code,
-                    "trade_date": trade_date,
-                    "source": "tushare:stk_factor_pro",
-                    "factors": factors,
-                    "metadata_json": {
-                        "provider": "tushare",
-                        "api_name": "stk_factor_pro",
-                        "mapping_version": "history_backfill_v1",
-                    },
-                }
-            )
+            rows.append(row)
         return rows, len(records), len(rows), warnings
 
     @staticmethod
@@ -859,7 +843,7 @@ class StockDailyBackfillService:
         elif fact_kind == "adjust_factor":
             count = await repository.upsert_adjust_factor_rows(rows)
         elif fact_kind == "stock_technical_factor_pro":
-            count = await repository.upsert_stock_technical_factor_rows(rows)
+            count = await repository.upsert_stock_factor_professional_rows(rows)
         else:
             count = await repository.upsert_stock_fund_flow_rows(rows)
         await session.commit()

@@ -71,7 +71,9 @@ def test_daily_basic_adapter_maps_existing_table_fields():
     assert result.mapped_count == 1
     row = result.rows[0]
     assert row["stock_code"] == "000001"
-    assert row["turnover_rate"] == 1.2
+    assert row["turnover_rate_pct"] == 1.2
+    assert row["total_share_shares"] == 1000000
+    assert row["total_market_value_yuan"] == 123450000
     assert "close_price" not in row
     assert "limit_status" not in row
 
@@ -115,11 +117,11 @@ def test_moneyflow_adapter_converts_ten_thousand_yuan_to_yuan():
     assert result.mapped_count == 1
     row = result.rows[0]
     assert row["stock_code"] == "002281"
-    assert row["main_net_inflow"] == 45000
-    assert row["small_buy_amount"] == 10000
-    assert row["small_net_inflow"] == 5000
-    assert row["big_order_net_inflow"] == 20000
-    assert row["super_large_net_inflow"] == 25000
+    assert row["main_net_inflow_yuan"] == 45000
+    assert row["small_buy_amount_yuan"] == 10000
+    assert row["small_net_inflow_yuan"] == 5000
+    assert row["big_order_net_inflow_yuan"] == 20000
+    assert row["super_large_net_inflow_yuan"] == 25000
     assert row["metadata_json"]["unit_conversions"]["moneyflow.*_amount"] == "ten_thousand_yuan -> yuan"
 
 

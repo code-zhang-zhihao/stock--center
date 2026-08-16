@@ -116,7 +116,7 @@ Key 规则：
 - 两个任务写入 `t_scheduler_job`，默认 disabled，先手动验证。
 - 任务运行日志写入 `t_scheduler_job_run`。
 - 调度页面使用 `parameter_schema` 生成默认参数与手动运行表单；可编辑 cron、启停、单次尝试超时、重试次数和重试间隔。Cron 与 payload 均在后端写入或运行前校验。
-- Provider 原始响应通过 `t_provider_raw_record` 留痕。
+- Provider 调用通过 `t_provider_ingest_audit` 保存脱敏参数、行数、哈希和状态；原始响应正文不入库。
 
 不迁移：
 

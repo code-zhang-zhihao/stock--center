@@ -231,7 +231,7 @@ def _margin_summary_rows(records: list[dict]) -> list[dict]:
         trade_date = _date(record, "trade_date")
         exchange = str(record.get("exchange_id") or record.get("exchange") or "ALL")
         if trade_date:
-            rows.append({"trade_date": trade_date, "exchange": exchange, "source": "tushare:margin", "rzye": safe_float(record.get("rzye")), "rz_mre": safe_float(record.get("rzmre")), "rzche": safe_float(record.get("rzche")), "rqye": safe_float(record.get("rqye")), "rq_mcl": safe_float(record.get("rqmcl")), "rzrqye": safe_float(record.get("rzrqye")), "metadata_json": _metadata("margin", record)})
+            rows.append({"trade_date": trade_date, "exchange": exchange, "source": "tushare:margin", "financing_balance_yuan": safe_float(record.get("rzye")), "financing_buy_yuan": safe_float(record.get("rzmre")), "financing_repay_yuan": safe_float(record.get("rzche")), "securities_lending_balance_yuan": safe_float(record.get("rqye")), "securities_lending_sell_shares": safe_float(record.get("rqmcl")), "margin_total_balance_yuan": safe_float(record.get("rzrqye"))})
     return rows
 
 
@@ -1521,6 +1521,6 @@ class MarketDataSyncService:
             "response_row_count": row_count,
             "normalized_row_count": row_count,
             "normalized_table": normalized_table,
-            "schema_version": "canonical_v2",
+            "schema_version": "canonical_final_r1",
             "status": "complete_zero" if row_count == 0 else "captured",
         })

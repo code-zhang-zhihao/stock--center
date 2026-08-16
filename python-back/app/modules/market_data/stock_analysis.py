@@ -13,11 +13,9 @@ from app.modules.market_data.models import (
     SectorBasic,
     SectorComponent,
     Stock,
-    StockChipPerfDaily,
     StockDailyBasic,
     StockFactorMinute,
     StockFundFlowDaily,
-    StockTechnicalFactorDaily,
 )
 from app.modules.market_data.providers import AkShareProvider, MootdxProvider, json_safe, normalize_symbol
 from app.modules.market_data.repository import MarketDataRepository
@@ -180,12 +178,6 @@ class StockAnalysisService:
 
     async def factors(self, stock_code: str, *, trade_date: date | None, lookback: int = 60) -> dict:
         code = normalize_symbol(stock_code)
-        technical_filters = [StockTechnicalFactorDaily.stock_code == code]
-        chip_filters = [StockChipPerfDaily.stock_code == code]
-        if trade_date is not None:
-            technical_filters.append(StockTechnicalFactorDaily.trade_date <= trade_date)
-            chip_filters.append(StockChipPerfDaily.trade_date <= trade_date)
-
         # Minute factors describe an intraday session. They must not share the
         # daily-factor lookback limit, otherwise a 120-row request returns only
         # the afternoon half of a normal 240-minute A-share session.
@@ -207,20 +199,15 @@ class StockAnalysisService:
             order_by=[StockFactorMinute.bar_time.desc()],
             limit=400,
         )
-        # The workbench only consumes the latest snapshot and enhanced-factor
-        # documents. Keeping their full JSON history in this response made a
-        # single-stock page request unnecessarily large and slow.
+        # The compatibility snapshot is projected from the official typed
+        # factor row. No professional JSON, chip document, or snapshot history
+        # is persisted separately.
         snapshots = await self.repository.computed_technical_snapshots(
             stock_code=code,
             end_date=trade_date,
             limit=1,
         )
-        technical = await self.repository.list_rows(StockTechnicalFactorDaily, filters=technical_filters, order_by=[StockTechnicalFactorDaily.trade_date.desc()], limit=1)
-        chip = await self.repository.list_rows(StockChipPerfDaily, filters=chip_filters, order_by=[StockChipPerfDaily.trade_date.desc()], limit=1)
-
         latest_daily = self._mapping(daily[0]) if daily else None
-        latest_technical = self._row(technical[0]) if technical else None
-        latest_chip = self._row(chip[0]) if chip else None
         latest_snapshot = self._mapping(snapshots[0]) if snapshots else None
         return {
             "stock_code": code,
@@ -228,17 +215,13 @@ class StockAnalysisService:
             "minute_factors": [self._row(row) for row in reversed(minute)],
             "minute_factor_trade_date": minute_trade_date.isoformat() if minute_trade_date else None,
             "technical_snapshots": [self._mapping(row) for row in reversed(snapshots)],
-            "technical_factors": [self._row(row) for row in reversed(technical)],
-            "chip_perf": [self._row(row) for row in reversed(chip)],
             "latest": {
                 "daily_factor": latest_daily,
-                "technical_factor": latest_technical,
-                "chip_perf": latest_chip,
                 "technical_snapshot": latest_snapshot,
             },
             "missing": {
-                "technical_factor": latest_technical is None,
-                "chip_perf": latest_chip is None,
+                "technical_core": not latest_daily or latest_daily.get("technical_core_status") != "ready",
+                "technical_extended": not latest_daily or latest_daily.get("technical_extended_status") != "ready",
             },
         }
 

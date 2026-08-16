@@ -368,7 +368,7 @@ class SyncIndexCatalogHandler:
 
 
 class BackfillMarketNorthFlowHandler:
-    """Backfill the compact market-level northbound flow fact before V2 calibration."""
+    """Backfill the compact market-level northbound flow fact before emotion calibration."""
 
     job_code = "backfill_market_north_flow"
     job_type = "market_data"
@@ -392,7 +392,7 @@ class BackfillMarketNorthFlowHandler:
             "required": False,
             "min": 60,
             "max": 1000,
-            "description": "未指定开始日期时，回填最近多少个已有个股日线的交易日；V2 默认基线使用 250。",
+            "description": "未指定开始日期时，回填最近多少个已有个股日线的交易日；情绪基线默认使用 250。",
         },
         "only_missing": {
             "label": "只补缺失",
@@ -457,7 +457,7 @@ class BackfillStockDailyFactsHandler:
             "type": "string",
             "default": "2020-01-01",
             "required": True,
-            "description": "日线、daily_basic、复权因子、资金流、专业技术因子和事件回填开始日期；默认覆盖 V2 因子 2021-01-01 前约 250 个交易日预热。",
+            "description": "日线、daily_basic、复权因子、资金流、专业技术因子和事件回填开始日期；默认覆盖正式因子 2021-01-01 前约 250 个交易日预热。",
         },
         "end_date": {
             "label": "结束日期",
@@ -777,13 +777,6 @@ class BackfillStockDailyFactorsHandler:
             "max": 4,
             "description": "同一日期窗口并行计算的股票分片数；每个 worker 使用独立数据库会话，默认 2。",
         },
-        "calculate_stock_fund": {
-            "label": "计算资金因子",
-            "type": "boolean",
-            "default": True,
-            "required": False,
-            "description": "从 t_stock_fund_flow_daily 读取资金流，补充资金占比、连续流入、横截面分位等 features。",
-        },
     }
     default_payload = {
         "pool_code": "all_a_share",
@@ -796,8 +789,6 @@ class BackfillStockDailyFactorsHandler:
         "sql_stock_chunk_size": 200,
         "calculation_workers": 2,
         "fail_fast": False,
-        "calculate_stock_fund": True,
-        "include_external_technical": False,
     }
     force_async = True
 
@@ -807,7 +798,7 @@ class BackfillStockDailyFactorsHandler:
         result = await service.backfill_stock_daily_pipeline(payload)
         return JobResult(
             status="success",
-            affected_rows=result.daily_factor_rows + result.technical_snapshot_rows,
+            affected_rows=result.daily_factor_rows,
             summary=result.model_dump(mode="json"),
         )
 
@@ -962,15 +953,15 @@ def _daily_close_affected_rows(result) -> int:
         + result.lhb_seat_rows
         + result.index_bar_rows
         + result.index_daily_basic_rows
-        + result.north_hold_rows
-        + result.market_stat_rows
         + result.sector_bar_rows
         + result.sector_moneyflow_rows
         + result.daily_factor_rows
-        + result.daily_factor_v2_rows
+        + result.qfq_rebased_rows
         + result.minute_factor_rows
-        + result.technical_snapshot_rows
         + result.sector_factor_rows
+        + result.sector_leader_rows
+        + result.index_factor_rows
+        + result.market_summary_rows
     )
 
 
@@ -1013,18 +1004,11 @@ class DailyCloseMinuteIngestHandler(_DailyCloseBaseHandler):
         "sync_lhb": False,
         "sync_index_bars": False,
         "sync_index_daily_basic": False,
-        "sync_north_hold": False,
-        "sync_market_stats": False,
         "sync_sector_bars": False,
         "sync_sector_moneyflow": False,
         "sync_minute": True,
         "calculate_daily_factors": False,
         "calculate_minute_factors": True,
-        "calculate_technical_snapshot": False,
-        "calculate_stock_fund_factors": False,
-        "calculate_external_technical_factors": False,
-        "merge_external_technical_factors": False,
-        "assemble_daily_factors_v2": False,
         "calculate_sector_factors": False,
         "fail_on_enrichment_error": False,
         "minute_retention_trade_days": 30,
@@ -1051,18 +1035,11 @@ class DailyCloseCoreIngestHandler(_DailyCloseBaseHandler):
         "sync_lhb": False,
         "sync_index_bars": True,
         "sync_index_daily_basic": False,
-        "sync_north_hold": False,
-        "sync_market_stats": False,
         "sync_sector_bars": False,
         "sync_sector_moneyflow": False,
         "sync_minute": False,
-        "calculate_daily_factors": True,
+        "calculate_daily_factors": False,
         "calculate_minute_factors": False,
-        "calculate_technical_snapshot": False,
-        "calculate_stock_fund_factors": True,
-        "calculate_external_technical_factors": False,
-        "merge_external_technical_factors": False,
-        "assemble_daily_factors_v2": False,
         "calculate_sector_factors": False,
         "fail_on_enrichment_error": False,
         "ingest_mode": "append_safe",
@@ -1088,18 +1065,11 @@ class DailyCloseEnrichmentIngestHandler(_DailyCloseBaseHandler):
         "sync_lhb": True,
         "sync_index_bars": False,
         "sync_index_daily_basic": True,
-        "sync_north_hold": False,
-        "sync_market_stats": True,
         "sync_sector_bars": True,
         "sync_sector_moneyflow": True,
         "sync_minute": False,
-        "calculate_daily_factors": False,
+        "calculate_daily_factors": True,
         "calculate_minute_factors": False,
-        "calculate_technical_snapshot": False,
-        "calculate_stock_fund_factors": False,
-        "calculate_external_technical_factors": True,
-        "merge_external_technical_factors": False,
-        "assemble_daily_factors_v2": True,
         "calculate_sector_factors": True,
         "fail_on_enrichment_error": False,
         "enrichment_block_concurrency": 4,
@@ -1172,16 +1142,14 @@ class DailyCloseRepairIngestHandler:
                     or repair_moneyflow
                 )
                 repair_technical = "stock_technical" in missing
-                repair_daily_factors_v2 = (
-                    "daily_factors_v2" in missing
-                    or repair_daily_factors
+                repair_daily_factors = (
+                    repair_daily_factors
                     or repair_daily_basic
                     or repair_adjust_factor
                     or repair_technical
                 )
                 repair_lhb = "lhb" in missing
                 repair_index_daily_basic = "index_daily_basic" in missing
-                repair_market_stats = "market_stats" in missing
                 repair_sector_moneyflow = "sector_moneyflow" in missing
                 repair_sector_factors = (
                     "sector_factors" in missing
@@ -1202,18 +1170,11 @@ class DailyCloseRepairIngestHandler:
                         sync_lhb_seats=repair_lhb,
                         sync_index_bars=repair_index_bars,
                         sync_index_daily_basic=repair_index_daily_basic,
-                        sync_north_hold=False,
-                        sync_market_stats=repair_market_stats,
                         sync_sector_bars=repair_sector_bars,
                         sync_sector_moneyflow=repair_sector_moneyflow,
                         sync_minute=False,
                         calculate_daily_factors=repair_daily_factors,
                         calculate_minute_factors=False,
-                        calculate_technical_snapshot=False,
-                        calculate_stock_fund_factors=repair_daily_factors,
-                        calculate_external_technical_factors=False,
-                        merge_external_technical_factors=False,
-                        assemble_daily_factors_v2=repair_daily_factors_v2,
                         calculate_sector_factors=repair_sector_factors,
                         fail_on_enrichment_error=bool(payload.get("fail_on_enrichment_error")),
                         enrichment_block_concurrency=int(payload.get("enrichment_block_concurrency") or 4),

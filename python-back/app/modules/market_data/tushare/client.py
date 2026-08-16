@@ -34,7 +34,7 @@ class TushareRawClient:
             "reference": TushareCategoryClient(transport, {"dividend", "share_float", "repurchase", "pledge_stat", "pledge_detail", "stk_holdernumber", "top10_holders", "top10_floatholders", "stk_holdertrade"}),
             "featured": TushareCategoryClient(transport, {"stk_limit", "limit_list_d", "anns_d", "ths_hot", "cyq_perf", "cyq_chips"}),
             "margin": TushareCategoryClient(transport, {"margin", "margin_detail"}),
-            "fund_flow": TushareCategoryClient(transport, {"moneyflow", "moneyflow_hsgt", "hsgt_top10", "hk_hold", "moneyflow_cnt_ths", "moneyflow_ind_ths"}),
+            "fund_flow": TushareCategoryClient(transport, {"moneyflow", "moneyflow_hsgt", "hsgt_top10", "moneyflow_cnt_ths", "moneyflow_ind_ths"}),
             "board_trading": TushareCategoryClient(transport, {"top_list", "top_inst"}),
         })()
         self.index = type("IndexApi", (), {

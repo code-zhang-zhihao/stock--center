@@ -1,7 +1,7 @@
 from datetime import date, datetime, time
 
 from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Index, String, Text, Time, UniqueConstraint, func, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -13,25 +13,6 @@ def created_at_column():
 
 def updated_at_column():
     return mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-
-class ProviderRawRecord(Base):
-    __tablename__ = "t_provider_raw_record"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    trace_id: Mapped[str] = mapped_column(String(80), nullable=False)
-    provider_code: Mapped[str] = mapped_column(String(80), nullable=False)
-    capability: Mapped[str] = mapped_column(String(80), nullable=False)
-    request_params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    record_key: Mapped[str | None] = mapped_column(String(200))
-    payload: Mapped[dict | list] = mapped_column(JSONB, nullable=False)
-    payload_summary: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    normalized_table: Mapped[str | None] = mapped_column(String(80))
-    normalized_pk: Mapped[str | None] = mapped_column(String(120))
-    status: Mapped[str] = mapped_column(String(40), nullable=False, default="captured")
-    error_code: Mapped[str | None] = mapped_column(String(120))
-    error_message: Mapped[str | None] = mapped_column(Text)
-    created_at = created_at_column()
 
 
 class ProviderIngestAudit(Base):
@@ -51,7 +32,7 @@ class ProviderIngestAudit(Base):
     normalized_row_count: Mapped[int] = mapped_column(nullable=False, default=0)
     payload_sha256: Mapped[str | None] = mapped_column(String(64))
     normalized_table: Mapped[str | None] = mapped_column(String(120))
-    schema_version: Mapped[str] = mapped_column(String(40), nullable=False, default="v1")
+    schema_version: Mapped[str] = mapped_column(String(40), nullable=False, default="ingest_audit_r1")
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(120))
     error_message: Mapped[str | None] = mapped_column(Text)
@@ -156,15 +137,13 @@ class DailyBar(Base):
     volume_hand: Mapped[int | None] = mapped_column(BigInteger)
     volume_share: Mapped[int | None] = mapped_column(BigInteger)
     amount_yuan: Mapped[float | None]
-    turnover_rate: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
     updated_at = updated_at_column()
 
 
 class MinuteBar(Base):
     __tablename__ = "t_minute_bar"
-    __table_args__ = (UniqueConstraint("stock_code", "trade_date", "bar_time", "interval", "source", name="uq_t_minute_bar_stock_date_time_interval_source_v2"),)
+    __table_args__ = (UniqueConstraint("stock_code", "trade_date", "bar_time", "interval", "source", name="uq_t_minute_bar_stock_date_time_interval_source"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -177,7 +156,6 @@ class MinuteBar(Base):
     volume_hand: Mapped[int | None] = mapped_column(BigInteger)
     volume_share: Mapped[int | None] = mapped_column(BigInteger)
     amount_yuan: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
 
 
@@ -266,7 +244,6 @@ class SectorBar(Base):
     volume: Mapped[float | None]
     amount_yuan: Mapped[float | None]
     turnover_rate: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
 
 
@@ -312,7 +289,6 @@ class IndexBar(Base):
     change_pct: Mapped[float | None]
     volume: Mapped[float | None]
     amount_yuan: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
 
 
@@ -324,28 +300,23 @@ class StockFundFlowDaily(Base):
     stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
-    main_net_inflow: Mapped[float | None]
+    main_net_inflow_yuan: Mapped[float | None]
     main_net_ratio: Mapped[float | None]
-    big_order_net_inflow: Mapped[float | None]
+    big_order_net_inflow_yuan: Mapped[float | None]
     big_order_net_ratio: Mapped[float | None]
-    super_large_net_inflow: Mapped[float | None]
-    medium_net_inflow: Mapped[float | None]
-    small_net_inflow: Mapped[float | None]
-    small_buy_amount: Mapped[float | None]
-    small_sell_amount: Mapped[float | None]
-    medium_buy_amount: Mapped[float | None]
-    medium_sell_amount: Mapped[float | None]
-    large_buy_amount: Mapped[float | None]
-    large_sell_amount: Mapped[float | None]
-    super_large_buy_amount: Mapped[float | None]
-    super_large_sell_amount: Mapped[float | None]
-    close_price: Mapped[float | None]
-    change_pct: Mapped[float | None]
-    rank: Mapped[int | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    super_large_net_inflow_yuan: Mapped[float | None]
+    medium_net_inflow_yuan: Mapped[float | None]
+    small_net_inflow_yuan: Mapped[float | None]
+    small_buy_amount_yuan: Mapped[float | None]
+    small_sell_amount_yuan: Mapped[float | None]
+    medium_buy_amount_yuan: Mapped[float | None]
+    medium_sell_amount_yuan: Mapped[float | None]
+    large_buy_amount_yuan: Mapped[float | None]
+    large_sell_amount_yuan: Mapped[float | None]
+    super_large_buy_amount_yuan: Mapped[float | None]
+    super_large_sell_amount_yuan: Mapped[float | None]
     created_at = created_at_column()
     updated_at = updated_at_column()
-
 
 class SectorFundFlowDaily(Base):
     __tablename__ = "t_sector_fund_flow_daily"
@@ -357,9 +328,9 @@ class SectorFundFlowDaily(Base):
     sector_type: Mapped[str] = mapped_column(String(40), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
-    main_net_inflow: Mapped[float | None]
-    net_buy_amount: Mapped[float | None]
-    net_sell_amount: Mapped[float | None]
+    main_net_inflow_yuan: Mapped[float | None]
+    net_buy_amount_yuan: Mapped[float | None]
+    net_sell_amount_yuan: Mapped[float | None]
     main_net_ratio: Mapped[float | None]
     change_pct: Mapped[float | None]
     close_price: Mapped[float | None]
@@ -367,10 +338,8 @@ class SectorFundFlowDaily(Base):
     lead_stock: Mapped[str | None] = mapped_column(String(120))
     lead_stock_change_pct: Mapped[float | None]
     rank: Mapped[int | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
     updated_at = updated_at_column()
-
 
 class LhbEvent(Base):
     __tablename__ = "t_lhb_event"
@@ -388,7 +357,6 @@ class LhbEvent(Base):
     net_buy_amount: Mapped[float | None]
     buy_amount: Mapped[float | None]
     sell_amount: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
     updated_at = updated_at_column()
 
@@ -444,64 +412,35 @@ class FactorDefinition(Base):
     updated_at = updated_at_column()
 
 
-class FactorSetVersion(Base):
-    __tablename__ = "t_factor_set_version"
-
-    factor_set_code: Mapped[str] = mapped_column(String(80), primary_key=True)
-    factor_set_name: Mapped[str] = mapped_column(String(160), nullable=False)
-    version_no: Mapped[int] = mapped_column(nullable=False)
-    price_basis: Mapped[str] = mapped_column(String(20), nullable=False)
-    status: Mapped[str] = mapped_column(String(24), nullable=False)
-    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-    updated_at = updated_at_column()
-
-
 class StockFactorDaily(Base):
+    """The single official QFQ stock factor asset.
+
+    Provider technical indicators and locally reproducible factors share one
+    typed row.  Group statuses let each strategy validate only the inputs it
+    actually requires; there is no physical asset activation switch.
+    """
+
     __tablename__ = "t_stock_factor_daily"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False, default="system")
-    ma5: Mapped[float | None]
-    ma10: Mapped[float | None]
-    ma20: Mapped[float | None]
-    ma30: Mapped[float | None]
-    ma60: Mapped[float | None]
-    return_1d: Mapped[float | None]
-    amplitude: Mapped[float | None]
-    volume_ratio: Mapped[float | None]
-    amount_ratio: Mapped[float | None]
-    volatility_20d: Mapped[float | None]
-    close_position: Mapped[float | None]
-    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-
-
-class StockFactorDailyV2(Base):
-    __tablename__ = "t_stock_factor_daily_v2"
-    __table_args__ = (
-        UniqueConstraint(
-            "stock_code",
-            "trade_date",
-            "factor_set_version",
-            name="uq_t_stock_factor_daily_v2_business",
-        ),
-    )
+    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_t_stock_factor_daily_business"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    factor_set_version: Mapped[str] = mapped_column(String(80), nullable=False, default="stock_daily_v2")
+
     price_basis: Mapped[str] = mapped_column(String(20), nullable=False, default="qfq")
-    factor_status: Mapped[str] = mapped_column(String(24), nullable=False, default="partial")
+    price_status: Mapped[str] = mapped_column(String(24), nullable=False, default="partial")
+    technical_core_status: Mapped[str] = mapped_column(String(24), nullable=False, default="partial")
+    technical_extended_status: Mapped[str] = mapped_column(String(24), nullable=False, default="partial")
+    valuation_status: Mapped[str] = mapped_column(String(24), nullable=False, default="partial")
+    fund_status: Mapped[str] = mapped_column(String(24), nullable=False, default="partial")
+    quality_flags: Mapped[list[str]] = mapped_column(ARRAY(String()), nullable=False, default=list)
+    price_source: Mapped[str | None] = mapped_column(String(80))
     technical_source: Mapped[str | None] = mapped_column(String(80))
-    local_source: Mapped[str] = mapped_column(String(80), nullable=False, default="system:daily_factor_v2")
+    basic_source: Mapped[str | None] = mapped_column(String(80))
     fund_source: Mapped[str | None] = mapped_column(String(80))
-    source_map: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    missing_factors: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    local_source: Mapped[str] = mapped_column(String(80), nullable=False, default="system:stock_daily_factor")
+    calculation_revision: Mapped[str] = mapped_column(String(80), nullable=False, default="stock_daily_final_r1")
+    history_days: Mapped[int] = mapped_column(nullable=False, default=0)
 
     open_qfq: Mapped[float | None]
     high_qfq: Mapped[float | None]
@@ -520,6 +459,8 @@ class StockFactorDailyV2(Base):
     ema20: Mapped[float | None]
     ema30: Mapped[float | None]
     ema60: Mapped[float | None]
+    ema90: Mapped[float | None]
+    ema250: Mapped[float | None]
     macd: Mapped[float | None]
     macd_dif: Mapped[float | None]
     macd_dea: Mapped[float | None]
@@ -534,87 +475,136 @@ class StockFactorDailyV2(Base):
     boll_mid: Mapped[float | None]
     boll_lower: Mapped[float | None]
     atr: Mapped[float | None]
+    bbi: Mapped[float | None]
+    bias1: Mapped[float | None]
+    bias2: Mapped[float | None]
+    bias3: Mapped[float | None]
     cci: Mapped[float | None]
     vr: Mapped[float | None]
     wr: Mapped[float | None]
     wr1: Mapped[float | None]
-    bias1: Mapped[float | None]
-    bias2: Mapped[float | None]
-    bias3: Mapped[float | None]
     obv: Mapped[float | None]
     mfi: Mapped[float | None]
     roc: Mapped[float | None]
     mtm: Mapped[float | None]
-    return_1d: Mapped[float | None]
-    return_3d: Mapped[float | None]
-    return_5d: Mapped[float | None]
-    return_10d: Mapped[float | None]
-    return_20d: Mapped[float | None]
-    amplitude_1d: Mapped[float | None]
+    mtmma: Mapped[float | None]
+    asi: Mapped[float | None]
+    asit: Mapped[float | None]
+    brar_ar: Mapped[float | None]
+    brar_br: Mapped[float | None]
+    cr: Mapped[float | None]
+    dfma_dif: Mapped[float | None]
+    dfma_difma: Mapped[float | None]
+    dmi_adx: Mapped[float | None]
+    dmi_adxr: Mapped[float | None]
+    dmi_mdi: Mapped[float | None]
+    dmi_pdi: Mapped[float | None]
+    dpo: Mapped[float | None]
+    madpo: Mapped[float | None]
+    emv: Mapped[float | None]
+    maemv: Mapped[float | None]
+    expma12: Mapped[float | None]
+    expma50: Mapped[float | None]
+    keltner_lower: Mapped[float | None]
+    keltner_mid: Mapped[float | None]
+    keltner_upper: Mapped[float | None]
+    mass: Mapped[float | None]
+    ma_mass: Mapped[float | None]
+    maroc: Mapped[float | None]
+    psy: Mapped[float | None]
+    psyma: Mapped[float | None]
+    taq_lower: Mapped[float | None]
+    taq_mid: Mapped[float | None]
+    taq_upper: Mapped[float | None]
+    trix: Mapped[float | None]
+    trma: Mapped[float | None]
+    xsii_td1: Mapped[float | None]
+    xsii_td2: Mapped[float | None]
+    xsii_td3: Mapped[float | None]
+    xsii_td4: Mapped[float | None]
+    updays: Mapped[int | None]
+    downdays: Mapped[int | None]
+    topdays: Mapped[int | None]
+    lowdays: Mapped[int | None]
+
+    return_1d_pct: Mapped[float | None]
+    return_3d_pct: Mapped[float | None]
+    return_5d_pct: Mapped[float | None]
+    return_10d_pct: Mapped[float | None]
+    return_20d_pct: Mapped[float | None]
+    return_60d_pct: Mapped[float | None]
+    return_120d_pct: Mapped[float | None]
+    return_250d_pct: Mapped[float | None]
+    amplitude_1d_pct: Mapped[float | None]
+    open_gap_pct: Mapped[float | None]
+    close_position_ratio: Mapped[float | None]
     volume_ratio_5d: Mapped[float | None]
+    volume_ratio_10d: Mapped[float | None]
+    volume_ratio_20d: Mapped[float | None]
     amount_ratio_5d: Mapped[float | None]
+    amount_ratio_10d: Mapped[float | None]
+    amount_ratio_20d: Mapped[float | None]
+    average_amount_5d_yuan: Mapped[float | None]
+    average_amount_20d_yuan: Mapped[float | None]
+    average_amount_60d_yuan: Mapped[float | None]
+    volatility_5d: Mapped[float | None]
+    volatility_10d: Mapped[float | None]
     volatility_20d: Mapped[float | None]
-    close_position_1d: Mapped[float | None]
+    volatility_60d: Mapped[float | None]
     high_20d: Mapped[float | None]
     low_20d: Mapped[float | None]
     high_60d: Mapped[float | None]
     low_60d: Mapped[float | None]
-    drawdown_20d: Mapped[float | None]
-    drawdown_60d: Mapped[float | None]
-    turnover_rate: Mapped[float | None]
-    circ_mv: Mapped[float | None]
-    total_mv: Mapped[float | None]
-    main_net_inflow: Mapped[float | None]
+    high_120d: Mapped[float | None]
+    low_120d: Mapped[float | None]
+    high_250d: Mapped[float | None]
+    low_250d: Mapped[float | None]
+    distance_high_20d_ratio: Mapped[float | None]
+    distance_low_20d_ratio: Mapped[float | None]
+    distance_high_60d_ratio: Mapped[float | None]
+    distance_low_60d_ratio: Mapped[float | None]
+    drawdown_20d_pct: Mapped[float | None]
+    drawdown_60d_pct: Mapped[float | None]
+    drawdown_120d_pct: Mapped[float | None]
+    drawdown_250d_pct: Mapped[float | None]
+    relative_csi300_5d_pct: Mapped[float | None]
+    relative_csi300_20d_pct: Mapped[float | None]
+    relative_csi300_60d_pct: Mapped[float | None]
+    return_percentile_1d: Mapped[float | None]
+    return_percentile_5d: Mapped[float | None]
+    return_percentile_20d: Mapped[float | None]
+    amount_percentile: Mapped[float | None]
+    turnover_percentile: Mapped[float | None]
+    main_net_inflow_percentile: Mapped[float | None]
+
+    turnover_rate_pct: Mapped[float | None]
+    turnover_rate_free_pct: Mapped[float | None]
+    pe: Mapped[float | None]
+    pe_ttm: Mapped[float | None]
+    pb: Mapped[float | None]
+    ps_ttm: Mapped[float | None]
+    dividend_yield_pct: Mapped[float | None]
+    total_share_shares: Mapped[float | None]
+    float_share_shares: Mapped[float | None]
+    free_share_shares: Mapped[float | None]
+    total_market_value_yuan: Mapped[float | None]
+    circulating_market_value_yuan: Mapped[float | None]
+    main_net_inflow_yuan: Mapped[float | None]
     provider_main_net_ratio: Mapped[float | None]
     main_net_amount_ratio: Mapped[float | None]
-    big_order_net_inflow: Mapped[float | None]
+    big_order_net_inflow_yuan: Mapped[float | None]
     big_order_net_amount_ratio: Mapped[float | None]
-    super_large_net_inflow: Mapped[float | None]
+    super_large_net_inflow_yuan: Mapped[float | None]
     super_large_net_amount_ratio: Mapped[float | None]
-    main_net_inflow_3d: Mapped[float | None]
-    main_net_inflow_5d: Mapped[float | None]
-    main_net_inflow_10d: Mapped[float | None]
+    main_net_inflow_3d_yuan: Mapped[float | None]
+    main_net_inflow_5d_yuan: Mapped[float | None]
+    main_net_inflow_10d_yuan: Mapped[float | None]
+    main_net_inflow_20d_yuan: Mapped[float | None]
     continuous_main_inflow_days: Mapped[int | None]
-    fund_strength_percentile: Mapped[float | None]
-    history_days: Mapped[int] = mapped_column(nullable=False, default=0)
+
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_at = created_at_column()
     updated_at = updated_at_column()
-
-
-class StockFactorDailyActive(Base):
-    """Read-only ORM projection for the currently activated factor set."""
-
-    __tablename__ = "v_stock_factor_daily_active_basis"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False)
-    ma5: Mapped[float | None]
-    ma10: Mapped[float | None]
-    ma20: Mapped[float | None]
-    ma30: Mapped[float | None]
-    ma60: Mapped[float | None]
-    return_1d: Mapped[float | None]
-    amplitude: Mapped[float | None]
-    volume_ratio: Mapped[float | None]
-    amount_ratio: Mapped[float | None]
-    volatility_20d: Mapped[float | None]
-    close_position: Mapped[float | None]
-    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    factor_set_version: Mapped[str] = mapped_column(String(80), nullable=False)
-    price_basis: Mapped[str] = mapped_column(String(20), nullable=False)
-    factor_status: Mapped[str] = mapped_column(String(24), nullable=False)
-    source_map: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    missing_factors: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    basis_open_price: Mapped[float | None]
-    basis_high_price: Mapped[float | None]
-    basis_low_price: Mapped[float | None]
-    basis_close_price: Mapped[float | None]
-    basis_pre_close_price: Mapped[float | None]
-
 
 class StockFactorMinute(Base):
     __tablename__ = "t_stock_factor_minute"
@@ -625,28 +615,15 @@ class StockFactorMinute(Base):
     bar_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False, default="system")
     vwap: Mapped[float | None]
-    minute_return: Mapped[float | None]
-    volume_spike_ratio: Mapped[float | None]
-    intraday_strength: Mapped[float | None]
-    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    return_1m_pct: Mapped[float | None]
+    return_5m_pct: Mapped[float | None]
+    return_15m_pct: Mapped[float | None]
+    ma5: Mapped[float | None]
+    ma10: Mapped[float | None]
+    ma20: Mapped[float | None]
+    volume_ratio_20m: Mapped[float | None]
+    intraday_position_ratio: Mapped[float | None]
     created_at = created_at_column()
-
-
-class TechnicalIndicatorSnapshot(Base):
-    __tablename__ = "t_technical_indicator_snapshot"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    snapshot_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False, default="system")
-    last_price: Mapped[float | None]
-    change_pct: Mapped[float | None]
-    intraday_strength: Mapped[float | None]
-    volume_score: Mapped[float | None]
-    trend_score: Mapped[float | None]
-    factor_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-
 
 class StockDailyBasic(Base):
     __tablename__ = "t_stock_daily_basic"
@@ -656,88 +633,23 @@ class StockDailyBasic(Base):
     stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
-    close_price: Mapped[float | None]
-    turnover_rate: Mapped[float | None]
-    turnover_rate_f: Mapped[float | None]
-    volume_ratio: Mapped[float | None]
+    turnover_rate_pct: Mapped[float | None]
+    turnover_rate_free_pct: Mapped[float | None]
+    provider_volume_ratio: Mapped[float | None]
     pe: Mapped[float | None]
     pe_ttm: Mapped[float | None]
     pb: Mapped[float | None]
     ps: Mapped[float | None]
     ps_ttm: Mapped[float | None]
-    dv_ratio: Mapped[float | None]
-    dv_ttm: Mapped[float | None]
-    total_share: Mapped[float | None]
-    float_share: Mapped[float | None]
-    free_share: Mapped[float | None]
-    total_mv: Mapped[float | None]
-    circ_mv: Mapped[float | None]
-    limit_status: Mapped[int | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    dividend_yield_pct: Mapped[float | None]
+    dividend_yield_ttm_pct: Mapped[float | None]
+    total_share_shares: Mapped[float | None]
+    float_share_shares: Mapped[float | None]
+    free_share_shares: Mapped[float | None]
+    total_market_value_yuan: Mapped[float | None]
+    circulating_market_value_yuan: Mapped[float | None]
     created_at = created_at_column()
     updated_at = updated_at_column()
-
-
-class StockTechnicalFactorDaily(Base):
-    __tablename__ = "t_stock_technical_factor_daily"
-    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_t_stock_technical_factor_daily_business"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False)
-    factors: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-    updated_at = updated_at_column()
-
-
-class StockChipPerfDaily(Base):
-    __tablename__ = "t_stock_chip_perf_daily"
-    __table_args__ = (UniqueConstraint("stock_code", "trade_date", name="uq_t_stock_chip_perf_daily_business"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False)
-    his_low: Mapped[float | None]
-    his_high: Mapped[float | None]
-    cost_5pct: Mapped[float | None]
-    cost_15pct: Mapped[float | None]
-    cost_50pct: Mapped[float | None]
-    cost_85pct: Mapped[float | None]
-    cost_95pct: Mapped[float | None]
-    weight_avg: Mapped[float | None]
-    winner_rate: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-    updated_at = updated_at_column()
-
-
-class MarketDailyStat(Base):
-    __tablename__ = "t_market_daily_stat"
-    __table_args__ = (UniqueConstraint("trade_date", "ts_code", "exchange", name="uq_t_market_daily_stat_business"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    ts_code: Mapped[str] = mapped_column(String(40), nullable=False)
-    ts_name: Mapped[str | None] = mapped_column(String(120))
-    exchange: Mapped[str] = mapped_column(String(20), nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False)
-    company_count: Mapped[int | None]
-    total_share: Mapped[float | None]
-    float_share: Mapped[float | None]
-    total_mv: Mapped[float | None]
-    float_mv: Mapped[float | None]
-    amount: Mapped[float | None]
-    volume: Mapped[float | None]
-    transaction_count: Mapped[float | None]
-    pe: Mapped[float | None]
-    turnover_rate: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-    updated_at = updated_at_column()
-
 
 class IndexDailyBasic(Base):
     __tablename__ = "t_index_daily_basic"
@@ -747,20 +659,18 @@ class IndexDailyBasic(Base):
     index_code: Mapped[str] = mapped_column(String(20), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
-    total_mv: Mapped[float | None]
-    float_mv: Mapped[float | None]
-    total_share: Mapped[float | None]
-    float_share: Mapped[float | None]
-    free_share: Mapped[float | None]
-    turnover_rate: Mapped[float | None]
-    turnover_rate_f: Mapped[float | None]
+    total_market_value_yuan: Mapped[float | None]
+    float_market_value_yuan: Mapped[float | None]
+    total_share_shares: Mapped[float | None]
+    float_share_shares: Mapped[float | None]
+    free_share_shares: Mapped[float | None]
+    turnover_rate_pct: Mapped[float | None]
+    turnover_rate_free_pct: Mapped[float | None]
     pe: Mapped[float | None]
     pe_ttm: Mapped[float | None]
     pb: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
     updated_at = updated_at_column()
-
 
 class StockAdjustFactor(Base):
     __tablename__ = "t_stock_adjust_factor"
@@ -771,7 +681,6 @@ class StockAdjustFactor(Base):
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
     adj_factor: Mapped[float] = mapped_column(nullable=False)
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at = created_at_column()
 
 
@@ -830,15 +739,13 @@ class MarginSummaryDaily(Base):
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     exchange: Mapped[str] = mapped_column(String(20), nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
-    rzye: Mapped[float | None]
-    rz_mre: Mapped[float | None]
-    rzche: Mapped[float | None]
-    rqye: Mapped[float | None]
-    rq_mcl: Mapped[float | None]
-    rzrqye: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    financing_balance_yuan: Mapped[float | None]
+    financing_buy_yuan: Mapped[float | None]
+    financing_repay_yuan: Mapped[float | None]
+    securities_lending_balance_yuan: Mapped[float | None]
+    securities_lending_sell_shares: Mapped[float | None]
+    margin_total_balance_yuan: Mapped[float | None]
     created_at = created_at_column()
-
 
 class MarginDetailDaily(Base):
     __tablename__ = "t_margin_detail_daily"
@@ -878,25 +785,6 @@ class LimitEventDaily(Base):
     created_at = created_at_column()
 
 
-class StockNorthHoldDaily(Base):
-    __tablename__ = "t_stock_north_hold_daily"
-    __table_args__ = (UniqueConstraint("stock_code", "trade_date", "exchange", name="uq_t_stock_north_hold_daily_business"),)
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
-    stock_name: Mapped[str | None] = mapped_column(String(120))
-    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    exchange: Mapped[str] = mapped_column(String(20), nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False)
-    hold_volume: Mapped[float | None]
-    hold_ratio: Mapped[float | None]
-    hold_market_value: Mapped[float | None]
-    hold_volume_change: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
-    created_at = created_at_column()
-    updated_at = updated_at_column()
-
-
 class MarketNorthFlowDaily(Base):
     """Canonical daily Stock Connect aggregate flow from Tushare moneyflow_hsgt."""
 
@@ -906,16 +794,14 @@ class MarketNorthFlowDaily(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[str] = mapped_column(String(80), nullable=False)
-    hgt: Mapped[float | None]
-    sgt: Mapped[float | None]
-    north_money: Mapped[float | None]
-    ggt_ss: Mapped[float | None]
-    ggt_sz: Mapped[float | None]
-    south_money: Mapped[float | None]
-    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    hgt_yuan: Mapped[float | None]
+    sgt_yuan: Mapped[float | None]
+    north_money_yuan: Mapped[float | None]
+    ggt_ss_yuan: Mapped[float | None]
+    ggt_sz_yuan: Mapped[float | None]
+    south_money_yuan: Mapped[float | None]
     created_at = created_at_column()
     updated_at = updated_at_column()
-
 
 class SectorFactorDaily(Base):
     __tablename__ = "t_sector_factor_daily"
@@ -926,20 +812,68 @@ class SectorFactorDaily(Base):
     sector_name: Mapped[str | None] = mapped_column(String(160))
     sector_type: Mapped[str] = mapped_column(String(40), nullable=False)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False)
-    source: Mapped[str] = mapped_column(String(80), nullable=False, default="system:daily_close")
+    source: Mapped[str] = mapped_column(String(80), nullable=False, default="system:sector_factor")
+    ma5: Mapped[float | None]
+    ma10: Mapped[float | None]
+    ma20: Mapped[float | None]
+    ma60: Mapped[float | None]
+    return_1d_pct: Mapped[float | None]
+    return_5d_pct: Mapped[float | None]
+    return_20d_pct: Mapped[float | None]
+    drawdown_20d_pct: Mapped[float | None]
     fund_strength: Mapped[float | None]
-    net_inflow_3d: Mapped[float | None]
-    net_inflow_5d: Mapped[float | None]
-    net_inflow_10d: Mapped[float | None]
+    main_net_inflow_yuan: Mapped[float | None]
+    main_net_inflow_3d_yuan: Mapped[float | None]
+    main_net_inflow_5d_yuan: Mapped[float | None]
+    main_net_inflow_10d_yuan: Mapped[float | None]
     continuous_inflow_days: Mapped[int | None]
+    fund_rank: Mapped[int | None]
+    component_count: Mapped[int | None]
+    component_coverage_ratio: Mapped[float | None]
     rising_stock_count: Mapped[int | None]
+    falling_stock_count: Mapped[int | None]
+    flat_stock_count: Mapped[int | None]
     limit_up_stock_count: Mapped[int | None]
+    limit_down_stock_count: Mapped[int | None]
+    limit_break_stock_count: Mapped[int | None]
+    one_word_limit_up_count: Mapped[int | None]
+    natural_limit_up_count: Mapped[int | None]
     average_change_pct: Mapped[float | None]
+    median_change_pct: Mapped[float | None]
+    above_ma20_ratio: Mapped[float | None]
+    above_ma60_ratio: Mapped[float | None]
+    new_high_20d_count: Mapped[int | None]
+    new_low_20d_count: Mapped[int | None]
+    new_high_60d_count: Mapped[int | None]
+    new_low_60d_count: Mapped[int | None]
     volatility_20d: Mapped[float | None]
-    tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    heat_score: Mapped[float | None]
+    heat_rank: Mapped[int | None]
+    persistence_score: Mapped[float | None]
+    leader_strength_score: Mapped[float | None]
+    calculation_revision: Mapped[str] = mapped_column(String(80), nullable=False, default="sector_daily_final_r1")
+    quality_flags: Mapped[list[str]] = mapped_column(ARRAY(String()), nullable=False, default=list)
     created_at = created_at_column()
     updated_at = updated_at_column()
+
+class SectorLeaderDaily(Base):
+    __tablename__ = "t_sector_leader_daily"
+    __table_args__ = (
+        UniqueConstraint("sector_code", "trade_date", "leader_rank", name="uq_t_sector_leader_daily_business"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    sector_code: Mapped[str] = mapped_column(String(80), nullable=False)
+    trade_date: Mapped[date] = mapped_column(Date, nullable=False)
+    leader_rank: Mapped[int] = mapped_column(nullable=False)
+    stock_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    stock_name: Mapped[str | None] = mapped_column(String(120))
+    change_pct: Mapped[float | None]
+    amount_yuan: Mapped[float | None]
+    limit_board_count: Mapped[int | None]
+    leader_score: Mapped[float | None]
+    source: Mapped[str] = mapped_column(String(80), nullable=False, default="system:sector_factor")
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class IndexFactorDaily(Base):
@@ -955,17 +889,97 @@ class IndexFactorDaily(Base):
     ma20: Mapped[float | None]
     ma30: Mapped[float | None]
     ma60: Mapped[float | None]
-    return_1d: Mapped[float | None]
-    amplitude: Mapped[float | None]
-    volume_ratio: Mapped[float | None]
-    amount_ratio: Mapped[float | None]
+    ma120: Mapped[float | None]
+    ma250: Mapped[float | None]
+    ema5: Mapped[float | None]
+    ema10: Mapped[float | None]
+    ema20: Mapped[float | None]
+    ema30: Mapped[float | None]
+    ema60: Mapped[float | None]
+    return_1d_pct: Mapped[float | None]
+    return_5d_pct: Mapped[float | None]
+    return_10d_pct: Mapped[float | None]
+    return_20d_pct: Mapped[float | None]
+    return_60d_pct: Mapped[float | None]
+    amplitude_pct: Mapped[float | None]
+    volume_ratio_5d: Mapped[float | None]
+    amount_ratio_5d: Mapped[float | None]
     volatility_20d: Mapped[float | None]
-    turnover_rate: Mapped[float | None]
+    volatility_60d: Mapped[float | None]
+    high_20d: Mapped[float | None]
+    low_20d: Mapped[float | None]
+    high_60d: Mapped[float | None]
+    low_60d: Mapped[float | None]
+    drawdown_20d_pct: Mapped[float | None]
+    drawdown_60d_pct: Mapped[float | None]
+    trend_status: Mapped[str | None] = mapped_column(String(32))
+    turnover_rate_pct: Mapped[float | None]
     pe_ttm: Mapped[float | None]
     pb: Mapped[float | None]
-    features: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    calculation_revision: Mapped[str] = mapped_column(String(80), nullable=False, default="index_daily_final_r1")
+    quality_flags: Mapped[list[str]] = mapped_column(ARRAY(String()), nullable=False, default=list)
     created_at = created_at_column()
     updated_at = updated_at_column()
+
+class MarketSummaryDaily(Base):
+    __tablename__ = "t_market_summary_daily"
+
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    eligible_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    daily_bar_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    daily_basic_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    fund_flow_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    factor_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    up_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    down_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    flat_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    average_change_pct: Mapped[float | None]
+    median_change_pct: Mapped[float | None]
+    up_1pct_count: Mapped[int | None]
+    down_1pct_count: Mapped[int | None]
+    up_3pct_count: Mapped[int | None]
+    down_3pct_count: Mapped[int | None]
+    up_5pct_count: Mapped[int | None]
+    down_5pct_count: Mapped[int | None]
+    up_7pct_count: Mapped[int | None]
+    down_7pct_count: Mapped[int | None]
+    total_amount_yuan: Mapped[float | None]
+    amount_ratio_5d: Mapped[float | None]
+    amount_ratio_20d: Mapped[float | None]
+    average_turnover_pct: Mapped[float | None]
+    median_turnover_pct: Mapped[float | None]
+    average_volatility_20d_pct: Mapped[float | None]
+    main_net_inflow_yuan: Mapped[float | None]
+    main_net_inflow_ratio: Mapped[float | None]
+    above_ma5_ratio: Mapped[float | None]
+    above_ma20_ratio: Mapped[float | None]
+    above_ma60_ratio: Mapped[float | None]
+    above_ma250_ratio: Mapped[float | None]
+    new_high_20d_count: Mapped[int | None]
+    new_low_20d_count: Mapped[int | None]
+    new_high_60d_count: Mapped[int | None]
+    new_low_60d_count: Mapped[int | None]
+    new_high_250d_count: Mapped[int | None]
+    new_low_250d_count: Mapped[int | None]
+    limit_up_count: Mapped[int | None]
+    limit_down_count: Mapped[int | None]
+    limit_break_count: Mapped[int | None]
+    one_word_limit_up_count: Mapped[int | None]
+    natural_limit_up_count: Mapped[int | None]
+    highest_board_count: Mapped[int | None]
+    promotion_rate: Mapped[float | None]
+    core_index_ready_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    core_index_rising_count: Mapped[int | None]
+    core_index_average_return_1d_pct: Mapped[float | None]
+    core_index_average_amplitude_pct: Mapped[float | None]
+    north_flow_yuan: Mapped[float | None]
+    north_flow_disclosure_date: Mapped[date | None] = mapped_column(Date)
+    margin_balance_yuan: Mapped[float | None]
+    margin_disclosure_date: Mapped[date | None] = mapped_column(Date)
+    core_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quality_flags: Mapped[list[str]] = mapped_column(ARRAY(String()), nullable=False, default=list)
+    calculation_revision: Mapped[str] = mapped_column(String(80), nullable=False, default="market_summary_final_r1")
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class StockHolderCount(Base):

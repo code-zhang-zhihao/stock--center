@@ -1,37 +1,3 @@
-export interface MarketSentimentComponent {
-  label: string;
-  weight: number;
-  raw_value: number | null;
-  score: number | null;
-  available: boolean;
-  formula: string;
-}
-
-export interface MarketDailySentiment {
-  available: boolean;
-  reason?: string | null;
-  trade_date: string | null;
-  universe_code: string | null;
-  calculation_version: string;
-  status?: 'pending' | 'ready' | string | null;
-  sentiment_score?: number | null;
-  stage_code?: string | null;
-  stage_label?: string | null;
-  components?: Record<string, MarketSentimentComponent>;
-  metrics?: Record<string, number | null>;
-  coverage?: {
-    active_stock_count?: number;
-    daily_bar_count?: number;
-    daily_bar_coverage_pct?: number | null;
-    minimum_daily_bar_coverage_pct?: number;
-    limit_event_complete?: boolean;
-    completion_capabilities?: string[];
-    unavailable_reasons?: string[];
-  };
-  source_facts?: Record<string, string>;
-  calculated_at?: string | null;
-}
-
 export interface MarketSectorHeat {
   trade_date: string;
   sector_code: string;
@@ -41,7 +7,7 @@ export interface MarketSectorHeat {
   heat_score: number | null;
   heat_rank: number | null;
   metrics: Record<string, number | null>;
-  components: Record<string, MarketSentimentComponent>;
+  components: Record<string, MarketEmotionMetric>;
   leaders: Array<{
     stock_code: string;
     stock_name: string;
@@ -80,7 +46,7 @@ export interface MarketDailyReview {
   reason?: string | null;
   trade_date: string | null;
   calculation_version: string;
-  sentiment: MarketDailySentiment;
+  emotion: MarketEmotionDaily;
   coverage?: {
     sector_heat_count: number;
     limit_up_evidence_count: number;

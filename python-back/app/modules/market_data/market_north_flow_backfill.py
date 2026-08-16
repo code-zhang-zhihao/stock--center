@@ -164,7 +164,7 @@ class MarketNorthFlowBackfillService:
                             "response_row_count": len(response.records),
                             "normalized_row_count": len(rows),
                             "normalized_table": "t_market_north_flow_daily",
-                            "schema_version": "canonical_v2",
+                            "schema_version": "canonical_final_r1",
                             "status": "captured" if rows else "complete_zero",
                         }
                     )
@@ -255,8 +255,8 @@ class MarketNorthFlowBackfillService:
             resolved_end = recent[0] if recent else None
         if resolved_end is None:
             return []
-        # Only request dates whose core daily bar already exists; a later V2
-        # baseline cannot score a date that has no canonical market facts.
+        # Only request dates whose core daily bar already exists; the formal
+        # emotion model cannot score a date that has no canonical market facts.
         recent_dates = await repository.recent_daily_trade_dates(
             up_to=resolved_end,
             limit=payload.trade_days,
@@ -281,20 +281,22 @@ def _map_records(records: list[dict[str, Any]], target_dates: set[date]) -> list
         mapped[trade_date] = {
             "trade_date": trade_date,
             "source": NORTH_FLOW_SOURCE,
-            "hgt": safe_float(record.get("hgt")),
-            "sgt": safe_float(record.get("sgt")),
-            "north_money": safe_float(record.get("north_money")),
-            "ggt_ss": safe_float(record.get("ggt_ss")),
-            "ggt_sz": safe_float(record.get("ggt_sz")),
-            "south_money": safe_float(record.get("south_money")),
-            "metadata_json": {
-                "provider": "tushare",
-                "api_name": "moneyflow_hsgt",
-                "value_unit": "provider_reported",
-                "raw": record,
-            },
+            # moneyflow_hsgt reports these values in CNY millions.  Persist
+            # only the final unit-explicit columns; request provenance and
+            # completion status live in t_provider_ingest_audit.
+            "hgt_yuan": _million_yuan(record.get("hgt")),
+            "sgt_yuan": _million_yuan(record.get("sgt")),
+            "north_money_yuan": _million_yuan(record.get("north_money")),
+            "ggt_ss_yuan": _million_yuan(record.get("ggt_ss")),
+            "ggt_sz_yuan": _million_yuan(record.get("ggt_sz")),
+            "south_money_yuan": _million_yuan(record.get("south_money")),
         }
     return [mapped[item] for item in sorted(mapped)]
+
+
+def _million_yuan(value: Any) -> float | None:
+    parsed = safe_float(value)
+    return parsed * 1_000_000 if parsed is not None else None
 
 
 def _chunked(values: list[date], size: int):

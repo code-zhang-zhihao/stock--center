@@ -17,9 +17,9 @@ class TushareMarketAdapter(ProviderAdapter):
         "ths_daily.amount": "thousand_yuan -> yuan",
     }
     sector_moneyflow_unit_conversions = {
-        "moneyflow_*_ths.net_buy_amount": "ten_thousand_yuan -> yuan",
-        "moneyflow_*_ths.net_sell_amount": "ten_thousand_yuan -> yuan",
-        "moneyflow_*_ths.net_amount": "ten_thousand_yuan -> yuan",
+        "moneyflow_*_ths.net_buy_amount": "hundred_million_yuan -> yuan",
+        "moneyflow_*_ths.net_sell_amount": "hundred_million_yuan -> yuan",
+        "moneyflow_*_ths.net_amount": "hundred_million_yuan -> yuan",
     }
     top_list_unit_conversions = {
         "top_list.amount": "ten_thousand_yuan -> yuan",
@@ -145,17 +145,16 @@ class TushareMarketAdapter(ProviderAdapter):
                     "index_code": index_code,
                     "trade_date": row_date,
                     "source": "tushare:index_dailybasic",
-                    "total_mv": safe_float(record.get("total_mv")),
-                    "float_mv": safe_float(record.get("float_mv")),
-                    "total_share": safe_float(record.get("total_share")),
-                    "float_share": safe_float(record.get("float_share")),
-                    "free_share": safe_float(record.get("free_share")),
-                    "turnover_rate": safe_float(record.get("turnover_rate")),
-                    "turnover_rate_f": safe_float(record.get("turnover_rate_f")),
+                    "total_market_value_yuan": safe_float(record.get("total_mv")),
+                    "float_market_value_yuan": safe_float(record.get("float_mv")),
+                    "total_share_shares": safe_float(record.get("total_share")),
+                    "float_share_shares": safe_float(record.get("float_share")),
+                    "free_share_shares": safe_float(record.get("free_share")),
+                    "turnover_rate_pct": safe_float(record.get("turnover_rate")),
+                    "turnover_rate_free_pct": safe_float(record.get("turnover_rate_f")),
                     "pe": safe_float(record.get("pe")),
                     "pe_ttm": safe_float(record.get("pe_ttm")),
                     "pb": safe_float(record.get("pb")),
-                    "metadata_json": self._metadata("index_dailybasic", record, self.raw_unit_conversions),
                 }
             )
         if len(records) != len(rows):
@@ -302,9 +301,9 @@ class TushareMarketAdapter(ProviderAdapter):
                     "sector_type": (sector or {}).get("sector_type") or sector_type,
                     "trade_date": row_date,
                     "source": f"tushare:{api_name}",
-                    "main_net_inflow": self._ten_thousand(record.get("net_amount")),
-                    "net_buy_amount": self._ten_thousand(record.get("net_buy_amount")),
-                    "net_sell_amount": self._ten_thousand(record.get("net_sell_amount")),
+                    "main_net_inflow_yuan": self._hundred_million(record.get("net_amount")),
+                    "net_buy_amount_yuan": self._hundred_million(record.get("net_buy_amount")),
+                    "net_sell_amount_yuan": self._hundred_million(record.get("net_sell_amount")),
                     "main_net_ratio": None,
                     "change_pct": safe_float(record.get("pct_change")),
                     "close_price": safe_float(record.get("close_price") or record.get("close")),
@@ -317,7 +316,7 @@ class TushareMarketAdapter(ProviderAdapter):
                         record,
                         self.sector_moneyflow_unit_conversions,
                         unit_normalized="yuan",
-                        source_unit="ten_thousand_yuan",
+                        source_unit="hundred_million_yuan",
                     ),
                 }
             )
@@ -431,3 +430,8 @@ class TushareMarketAdapter(ProviderAdapter):
     def _ten_thousand(value: Any) -> float | None:
         parsed = safe_float(value)
         return parsed * 10000 if parsed is not None else None
+
+    @staticmethod
+    def _hundred_million(value: Any) -> float | None:
+        parsed = safe_float(value)
+        return parsed * 100_000_000 if parsed is not None else None
