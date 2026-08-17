@@ -159,6 +159,29 @@ def test_final_stock_factor_sql_binds_date_parameters_for_asyncpg() -> None:
     assert "CAST(:start_date AS date) - INTERVAL '45 days'" in statement.text
 
 
+def test_final_sector_factor_sql_binds_trade_date_for_asyncpg() -> None:
+    class Result:
+        @staticmethod
+        def all():
+            return []
+
+    class Session:
+        calls = []
+
+        async def execute(self, statement, params=None):
+            self.calls.append((statement, params or {}))
+            return Result()
+
+    session = Session()
+    repository = IndicatorRepository(session)  # type: ignore[arg-type]
+
+    asyncio.run(repository.rebuild_sector_final_metrics(trade_date=date(2026, 8, 14)))
+
+    statement = session.calls[0][0]
+    assert isinstance(statement._bindparams["trade_date"].type, Date)
+    assert "CAST(:trade_date AS date) - INTERVAL '180 days'" in statement.text
+
+
 def test_partial_professional_upsert_preserves_existing_local_core_values() -> None:
     class Result:
         rowcount = 1

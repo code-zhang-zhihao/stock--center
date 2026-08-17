@@ -1449,9 +1449,8 @@ class IndicatorRepository:
 
     async def rebuild_sector_final_metrics(self, *, trade_date: date) -> int:
         """Fill typed trend/breadth/event fields after the base sector pass."""
-        result = await self.session.execute(
-            text(
-                """
+        statement = text(
+            """
                 WITH bar_series AS (
                     SELECT bar.*,
                         avg(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
@@ -1463,7 +1462,7 @@ class IndicatorRepository:
                         lag(close_price, 20) OVER (PARTITION BY sector_code ORDER BY trade_date) AS close20,
                         max(close_price) OVER (PARTITION BY sector_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS high20
                     FROM t_sector_bar bar
-                    WHERE trade_date BETWEEN (:trade_date - INTERVAL '180 days')::date AND :trade_date
+                    WHERE trade_date BETWEEN (CAST(:trade_date AS date) - INTERVAL '180 days') AND :trade_date
                 ),
                 current_bar AS (
                     SELECT * FROM bar_series WHERE trade_date = :trade_date
@@ -1582,8 +1581,10 @@ class IndicatorRepository:
                 WHERE factor.sector_code = ranked.sector_code
                   AND factor.trade_date = :trade_date
                 RETURNING factor.id
-                """
-            ),
+            """
+        ).bindparams(bindparam("trade_date", type_=Date()))
+        result = await self.session.execute(
+            statement,
             {"trade_date": trade_date},
         )
         return len(result.all())
