@@ -17,6 +17,7 @@ from app.modules.market_data.index_contract import CORE_INDEX_CANONICAL_CODES, C
 from app.modules.market_data.close_ingest import DailyMarketCloseIngestRequest, DailyMarketCloseIngestService
 from app.modules.market_data.models import DailyBar, MinuteBar, QuoteSnapshot, TickTrade
 from app.modules.market_data.repository import MAX_POSTGRES_QUERY_PARAMS, MarketDataRepository, _safe_batch_size
+from app.modules.market_data.scheduler_handlers import BackfillSectorDailyFactorsHandler
 from app.modules.market_data.stock_factor_contract import (
     STK_FACTOR_PRO_COUNT_COLUMNS,
     STK_FACTOR_PRO_QFQ_COLUMNS,
@@ -180,6 +181,83 @@ def test_final_sector_factor_sql_binds_trade_date_for_asyncpg() -> None:
     statement = session.calls[0][0]
     assert isinstance(statement._bindparams["trade_date"].type, Date)
     assert "CAST(:trade_date AS date) - INTERVAL '180 days'" in statement.text
+
+
+def test_sector_window_factor_sql_uses_one_bounded_member_aggregation() -> None:
+    class Result:
+        def mappings(self):
+            return self
+
+        @staticmethod
+        def all():
+            return []
+
+    class Session:
+        calls = []
+
+        async def execute(self, statement, params=None):
+            self.calls.append((statement, params or {}))
+            return Result()
+
+    session = Session()
+    repository = IndicatorRepository(session)  # type: ignore[arg-type]
+
+    asyncio.run(
+        repository.assemble_sector_daily_factors_final_between(
+            start_date=date(2026, 8, 3),
+            end_date=date(2026, 8, 14),
+            history_start=date(2026, 2, 1),
+        )
+    )
+
+    statement = session.calls[0][0]
+    assert isinstance(statement._bindparams["start_date"].type, Date)
+    assert isinstance(statement._bindparams["end_date"].type, Date)
+    assert isinstance(statement._bindparams["history_start"].type, Date)
+    assert "member_stats AS" in statement.text
+    assert "member_events AS" not in statement.text
+    assert "target.trade_date BETWEEN :start_date AND :end_date" in statement.text
+    assert "component.start_date" in statement.text
+    assert "count(*) FILTER (" in statement.text
+    assert "WHERE coalesce(flow.main_net_inflow_yuan, 0) > 0" in statement.text
+    assert "ON CONFLICT (sector_code, trade_date) DO UPDATE" in statement.text
+
+
+def test_sector_leader_window_is_limited_to_factor_backed_sectors_and_five_rows() -> None:
+    class Result:
+        rowcount = 0
+
+        def mappings(self):
+            return self
+
+        @staticmethod
+        def all():
+            return []
+
+    class Session:
+        calls = []
+
+        async def execute(self, statement, params=None):
+            self.calls.append((statement, params or {}))
+            return Result()
+
+    session = Session()
+    repository = IndicatorRepository(session)  # type: ignore[arg-type]
+
+    asyncio.run(
+        repository.rebuild_sector_leaders_between(
+            start_date=date(2026, 8, 3),
+            end_date=date(2026, 8, 14),
+        )
+    )
+
+    statement = session.calls[-1][0]
+    assert isinstance(statement._bindparams["start_date"].type, Date)
+    assert isinstance(statement._bindparams["end_date"].type, Date)
+    assert "target_factors AS" in statement.text
+    assert "factor.calculation_revision = 'sector_daily_final_r1'" in statement.text
+    assert "leader_rank <= 5" in statement.text
+    assert "component.start_date" in statement.text
 
 
 def test_partial_professional_upsert_preserves_existing_local_core_values() -> None:
@@ -386,6 +464,9 @@ def test_final_history_backfill_uses_configured_trade_date_windows(monkeypatch) 
         async def __aexit__(self, exc_type, exc, traceback):
             return None
 
+        async def execute(self, _statement, _params=None):
+            return None
+
         async def commit(self):
             return None
 
@@ -471,3 +552,93 @@ def test_final_history_backfill_uses_configured_trade_date_windows(monkeypatch) 
     assert result.failed_trade_dates == 0
     assert result.daily_factor_rows == 17
     assert result.market_summary_rows == 6
+
+
+def test_sector_history_backfill_uses_actual_bar_dates_and_window_transactions(monkeypatch) -> None:
+    trade_dates = [date(2026, 7, 1) + timedelta(days=index) for index in range(6)]
+    factor_calls: list[tuple[date, date, date]] = []
+    leader_calls: list[tuple[date, date]] = []
+    progress_rows: list[dict] = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def execute(self, _statement, _params=None):
+            return None
+
+        async def commit(self):
+            return None
+
+    class FakeSessionmaker:
+        def __call__(self):
+            return FakeSession()
+
+    class FakeRepository:
+        def __init__(self, _session):
+            pass
+
+        async def list_sector_factor_trade_dates_between(self, *, start_date, end_date):
+            return [item for item in trade_dates if start_date <= item <= end_date]
+
+        async def assemble_sector_daily_factors_final_between(
+            self,
+            *,
+            start_date,
+            end_date,
+            history_start,
+        ):
+            factor_calls.append((start_date, end_date, history_start))
+            return {
+                item: 10
+                for item in trade_dates
+                if start_date <= item <= end_date
+            }
+
+        async def rebuild_sector_leaders_between(self, *, start_date, end_date):
+            leader_calls.append((start_date, end_date))
+            return {
+                item: 50
+                for item in trade_dates
+                if start_date <= item <= end_date
+            }
+
+    async def report_progress(payload):
+        progress_rows.append(payload)
+
+    service = FactorBackfillService(FakeSessionmaker())
+    monkeypatch.setattr(backfill_module, "IndicatorRepository", FakeRepository)
+
+    result = asyncio.run(
+        service.backfill_sector(
+            FactorBackfillRequest(
+                start_date=trade_dates[0],
+                end_date=trade_dates[-1],
+                factor_window_trade_days=5,
+                calculation_workers=2,
+                only_missing=False,
+            ),
+            progress_reporter=report_progress,
+        )
+    )
+
+    assert sorted((start, end) for start, end, _ in factor_calls) == [
+        (trade_dates[0], trade_dates[4]),
+        (trade_dates[5], trade_dates[5]),
+    ]
+    assert all(history_start == start - timedelta(days=180) for start, _, history_start in factor_calls)
+    assert sorted(leader_calls) == [
+        (trade_dates[0], trade_dates[4]),
+        (trade_dates[5], trade_dates[5]),
+    ]
+    assert result.trade_date_count == 6
+    assert result.processed_trade_dates == 6
+    assert result.failed_trade_dates == 0
+    assert result.sector_factor_rows == 60
+    assert result.sector_leader_rows == 300
+    assert progress_rows[-1]["status"] == "complete"
+    assert "batch_size" not in BackfillSectorDailyFactorsHandler.parameter_schema
+    assert BackfillSectorDailyFactorsHandler.default_payload["factor_window_trade_days"] == 20

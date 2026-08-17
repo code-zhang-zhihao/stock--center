@@ -21,7 +21,6 @@ from pydantic import BaseModel, Field
 from app.db.session import get_sessionmaker
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.indicator_engine.repository import IndicatorRepository
-from app.modules.indicator_engine.service import IndicatorEngineService
 from app.modules.market_data.contracts import CanonicalMappingResult
 from app.modules.market_data.providers import MootdxProvider, normalize_symbol, parse_date, safe_float, safe_int
 from app.modules.market_data.partitioning import ensure_market_partitions
@@ -463,14 +462,17 @@ class DailyMarketCloseIngestService:
 
         if payload.calculate_sector_factors:
             sector_factor_started = perf_counter()
-            indicator = IndicatorEngineService(indicator_repository)
-            result.sector_factor_rows = await indicator.calculate_sector_factors(trade_date=trade_date)
-            result.sector_factor_rows = await indicator_repository.rebuild_sector_final_metrics(
-                trade_date=trade_date
+            factor_counts = await indicator_repository.assemble_sector_daily_factors_final_between(
+                start_date=trade_date,
+                end_date=trade_date,
+                history_start=trade_date.fromordinal(trade_date.toordinal() - 180),
             )
-            result.sector_leader_rows = await indicator_repository.rebuild_sector_leaders(
-                trade_date=trade_date
+            leader_counts = await indicator_repository.rebuild_sector_leaders_between(
+                start_date=trade_date,
+                end_date=trade_date,
             )
+            result.sector_factor_rows = factor_counts.get(trade_date, 0)
+            result.sector_leader_rows = leader_counts.get(trade_date, 0)
             await self.repository.commit()
             result.stage_timings["sector_factors"] = int(
                 (perf_counter() - sector_factor_started) * 1000

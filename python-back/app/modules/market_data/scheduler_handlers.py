@@ -807,23 +807,43 @@ class BackfillSectorDailyFactorsHandler:
     job_code = "backfill_sector_daily_factors"
     job_type = "market_data"
     parameter_schema = {
-        **_FACTOR_BACKFILL_COMMON_SCHEMA,
+        **{
+            key: value
+            for key, value in _FACTOR_BACKFILL_COMMON_SCHEMA.items()
+            if key not in {"batch_size", "only_missing"}
+        },
+        "only_missing": {
+            "label": "只补缺失日期（兼容）",
+            "type": "boolean",
+            "default": False,
+            "required": False,
+            "description": "保留用于兼容旧运行记录；板块窗口会幂等刷新目标日期，以补齐部分字段并重建受限龙头。",
+        },
+        "factor_window_trade_days": {
+            "label": "回填时间窗口（交易日）",
+            "type": "number",
+            "default": 20,
+            "required": False,
+            "min": 5,
+            "max": 60,
+            "description": "每个窗口一次性组装板块趋势、资金、成分广度、事件和龙头；默认 20。",
+        },
         "calculation_workers": {
-            "label": "计算 worker 数",
+            "label": "窗口计算 worker 数",
             "type": "number",
             "default": 2,
             "required": False,
             "min": 1,
             "max": 4,
-            "description": "按交易日并行计算板块因子；默认 2，避免同时放大成分股聚合查询。",
+            "description": "并行处理互不重叠的日期窗口；运行时最高使用 2，避免大表聚合互相争用。",
         },
     }
     default_payload = {
         "start_date": "2024-01-01",
         "end_date": None,
         "ingest_mode": "append_safe",
-        "only_missing": True,
-        "batch_size": 200,
+        "only_missing": False,
+        "factor_window_trade_days": 20,
         "calculation_workers": 2,
         "fail_fast": False,
     }
@@ -832,7 +852,7 @@ class BackfillSectorDailyFactorsHandler:
     async def run(self, context: JobExecutionContext) -> JobResult:
         payload = FactorBackfillRequest(**{**self.default_payload, **context.payload})
         service = FactorBackfillService(get_sessionmaker())
-        result = await service.backfill_sector(payload)
+        result = await service.backfill_sector(payload, progress_reporter=context.report_progress)
         return JobResult(
             status="success" if result.failed_trade_dates == 0 else "success",
             affected_rows=result.sector_factor_rows,

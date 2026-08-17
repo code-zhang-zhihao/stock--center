@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.modules.indicator_engine.repository import IndicatorRepository
-from app.modules.indicator_engine.service import IndicatorEngineService
 from app.modules.market_data.repository import MarketDataRepository
 
 
@@ -303,9 +304,18 @@ class FactorBackfillService:
         )
         return result
 
-    async def backfill_sector(self, payload: FactorBackfillRequest) -> FactorBackfillResult:
+    async def backfill_sector(
+        self,
+        payload: FactorBackfillRequest,
+        *,
+        progress_reporter: Callable[[dict], Awaitable[None]] | None = None,
+    ) -> FactorBackfillResult:
         end_date = payload.end_date or await self._resolve_latest_trade_date()
-        trade_dates = await self._resolve_trade_dates(payload.start_date, end_date)
+        async with self.sessionmaker() as session:
+            trade_dates = await IndicatorRepository(session).list_sector_factor_trade_dates_between(
+                start_date=payload.start_date,
+                end_date=end_date,
+            )
         result = FactorBackfillResult(
             factor_kind="sector",
             pool_code=None,
@@ -313,80 +323,173 @@ class FactorBackfillService:
             end_date=end_date,
             trade_date_count=len(trade_dates),
             ingest_mode=payload.ingest_mode,
+            factor_window_trade_days=payload.factor_window_trade_days,
         )
+        if not trade_dates:
+            result.warnings.append("目标区间没有 canonical 板块日线，未执行板块因子计算。")
+            return result
+        windows = [
+            trade_dates[offset : offset + payload.factor_window_trade_days]
+            for offset in range(0, len(trade_dates), payload.factor_window_trade_days)
+        ]
+        effective_workers = min(payload.calculation_workers, 2, len(windows))
         logger.info(
-            "factor sector backfill started: start_date=%s end_date=%s trade_dates=%s ingest_mode=%s only_missing=%s workers=%s",
+            "factor sector backfill started: start_date=%s end_date=%s trade_dates=%s windows=%s "
+            "window_trade_days=%s ingest_mode=%s only_missing=%s requested_workers=%s effective_workers=%s",
             payload.start_date,
             end_date,
             len(trade_dates),
+            len(windows),
+            payload.factor_window_trade_days,
             payload.ingest_mode,
             payload.only_missing,
             payload.calculation_workers,
+            effective_workers,
         )
-        queue: asyncio.Queue[date] = asyncio.Queue()
-        for trade_date in trade_dates:
-            queue.put_nowait(trade_date)
+        if progress_reporter is not None:
+            await progress_reporter(
+                {
+                    "phase": "sector_windows",
+                    "status": "running",
+                    "trade_date_count": len(trade_dates),
+                    "window_count": len(windows),
+                    "completed_windows": 0,
+                    "processed_trade_dates": 0,
+                    "failed_trade_dates": 0,
+                    "sector_factor_rows": 0,
+                    "sector_leader_rows": 0,
+                }
+            )
+
+        queue: asyncio.Queue[tuple[int, list[date]]] = asyncio.Queue()
+        for window_index, window_dates in enumerate(windows, start=1):
+            queue.put_nowait((window_index, window_dates))
         lock = asyncio.Lock()
+        completed_windows = 0
 
         async def worker(worker_id: int) -> None:
-            async with self.sessionmaker() as session:
-                indicator_repository = IndicatorRepository(session)
-                indicator = IndicatorEngineService(indicator_repository)
-                while True:
-                    try:
-                        trade_date = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    try:
+            nonlocal completed_windows
+            while True:
+                try:
+                    window_index, window_dates = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                window_start, window_end = window_dates[0], window_dates[-1]
+                started = perf_counter()
+                try:
+                    async with self.sessionmaker() as session:
+                        await session.execute(text("SET LOCAL statement_timeout = '15min'"))
+                        repository = IndicatorRepository(session)
                         deleted = 0
                         if payload.ingest_mode == "rebuild":
-                            deleted = await indicator_repository.clear_sector_factor_rows(trade_date=trade_date)
-                            await session.commit()
-                            async with lock:
-                                result.rebuild_deleted_rows += deleted
-                        await indicator.calculate_sector_factors(trade_date=trade_date)
-                        rows = await indicator_repository.rebuild_sector_final_metrics(trade_date=trade_date)
-                        leader_rows = await indicator_repository.rebuild_sector_leaders(trade_date=trade_date)
+                            deleted = await repository.clear_sector_factor_rows_between(
+                                start_date=window_start,
+                                end_date=window_end,
+                            )
+                        factor_counts = await repository.assemble_sector_daily_factors_final_between(
+                            start_date=window_start,
+                            end_date=window_end,
+                            history_start=window_start - timedelta(days=180),
+                        )
+                        leader_counts = await repository.rebuild_sector_leaders_between(
+                            start_date=window_start,
+                            end_date=window_end,
+                        )
                         await session.commit()
-                        async with lock:
-                            result.processed_trade_dates += 1
-                            result.sector_factor_rows += rows
-                            result.sector_leader_rows += leader_rows
+
+                    elapsed_ms = int((perf_counter() - started) * 1000)
+                    factor_rows = sum(factor_counts.values())
+                    leader_rows = sum(leader_counts.values())
+                    async with lock:
+                        completed_windows += 1
+                        result.rebuild_deleted_rows += deleted
+                        result.processed_trade_dates += len(window_dates)
+                        result.sector_factor_rows += factor_rows
+                        result.sector_leader_rows += leader_rows
+                        for trade_date in window_dates:
                             result.date_summaries.append(
                                 {
                                     "trade_date": trade_date.isoformat(),
                                     "status": "success",
-                                    "sector_factor_rows": rows,
-                                    "sector_leader_rows": leader_rows,
+                                    "sector_factor_rows": factor_counts.get(trade_date, 0),
+                                    "sector_leader_rows": leader_counts.get(trade_date, 0),
+                                    "window": window_index,
                                     "worker": worker_id,
                                 }
                             )
-                        logger.info(
-                            "factor sector backfill date completed: worker=%s trade_date=%s rows=%s leaders=%s",
-                            worker_id,
-                            trade_date,
-                            rows,
-                            leader_rows,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        await session.rollback()
-                        async with lock:
-                            result.failed_trade_dates += 1
+                        progress = {
+                            "phase": "sector_windows",
+                            "status": "running" if completed_windows < len(windows) else "complete",
+                            "window_index": window_index,
+                            "window_count": len(windows),
+                            "completed_windows": completed_windows,
+                            "window_start": window_start.isoformat(),
+                            "window_end": window_end.isoformat(),
+                            "window_elapsed_ms": elapsed_ms,
+                            "processed_trade_dates": result.processed_trade_dates,
+                            "failed_trade_dates": result.failed_trade_dates,
+                            "sector_factor_rows": result.sector_factor_rows,
+                            "sector_leader_rows": result.sector_leader_rows,
+                        }
+                        if progress_reporter is not None:
+                            await progress_reporter(progress)
+                    logger.info(
+                        "factor sector backfill window completed: worker=%s window=%s/%s "
+                        "start_date=%s end_date=%s dates=%s factors=%s leaders=%s elapsed_ms=%s",
+                        worker_id,
+                        window_index,
+                        len(windows),
+                        window_start,
+                        window_end,
+                        len(window_dates),
+                        factor_rows,
+                        leader_rows,
+                        elapsed_ms,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    async with lock:
+                        completed_windows += 1
+                        result.failed_trade_dates += len(window_dates)
+                        for trade_date in window_dates:
                             if len(result.errors) < 30:
                                 result.errors.append(
                                     {"trade_date": trade_date.isoformat(), "error": f"{type(exc).__name__}: {exc}"}
                                 )
-                        logger.exception("factor sector backfill date failed: worker=%s trade_date=%s", worker_id, trade_date)
-                        if payload.fail_fast:
-                            raise
-                    finally:
-                        queue.task_done()
+                        if progress_reporter is not None:
+                            await progress_reporter(
+                                {
+                                    "phase": "sector_windows",
+                                    "status": "failed_window",
+                                    "window_index": window_index,
+                                    "window_count": len(windows),
+                                    "completed_windows": completed_windows,
+                                    "window_start": window_start.isoformat(),
+                                    "window_end": window_end.isoformat(),
+                                    "processed_trade_dates": result.processed_trade_dates,
+                                    "failed_trade_dates": result.failed_trade_dates,
+                                    "sector_factor_rows": result.sector_factor_rows,
+                                    "sector_leader_rows": result.sector_leader_rows,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+                    logger.exception(
+                        "factor sector backfill window failed: worker=%s window=%s/%s start_date=%s end_date=%s",
+                        worker_id,
+                        window_index,
+                        len(windows),
+                        window_start,
+                        window_end,
+                    )
+                    if payload.fail_fast:
+                        raise
+                finally:
+                    queue.task_done()
 
         workers = [
             asyncio.create_task(worker(index + 1))
-            for index in range(min(payload.calculation_workers, len(trade_dates)))
+            for index in range(effective_workers)
         ]
         await asyncio.gather(*workers)
         result.date_summaries.sort(key=lambda item: item["trade_date"])
@@ -501,8 +604,6 @@ class FactorBackfillService:
     def _append_warnings(result: FactorBackfillResult) -> None:
         if result.missing_daily_data:
             result.warnings.append(f"缺少日线数据导致无法计算日频因子的股票数累计: {result.missing_daily_data}")
-        if result.missing_snapshot_daily_data:
-            result.warnings.append(f"缺少日线数据导致无法生成技术快照的股票数累计: {result.missing_snapshot_daily_data}")
         if result.missing_stock_fund_flow:
             result.warnings.append(f"缺少资金流导致资金因子不完整的股票数累计: {result.missing_stock_fund_flow}")
         if result.missing_stock_technical_factor:

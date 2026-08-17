@@ -1234,6 +1234,35 @@ class IndicatorRepository:
         result = await self.session.execute(delete(SectorFactorDaily).where(SectorFactorDaily.trade_date == trade_date))
         return int(result.rowcount or 0)
 
+    async def list_sector_factor_trade_dates_between(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> list[date]:
+        """Return dates backed by canonical THS sector bars, not calendar-only dates."""
+        rows = await self.session.execute(
+            select(SectorBar.trade_date)
+            .join(SectorBasic, SectorBasic.sector_code == SectorBar.sector_code)
+            .where(
+                SectorBar.trade_date.between(start_date, end_date),
+                SectorBasic.source.like("tushare:%"),
+                SectorBasic.sector_code.like("ths_%"),
+            )
+            .distinct()
+            .order_by(SectorBar.trade_date)
+        )
+        return list(rows.scalars().all())
+
+    async def clear_sector_factor_rows_between(self, *, start_date: date, end_date: date) -> int:
+        leader_result = await self.session.execute(
+            delete(SectorLeaderDaily).where(SectorLeaderDaily.trade_date.between(start_date, end_date))
+        )
+        factor_result = await self.session.execute(
+            delete(SectorFactorDaily).where(SectorFactorDaily.trade_date.between(start_date, end_date))
+        )
+        return int(leader_result.rowcount or 0) + int(factor_result.rowcount or 0)
+
     async def clear_index_factor_rows_between(
         self,
         index_codes: list[str],
@@ -1447,6 +1476,371 @@ class IndicatorRepository:
             )
         return len(rows)
 
+    async def assemble_sector_daily_factors_final_between(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+        history_start: date,
+    ) -> dict[date, int]:
+        """Assemble a bounded window of typed sector factors in one PostgreSQL pass."""
+        statement = text(
+            """
+            WITH eligible_sectors AS (
+                SELECT sector_code, sector_name, sector_type
+                FROM t_sector_basic
+                WHERE source LIKE 'tushare:%'
+                  AND sector_code LIKE 'ths_%'
+            ),
+            target_keys AS (
+                SELECT bar.sector_code, bar.trade_date
+                FROM t_sector_bar bar
+                JOIN eligible_sectors sector USING (sector_code)
+                WHERE bar.trade_date BETWEEN :start_date AND :end_date
+                UNION
+                SELECT flow.sector_code, flow.trade_date
+                FROM t_sector_fund_flow_daily flow
+                JOIN eligible_sectors sector USING (sector_code)
+                WHERE flow.trade_date BETWEEN :start_date AND :end_date
+            ),
+            bar_history AS (
+                SELECT bar.*,
+                       avg(bar.close_price) OVER sector_rows_5 AS ma5,
+                       avg(bar.close_price) OVER sector_rows_10 AS ma10,
+                       avg(bar.close_price) OVER sector_rows_20 AS ma20,
+                       avg(bar.close_price) OVER sector_rows_60 AS ma60,
+                       lag(bar.close_price, 1) OVER sector_order AS close1,
+                       lag(bar.close_price, 5) OVER sector_order AS close5,
+                       lag(bar.close_price, 20) OVER sector_order AS close20,
+                       max(bar.close_price) OVER sector_rows_20 AS high20,
+                       CASE
+                           WHEN count(bar.change_pct) OVER sector_rows_20 >= 2
+                           THEN stddev_pop(bar.change_pct) OVER sector_rows_20
+                       END AS volatility20
+                FROM t_sector_bar bar
+                JOIN eligible_sectors sector USING (sector_code)
+                WHERE bar.trade_date BETWEEN :history_start AND :end_date
+                WINDOW
+                    sector_order AS (PARTITION BY bar.sector_code ORDER BY bar.trade_date),
+                    sector_rows_5 AS (
+                        PARTITION BY bar.sector_code ORDER BY bar.trade_date
+                        ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                    ),
+                    sector_rows_10 AS (
+                        PARTITION BY bar.sector_code ORDER BY bar.trade_date
+                        ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                    ),
+                    sector_rows_20 AS (
+                        PARTITION BY bar.sector_code ORDER BY bar.trade_date
+                        ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+                    ),
+                    sector_rows_60 AS (
+                        PARTITION BY bar.sector_code ORDER BY bar.trade_date
+                        ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                    )
+            ),
+            flow_marked AS (
+                SELECT flow.*,
+                       sum(
+                           CASE WHEN coalesce(flow.main_net_inflow_yuan, 0) > 0 THEN 0 ELSE 1 END
+                       ) OVER (
+                           PARTITION BY flow.sector_code ORDER BY flow.trade_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS positive_group
+                FROM t_sector_fund_flow_daily flow
+                JOIN eligible_sectors sector USING (sector_code)
+                WHERE flow.trade_date BETWEEN :history_start AND :end_date
+            ),
+            flow_history AS (
+                SELECT flow.*,
+                       sum(flow.main_net_inflow_yuan) OVER (
+                           PARTITION BY flow.sector_code ORDER BY flow.trade_date
+                           ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                       ) AS net_3d,
+                       sum(flow.main_net_inflow_yuan) OVER (
+                           PARTITION BY flow.sector_code ORDER BY flow.trade_date
+                           ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
+                       ) AS net_5d,
+                       sum(flow.main_net_inflow_yuan) OVER (
+                           PARTITION BY flow.sector_code ORDER BY flow.trade_date
+                           ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+                       ) AS net_10d,
+                       CASE
+                           WHEN coalesce(flow.main_net_inflow_yuan, 0) > 0
+                           THEN count(*) FILTER (
+                               WHERE coalesce(flow.main_net_inflow_yuan, 0) > 0
+                           ) OVER (
+                               PARTITION BY flow.sector_code, flow.positive_group
+                               ORDER BY flow.trade_date
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           )
+                           ELSE 0
+                       END AS continuous_days
+                FROM flow_marked flow
+            ),
+            active_components AS (
+                SELECT DISTINCT component.sector_code, component.stock_code,
+                                component.start_date, component.end_date
+                FROM t_sector_component component
+                JOIN eligible_sectors sector USING (sector_code)
+                JOIN t_stock stock ON stock.stock_code = component.stock_code
+                WHERE stock.status = 'active'
+                  AND stock.is_st IS FALSE
+                  AND stock.exchange IN ('SH','SZ','SSE','SZSE')
+            ),
+            stock_events AS (
+                SELECT event.stock_code,
+                       event.trade_date,
+                       bool_or(event.event_type = 'limit_up') AS is_limit_up,
+                       bool_or(event.event_type = 'limit_down') AS is_limit_down,
+                       bool_or(event.event_type = 'limit_break') AS is_limit_break,
+                       max(event.limit_price) FILTER (WHERE event.event_type = 'limit_up') AS limit_up_price,
+                       min(coalesce(event.open_count, 0)) FILTER (WHERE event.event_type = 'limit_up') AS open_count
+                FROM t_limit_event_daily event
+                WHERE event.trade_date BETWEEN :start_date AND :end_date
+                  AND event.event_type IN ('limit_up', 'limit_down', 'limit_break')
+                GROUP BY event.stock_code, event.trade_date
+            ),
+            member_stats AS (
+                SELECT target.sector_code,
+                       target.trade_date,
+                       count(component.stock_code) AS component_count,
+                       count(daily.stock_code) AS covered_count,
+                       count(*) FILTER (WHERE daily.change_pct > 0) AS rising_count,
+                       count(*) FILTER (WHERE daily.change_pct < 0) AS falling_count,
+                       count(*) FILTER (WHERE daily.change_pct = 0) AS flat_count,
+                       avg(daily.change_pct) AS average_change,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY daily.change_pct) AS median_change,
+                       avg((factor.close_qfq >= factor.ma20)::int)
+                           FILTER (WHERE factor.close_qfq IS NOT NULL AND factor.ma20 IS NOT NULL) AS above_ma20,
+                       avg((factor.close_qfq >= factor.ma60)::int)
+                           FILTER (WHERE factor.close_qfq IS NOT NULL AND factor.ma60 IS NOT NULL) AS above_ma60,
+                       count(*) FILTER (
+                           WHERE factor.close_qfq IS NOT NULL AND factor.high_20d IS NOT NULL
+                             AND factor.close_qfq >= factor.high_20d
+                       ) AS high20_count,
+                       count(*) FILTER (
+                           WHERE factor.close_qfq IS NOT NULL AND factor.low_20d IS NOT NULL
+                             AND factor.close_qfq <= factor.low_20d
+                       ) AS low20_count,
+                       count(*) FILTER (
+                           WHERE factor.close_qfq IS NOT NULL AND factor.high_60d IS NOT NULL
+                             AND factor.close_qfq >= factor.high_60d
+                       ) AS high60_count,
+                       count(*) FILTER (
+                           WHERE factor.close_qfq IS NOT NULL AND factor.low_60d IS NOT NULL
+                             AND factor.close_qfq <= factor.low_60d
+                       ) AS low60_count,
+                       count(*) FILTER (WHERE event.is_limit_up) AS limit_up_count,
+                       count(*) FILTER (WHERE event.is_limit_down) AS limit_down_count,
+                       count(*) FILTER (WHERE event.is_limit_break) AS break_count,
+                       count(*) FILTER (
+                           WHERE event.is_limit_up
+                             AND daily.open_price = event.limit_up_price
+                             AND coalesce(event.open_count, 0) = 0
+                       ) AS one_word_count
+                FROM t_sector_bar target
+                JOIN eligible_sectors sector USING (sector_code)
+                LEFT JOIN active_components component
+                  ON component.sector_code = target.sector_code
+                 AND coalesce(component.start_date, DATE '1900-01-01') <= target.trade_date
+                 AND coalesce(component.end_date, DATE '2999-12-31') >= target.trade_date
+                LEFT JOIN t_daily_bar daily
+                  ON daily.stock_code = component.stock_code
+                 AND daily.trade_date = target.trade_date
+                LEFT JOIN t_stock_factor_daily factor
+                  ON factor.stock_code = component.stock_code
+                 AND factor.trade_date = target.trade_date
+                LEFT JOIN stock_events event
+                  ON event.stock_code = component.stock_code
+                 AND event.trade_date = target.trade_date
+                WHERE target.trade_date BETWEEN :start_date AND :end_date
+                GROUP BY target.sector_code, target.trade_date
+            ),
+            target_flows AS (
+                SELECT flow.*,
+                       cume_dist() OVER (
+                           PARTITION BY flow.trade_date ORDER BY flow.main_net_inflow_yuan
+                       ) * 100 AS fund_strength,
+                       dense_rank() OVER (
+                           PARTITION BY flow.trade_date
+                           ORDER BY flow.main_net_inflow_yuan DESC
+                       ) AS fund_rank
+                FROM flow_history flow
+                WHERE flow.trade_date BETWEEN :start_date AND :end_date
+                  AND flow.main_net_inflow_yuan IS NOT NULL
+            ),
+            assembled AS (
+                SELECT target.sector_code,
+                       target.trade_date,
+                       sector.sector_name,
+                       sector.sector_type,
+                       bar.ma5, bar.ma10, bar.ma20, bar.ma60,
+                       (bar.close_price / nullif(bar.close1, 0) - 1) * 100 AS return_1d_pct,
+                       (bar.close_price / nullif(bar.close5, 0) - 1) * 100 AS return_5d_pct,
+                       (bar.close_price / nullif(bar.close20, 0) - 1) * 100 AS return_20d_pct,
+                       (bar.close_price / nullif(bar.high20, 0) - 1) * 100 AS drawdown_20d_pct,
+                       flow.fund_strength,
+                       flow.main_net_inflow_yuan,
+                       flow.net_3d,
+                       flow.net_5d,
+                       flow.net_10d,
+                       coalesce(flow.continuous_days, 0) AS continuous_days,
+                       flow.fund_rank,
+                       stats.component_count,
+                       stats.covered_count::double precision / nullif(stats.component_count, 0) AS coverage_ratio,
+                       stats.rising_count,
+                       stats.falling_count,
+                       stats.flat_count,
+                       stats.limit_up_count,
+                       stats.limit_down_count,
+                       stats.break_count,
+                       stats.one_word_count,
+                       greatest(stats.limit_up_count - stats.one_word_count, 0) AS natural_count,
+                       stats.average_change,
+                       stats.median_change,
+                       stats.above_ma20,
+                       stats.above_ma60,
+                       stats.high20_count,
+                       stats.low20_count,
+                       stats.high60_count,
+                       stats.low60_count,
+                       bar.volatility20,
+                       coalesce(stats.average_change, 0) * 8
+                         + coalesce(stats.limit_up_count, 0) * 3
+                         + coalesce(flow.fund_strength, 0) * 0.35
+                         + least(coalesce(flow.continuous_days, 0), 5) * 2 AS heat_score,
+                       least(coalesce(flow.continuous_days, 0) * 20, 100) AS persistence_score,
+                       array_remove(ARRAY[
+                           CASE WHEN bar.sector_code IS NULL THEN 'sector_bar' END,
+                           CASE WHEN flow.sector_code IS NULL THEN 'sector_fund_flow' END,
+                           CASE WHEN stats.component_count = 0 THEN 'components' END,
+                           CASE
+                               WHEN stats.component_count > 0
+                                AND stats.covered_count < stats.component_count * 0.8
+                               THEN 'component_coverage'
+                           END
+                       ]::text[], NULL) AS quality_flags
+                FROM target_keys target
+                JOIN eligible_sectors sector USING (sector_code)
+                LEFT JOIN bar_history bar
+                  ON bar.sector_code = target.sector_code AND bar.trade_date = target.trade_date
+                LEFT JOIN target_flows flow
+                  ON flow.sector_code = target.sector_code AND flow.trade_date = target.trade_date
+                LEFT JOIN member_stats stats
+                  ON stats.sector_code = target.sector_code AND stats.trade_date = target.trade_date
+            ),
+            ranked AS (
+                SELECT assembled.*,
+                       dense_rank() OVER (
+                           PARTITION BY assembled.trade_date
+                           ORDER BY assembled.heat_score DESC
+                       ) AS heat_rank
+                FROM assembled
+            ),
+            upserted AS (
+                INSERT INTO t_sector_factor_daily (
+                    sector_code, sector_name, sector_type, trade_date, source,
+                    ma5, ma10, ma20, ma60,
+                    return_1d_pct, return_5d_pct, return_20d_pct, drawdown_20d_pct,
+                    fund_strength, main_net_inflow_yuan,
+                    main_net_inflow_3d_yuan, main_net_inflow_5d_yuan, main_net_inflow_10d_yuan,
+                    continuous_inflow_days, fund_rank,
+                    component_count, component_coverage_ratio,
+                    rising_stock_count, falling_stock_count, flat_stock_count,
+                    limit_up_stock_count, limit_down_stock_count, limit_break_stock_count,
+                    one_word_limit_up_count, natural_limit_up_count,
+                    average_change_pct, median_change_pct,
+                    above_ma20_ratio, above_ma60_ratio,
+                    new_high_20d_count, new_low_20d_count,
+                    new_high_60d_count, new_low_60d_count,
+                    volatility_20d, heat_score, heat_rank, persistence_score,
+                    calculation_revision, quality_flags, created_at, updated_at
+                )
+                SELECT sector_code, sector_name, sector_type, trade_date, 'system:daily_close',
+                       ma5, ma10, ma20, ma60,
+                       return_1d_pct, return_5d_pct, return_20d_pct, drawdown_20d_pct,
+                       fund_strength, main_net_inflow_yuan,
+                       net_3d, net_5d, net_10d,
+                       continuous_days, fund_rank,
+                       component_count, coverage_ratio,
+                       rising_count, falling_count, flat_count,
+                       limit_up_count, limit_down_count, break_count,
+                       one_word_count, natural_count,
+                       average_change, median_change,
+                       above_ma20, above_ma60,
+                       high20_count, low20_count, high60_count, low60_count,
+                       volatility20, heat_score, heat_rank, persistence_score,
+                       'sector_daily_final_r1', quality_flags, now(), now()
+                FROM ranked
+                ON CONFLICT (sector_code, trade_date) DO UPDATE SET
+                    sector_name = EXCLUDED.sector_name,
+                    sector_type = EXCLUDED.sector_type,
+                    source = EXCLUDED.source,
+                    ma5 = EXCLUDED.ma5,
+                    ma10 = EXCLUDED.ma10,
+                    ma20 = EXCLUDED.ma20,
+                    ma60 = EXCLUDED.ma60,
+                    return_1d_pct = EXCLUDED.return_1d_pct,
+                    return_5d_pct = EXCLUDED.return_5d_pct,
+                    return_20d_pct = EXCLUDED.return_20d_pct,
+                    drawdown_20d_pct = EXCLUDED.drawdown_20d_pct,
+                    fund_strength = EXCLUDED.fund_strength,
+                    main_net_inflow_yuan = EXCLUDED.main_net_inflow_yuan,
+                    main_net_inflow_3d_yuan = EXCLUDED.main_net_inflow_3d_yuan,
+                    main_net_inflow_5d_yuan = EXCLUDED.main_net_inflow_5d_yuan,
+                    main_net_inflow_10d_yuan = EXCLUDED.main_net_inflow_10d_yuan,
+                    continuous_inflow_days = EXCLUDED.continuous_inflow_days,
+                    fund_rank = EXCLUDED.fund_rank,
+                    component_count = EXCLUDED.component_count,
+                    component_coverage_ratio = EXCLUDED.component_coverage_ratio,
+                    rising_stock_count = EXCLUDED.rising_stock_count,
+                    falling_stock_count = EXCLUDED.falling_stock_count,
+                    flat_stock_count = EXCLUDED.flat_stock_count,
+                    limit_up_stock_count = EXCLUDED.limit_up_stock_count,
+                    limit_down_stock_count = EXCLUDED.limit_down_stock_count,
+                    limit_break_stock_count = EXCLUDED.limit_break_stock_count,
+                    one_word_limit_up_count = EXCLUDED.one_word_limit_up_count,
+                    natural_limit_up_count = EXCLUDED.natural_limit_up_count,
+                    average_change_pct = EXCLUDED.average_change_pct,
+                    median_change_pct = EXCLUDED.median_change_pct,
+                    above_ma20_ratio = EXCLUDED.above_ma20_ratio,
+                    above_ma60_ratio = EXCLUDED.above_ma60_ratio,
+                    new_high_20d_count = EXCLUDED.new_high_20d_count,
+                    new_low_20d_count = EXCLUDED.new_low_20d_count,
+                    new_high_60d_count = EXCLUDED.new_high_60d_count,
+                    new_low_60d_count = EXCLUDED.new_low_60d_count,
+                    volatility_20d = EXCLUDED.volatility_20d,
+                    heat_score = EXCLUDED.heat_score,
+                    heat_rank = EXCLUDED.heat_rank,
+                    persistence_score = EXCLUDED.persistence_score,
+                    calculation_revision = EXCLUDED.calculation_revision,
+                    quality_flags = EXCLUDED.quality_flags,
+                    updated_at = now()
+                RETURNING trade_date
+            )
+            SELECT trade_date, count(*) AS row_count
+            FROM upserted
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """
+        ).bindparams(
+            bindparam("start_date", type_=Date()),
+            bindparam("end_date", type_=Date()),
+            bindparam("history_start", type_=Date()),
+        )
+        rows = (
+            await self.session.execute(
+                statement,
+                {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "history_start": history_start,
+                },
+            )
+        ).mappings().all()
+        return {row["trade_date"]: int(row["row_count"] or 0) for row in rows}
+
     async def rebuild_sector_final_metrics(self, *, trade_date: date) -> int:
         """Fill typed trend/breadth/event fields after the base sector pass."""
         statement = text(
@@ -1590,58 +1984,132 @@ class IndicatorRepository:
         return len(result.all())
 
     async def rebuild_sector_leaders(self, *, trade_date: date) -> int:
-        await self.session.execute(delete(SectorLeaderDaily).where(SectorLeaderDaily.trade_date == trade_date))
+        rows = await self.rebuild_sector_leaders_between(start_date=trade_date, end_date=trade_date)
+        return rows.get(trade_date, 0)
+
+    async def rebuild_sector_leaders_between(self, *, start_date: date, end_date: date) -> dict[date, int]:
+        """Replace leaders for a bounded window and restrict them to factor-backed sectors."""
+        await self.session.execute(
+            delete(SectorLeaderDaily).where(SectorLeaderDaily.trade_date.between(start_date, end_date))
+        )
+        await self.session.execute(
+            text(
+                """
+                UPDATE t_sector_factor_daily
+                SET leader_strength_score = NULL,
+                    updated_at = now()
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                """
+            ).bindparams(
+                bindparam("start_date", type_=Date()),
+                bindparam("end_date", type_=Date()),
+            ),
+            {"start_date": start_date, "end_date": end_date},
+        )
+        statement = text(
+            """
+            WITH target_factors AS (
+                SELECT factor.sector_code, factor.trade_date
+                FROM t_sector_factor_daily factor
+                JOIN t_sector_basic sector USING (sector_code)
+                WHERE factor.trade_date BETWEEN :start_date AND :end_date
+                  AND factor.calculation_revision = 'sector_daily_final_r1'
+                  AND sector.source LIKE 'tushare:%'
+                  AND sector.sector_code LIKE 'ths_%'
+            ),
+            active_components AS (
+                SELECT DISTINCT component.sector_code, component.stock_code,
+                                component.start_date, component.end_date
+                FROM t_sector_component component
+                JOIN (SELECT DISTINCT sector_code FROM target_factors) target USING (sector_code)
+                JOIN t_stock stock ON stock.stock_code = component.stock_code
+                WHERE stock.status = 'active'
+                  AND stock.is_st IS FALSE
+                  AND stock.exchange IN ('SH','SZ','SSE','SZSE')
+            ),
+            evidence AS (
+                SELECT item.stock_code, item.trade_date, max(item.board_count) AS board_count
+                FROM t_market_limit_up_evidence_daily item
+                WHERE item.trade_date BETWEEN :start_date AND :end_date
+                GROUP BY item.stock_code, item.trade_date
+            ),
+            candidates AS (
+                SELECT target.sector_code,
+                       target.trade_date,
+                       bar.stock_code,
+                       stock.stock_name,
+                       bar.change_pct,
+                       bar.amount_yuan,
+                       evidence.board_count,
+                       coalesce(evidence.board_count, 0) * 20
+                         + coalesce(bar.change_pct, 0) * 3
+                         + coalesce(factor.return_percentile_1d, 0) * 0.2 AS leader_score,
+                       row_number() OVER (
+                           PARTITION BY target.sector_code, target.trade_date
+                           ORDER BY coalesce(evidence.board_count, 0) DESC,
+                                    bar.change_pct DESC NULLS LAST,
+                                    bar.amount_yuan DESC NULLS LAST,
+                                    bar.stock_code
+                       ) AS leader_rank
+                FROM target_factors target
+                JOIN active_components component
+                  ON component.sector_code = target.sector_code
+                 AND coalesce(component.start_date, DATE '1900-01-01') <= target.trade_date
+                 AND coalesce(component.end_date, DATE '2999-12-31') >= target.trade_date
+                JOIN t_daily_bar bar
+                  ON bar.stock_code = component.stock_code
+                 AND bar.trade_date = target.trade_date
+                JOIN t_stock stock ON stock.stock_code = bar.stock_code
+                LEFT JOIN t_stock_factor_daily factor
+                  ON factor.stock_code = bar.stock_code
+                 AND factor.trade_date = target.trade_date
+                LEFT JOIN evidence
+                  ON evidence.stock_code = bar.stock_code
+                 AND evidence.trade_date = target.trade_date
+            ),
+            inserted AS (
+                INSERT INTO t_sector_leader_daily (
+                    sector_code, trade_date, leader_rank, stock_code, stock_name,
+                    change_pct, amount_yuan, limit_board_count, leader_score,
+                    source, calculated_at
+                )
+                SELECT sector_code, trade_date, leader_rank, stock_code, stock_name,
+                       change_pct, amount_yuan, board_count, leader_score,
+                       'system:sector_factor', now()
+                FROM candidates
+                WHERE leader_rank <= 5
+                RETURNING sector_code, trade_date, leader_score
+            ),
+            strengths AS (
+                SELECT sector_code, trade_date, max(leader_score) AS leader_strength_score
+                FROM inserted
+                GROUP BY sector_code, trade_date
+            ),
+            updated AS (
+                UPDATE t_sector_factor_daily factor
+                SET leader_strength_score = strengths.leader_strength_score,
+                    updated_at = now()
+                FROM strengths
+                WHERE factor.sector_code = strengths.sector_code
+                  AND factor.trade_date = strengths.trade_date
+                RETURNING factor.id
+            )
+            SELECT trade_date, count(*) AS row_count
+            FROM inserted
+            GROUP BY trade_date
+            ORDER BY trade_date
+            """
+        ).bindparams(
+            bindparam("start_date", type_=Date()),
+            bindparam("end_date", type_=Date()),
+        )
         rows = (
             await self.session.execute(
-                text(
-                    """
-                    WITH candidates AS (
-                        SELECT component.sector_code, bar.stock_code, stock.stock_name,
-                               bar.change_pct, bar.amount_yuan,
-                               evidence.board_count,
-                               coalesce(evidence.board_count, 0) * 20
-                                 + coalesce(bar.change_pct, 0) * 3
-                                 + coalesce(factor.return_percentile_1d, 0) * 0.2 AS leader_score,
-                               row_number() OVER (
-                                   PARTITION BY component.sector_code
-                                   ORDER BY coalesce(evidence.board_count, 0) DESC,
-                                            bar.change_pct DESC NULLS LAST,
-                                            bar.amount_yuan DESC NULLS LAST,
-                                            bar.stock_code
-                               ) AS leader_rank
-                        FROM t_sector_component component
-                        JOIN t_daily_bar bar
-                          ON bar.stock_code = component.stock_code AND bar.trade_date = :trade_date
-                        JOIN t_stock stock ON stock.stock_code = bar.stock_code
-                        LEFT JOIN t_stock_factor_daily factor
-                          ON factor.stock_code = bar.stock_code AND factor.trade_date = :trade_date
-                        LEFT JOIN LATERAL (
-                            SELECT max(item.board_count) AS board_count
-                            FROM t_market_limit_up_evidence_daily item
-                            WHERE item.stock_code = bar.stock_code
-                              AND item.trade_date = :trade_date
-                        ) evidence ON true
-                        WHERE stock.status = 'active' AND stock.is_st IS FALSE
-                          AND stock.exchange IN ('SH','SZ','SSE','SZSE')
-                          AND coalesce(component.start_date, DATE '1900-01-01') <= :trade_date
-                          AND coalesce(component.end_date, DATE '2999-12-31') >= :trade_date
-                    )
-                    INSERT INTO t_sector_leader_daily (
-                        sector_code, trade_date, leader_rank, stock_code, stock_name,
-                        change_pct, amount_yuan, limit_board_count, leader_score,
-                        source, calculated_at
-                    )
-                    SELECT sector_code, :trade_date, leader_rank, stock_code, stock_name,
-                           change_pct, amount_yuan, board_count, leader_score,
-                           'system:sector_factor', now()
-                    FROM candidates WHERE leader_rank <= 5
-                    RETURNING id
-                    """
-                ),
-                {"trade_date": trade_date},
+                statement,
+                {"start_date": start_date, "end_date": end_date},
             )
-        ).all()
-        return len(rows)
+        ).mappings().all()
+        return {row["trade_date"]: int(row["row_count"] or 0) for row in rows}
 
     async def rebuild_index_factors(self, *, trade_date: date) -> int:
         core_codes = CORE_INDEX_CANONICAL_CODES
