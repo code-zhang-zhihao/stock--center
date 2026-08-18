@@ -88,6 +88,7 @@
 80. `79a-sector-factor-window-backfill.sql`：将历史板块因子任务升级为 20 交易日窗口集合计算，暴露窗口参数并把数据库并发限制为最多 2；只更新任务元数据，不改业务表。
 81. `79b-daily-assets-final-resume.sql`：部署正式代码并完成个股/板块/指数历史派生回填后验证最新日覆盖、七大 canonical 指数代码（库内为无后缀六位代码）、市场汇总和审计，再恢复切换前处于启用状态的每日任务并进入 7 日观察期。
 82. `80-daily-assets-final-cleanup.sql`：观察至少 7 日且已完成数据库备份后，删除旧因子、专业 JSON、技术快照、旧情绪、Raw 表和冗余列，并清理因子字典中的资产版本残留。该脚本不可逆。
+83. `81-data-assets-index-and-analyze.sql`：为 `t_stock_adjust_factor` 和 `t_provider_ingest_audit` 补 `trade_date` 前导索引，恢复数据中心最新日扫描；随后对全库执行 `ANALYZE`，因为批量历史写入后所有业务表仍是无统计状态，数据中心会误显示为空数据、查询计划也会低估行数。脚本不修改业务数据。
 67. `67-market-emotion-v2.sql`：创建市场级北向资金流事实、V2 情绪模型及双分每日事实表；21:30 增强任务新增 `moneyflow_hsgt` 与北向持仓/两融的最近披露日补数，22:15 任务新增可手动触发的 V2 基线校准模式。V1 表和接口保持兼容。
 68. `68-market-emotion-baseline-performance.sql`：新增历史市场级北向资金流回填任务，默认按 120 交易日窗口补最近 250 个已有日线交易日；V2 基线改为精确交易日 lookback、20 日持久化检查点与运行进度，并把该手动校准任务超时上限调为 1800 秒。
 
