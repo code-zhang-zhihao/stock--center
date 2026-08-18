@@ -24,6 +24,27 @@ class FactorBackfillError(RuntimeError):
         self.code = code
 
 
+def _is_transient_connection_error(exc: BaseException) -> bool:
+    """Return True when the database connection died, not when a query timed out."""
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    transient_names = {
+        "InterfaceError",
+        "ConnectionDoesNotExistError",
+        "ConnectionIsClosedError",
+        "ConnectionResetError",
+        "BrokenPipeError",
+    }
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in transient_names:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class FactorBackfillRequest(BaseModel):
     pool_code: str = Field(default="focus", min_length=1, max_length=80)
     start_date: date = Field(default=date(2024, 1, 1))
@@ -377,25 +398,45 @@ class FactorBackfillService:
                 window_start, window_end = window_dates[0], window_dates[-1]
                 started = perf_counter()
                 try:
-                    async with self.sessionmaker() as session:
-                        await session.execute(text("SET LOCAL statement_timeout = '15min'"))
-                        repository = IndicatorRepository(session)
-                        deleted = 0
-                        if payload.ingest_mode == "rebuild":
-                            deleted = await repository.clear_sector_factor_rows_between(
-                                start_date=window_start,
-                                end_date=window_end,
-                            )
-                        factor_counts = await repository.assemble_sector_daily_factors_final_between(
-                            start_date=window_start,
-                            end_date=window_end,
-                            history_start=window_start - timedelta(days=180),
-                        )
-                        leader_counts = await repository.rebuild_sector_leaders_between(
-                            start_date=window_start,
-                            end_date=window_end,
-                        )
-                        await session.commit()
+                    attempt_count = 0
+                    while True:
+                        attempt_count += 1
+                        try:
+                            async with self.sessionmaker() as session:
+                                await session.execute(text("SET LOCAL statement_timeout = '30min'"))
+                                repository = IndicatorRepository(session)
+                                deleted = 0
+                                if payload.ingest_mode == "rebuild":
+                                    deleted = await repository.clear_sector_factor_rows_between(
+                                        start_date=window_start,
+                                        end_date=window_end,
+                                    )
+                                factor_counts = await repository.assemble_sector_daily_factors_final_between(
+                                    start_date=window_start,
+                                    end_date=window_end,
+                                    history_start=window_start - timedelta(days=180),
+                                )
+                                leader_counts = await repository.rebuild_sector_leaders_between(
+                                    start_date=window_start,
+                                    end_date=window_end,
+                                )
+                                await session.commit()
+                            break
+                        except Exception as exc:
+                            if attempt_count < 2 and _is_transient_connection_error(exc):
+                                logger.warning(
+                                    "factor sector backfill window retrying after connection loss: "
+                                    "worker=%s window=%s/%s start_date=%s end_date=%s attempt=%s error=%s",
+                                    worker_id,
+                                    window_index,
+                                    len(windows),
+                                    window_start,
+                                    window_end,
+                                    attempt_count,
+                                    exc,
+                                )
+                                continue
+                            raise
 
                     elapsed_ms = int((perf_counter() - started) * 1000)
                     factor_rows = sum(factor_counts.values())

@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from app.db.session import get_engine
 from app.modules.scheduler_center.models import SchedulerJob, SchedulerJobRun, SchedulerJobTag, SchedulerTag
 
 _UNSET = object()
+logger = logging.getLogger(__name__)
 
 
 class SchedulerRepository:
@@ -269,15 +271,35 @@ class SchedulerRepository:
         lock_key = f"scheduler:{job_code}"
         lock_stmt = text("SELECT pg_try_advisory_lock(hashtext(:lock_key)::bigint)").bindparams(lock_key=lock_key)
         unlock_stmt = text("SELECT pg_advisory_unlock(hashtext(:lock_key)::bigint)").bindparams(lock_key=lock_key)
-        async with get_engine().connect() as connection:
+        connection = await get_engine().connect()
+        try:
             result = await connection.execute(lock_stmt)
             locked = bool(result.scalar_one())
             try:
                 yield locked
             finally:
-                if locked:
+                if not locked:
+                    return
+                try:
                     await connection.execute(unlock_stmt)
-                await connection.commit()
+                    await connection.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "scheduler advisory lock release failed, "
+                        "the dedicated connection will be closed and the lock released by PostgreSQL: "
+                        "job_code=%s error=%s",
+                        job_code,
+                        exc,
+                    )
+        finally:
+            try:
+                await connection.close()
+            except Exception as exc:
+                logger.warning(
+                    "scheduler advisory lock connection close failed: job_code=%s error=%s",
+                    job_code,
+                    exc,
+                )
 
     async def commit(self) -> None:
         await self.session.commit()

@@ -258,6 +258,20 @@ def test_sector_leader_window_is_limited_to_factor_backed_sectors_and_five_rows(
     assert "factor.calculation_revision = 'sector_daily_final_r1'" in statement.text
     assert "leader_rank <= 5" in statement.text
     assert "component.start_date" in statement.text
+    assert "ranked AS" in statement.text
+    assert "top_candidates AS" in statement.text
+    assert "JOIN t_stock stock ON stock.stock_code = ranked.stock_code" in statement.text
+
+
+def test_transient_connection_error_detection_distinguishes_timeouts() -> None:
+    class ClosedConnectionError(Exception):
+        connection_invalidated = True
+
+    class QueryTimeoutError(Exception):
+        pass
+
+    assert backfill_module._is_transient_connection_error(ClosedConnectionError("closed")) is True
+    assert backfill_module._is_transient_connection_error(QueryTimeoutError("statement timeout")) is False
 
 
 def test_partial_professional_upsert_preserves_existing_local_core_values() -> None:

@@ -2033,17 +2033,13 @@ class IndicatorRepository:
                 WHERE item.trade_date BETWEEN :start_date AND :end_date
                 GROUP BY item.stock_code, item.trade_date
             ),
-            candidates AS (
+            ranked AS (
                 SELECT target.sector_code,
                        target.trade_date,
                        bar.stock_code,
-                       stock.stock_name,
                        bar.change_pct,
                        bar.amount_yuan,
                        evidence.board_count,
-                       coalesce(evidence.board_count, 0) * 20
-                         + coalesce(bar.change_pct, 0) * 3
-                         + coalesce(factor.return_percentile_1d, 0) * 0.2 AS leader_score,
                        row_number() OVER (
                            PARTITION BY target.sector_code, target.trade_date
                            ORDER BY coalesce(evidence.board_count, 0) DESC,
@@ -2059,13 +2055,22 @@ class IndicatorRepository:
                 JOIN t_daily_bar bar
                   ON bar.stock_code = component.stock_code
                  AND bar.trade_date = target.trade_date
-                JOIN t_stock stock ON stock.stock_code = bar.stock_code
-                LEFT JOIN t_stock_factor_daily factor
-                  ON factor.stock_code = bar.stock_code
-                 AND factor.trade_date = target.trade_date
                 LEFT JOIN evidence
                   ON evidence.stock_code = bar.stock_code
                  AND evidence.trade_date = target.trade_date
+            ),
+            top_candidates AS (
+                SELECT ranked.*,
+                       stock.stock_name,
+                       coalesce(ranked.board_count, 0) * 20
+                         + coalesce(ranked.change_pct, 0) * 3
+                         + coalesce(factor.return_percentile_1d, 0) * 0.2 AS leader_score
+                FROM ranked
+                JOIN t_stock stock ON stock.stock_code = ranked.stock_code
+                LEFT JOIN t_stock_factor_daily factor
+                  ON factor.stock_code = ranked.stock_code
+                 AND factor.trade_date = ranked.trade_date
+                WHERE ranked.leader_rank <= 5
             ),
             inserted AS (
                 INSERT INTO t_sector_leader_daily (
@@ -2076,8 +2081,7 @@ class IndicatorRepository:
                 SELECT sector_code, trade_date, leader_rank, stock_code, stock_name,
                        change_pct, amount_yuan, board_count, leader_score,
                        'system:sector_factor', now()
-                FROM candidates
-                WHERE leader_rank <= 5
+                FROM top_candidates
                 RETURNING sector_code, trade_date, leader_score
             ),
             strengths AS (
