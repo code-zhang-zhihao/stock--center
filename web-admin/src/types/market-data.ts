@@ -147,20 +147,21 @@ export interface StockDailyBasic {
   stock_code: string;
   trade_date: string;
   source: string;
-  close_price: number | null;
-  turnover_rate: number | null;
-  turnover_rate_f: number | null;
-  volume_ratio: number | null;
+  turnover_rate_pct: number | null;
+  turnover_rate_free_pct: number | null;
+  provider_volume_ratio: number | null;
   pe: number | null;
   pe_ttm: number | null;
   pb: number | null;
   ps: number | null;
   ps_ttm: number | null;
-  dv_ratio: number | null;
-  dv_ttm: number | null;
-  total_mv: number | null;
-  circ_mv: number | null;
-  limit_status: number | null;
+  dividend_yield_pct: number | null;
+  dividend_yield_ttm_pct: number | null;
+  total_share_shares: number | null;
+  float_share_shares: number | null;
+  free_share_shares: number | null;
+  total_market_value_yuan: number | null;
+  circulating_market_value_yuan: number | null;
 }
 
 export interface StockDailyBar {
@@ -178,7 +179,6 @@ export interface StockDailyBar {
   volume_hand: number | null;
   volume_share?: number | null;
   amount_yuan: number | null;
-  turnover_rate?: number | null;
 }
 
 export interface StockDailyChartBar extends StockDailyBar {

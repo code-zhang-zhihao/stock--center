@@ -100,8 +100,8 @@
               <dt>上市日</dt><dd>{{ overview?.stock.list_date || '-' }}</dd>
               <dt>PE TTM</dt><dd>{{ formatNumber(overview?.daily_basic?.pe_ttm ?? null) }}</dd>
               <dt>PB</dt><dd>{{ formatNumber(overview?.daily_basic?.pb ?? null) }}</dd>
-              <dt>换手率</dt><dd>{{ formatPercent(overview?.daily_basic?.turnover_rate ?? null) }}</dd>
-              <dt>总市值</dt><dd>{{ formatMoneyFromWan(overview?.daily_basic?.total_mv ?? null) }}</dd>
+              <dt>换手率</dt><dd>{{ formatPercent(overview?.daily_basic?.turnover_rate_pct ?? null) }}</dd>
+              <dt>总市值</dt><dd>{{ formatMoney(overview?.daily_basic?.total_market_value_yuan ?? null) }}</dd>
             </dl>
           </section>
 
@@ -697,11 +697,6 @@ function formatMoney(value: number | null | undefined) {
   if (abs >= 100000000) return `${formatNumber(value / 100000000)}亿`;
   if (abs >= 10000) return `${formatNumber(value / 10000)}万`;
   return formatNumber(value);
-}
-
-function formatMoneyFromWan(value: number | null | undefined) {
-  if (value === null || value === undefined) return '-';
-  return formatMoney(value * 10000);
 }
 
 function formatBarTime(value: string) {
