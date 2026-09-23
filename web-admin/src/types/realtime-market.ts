@@ -3,6 +3,8 @@ export interface RealtimeMarketQuote {
   stock_name?: string | null;
   source_symbol?: string | null;
   last_price?: number | null;
+  pre_close_price?: number | null;
+  change_amount?: number | null;
   change_pct?: number | null;
   amount_yuan?: number | null;
   volume_hand?: number | null;
@@ -49,7 +51,15 @@ export interface RealtimeMarketOverview {
       at_low_count?: number;
     };
     change_distribution?: Record<string, number>;
-    limit_events?: { available: boolean; reason?: string | null; limit_up_count?: number | null; limit_down_count?: number | null };
+    limit_events?: {
+      available: boolean;
+      reason?: string | null;
+      source?: 'provider' | 'derived_a_share_rule' | 'mixed' | string | null;
+      verified_quote_count?: number;
+      unavailable_quote_count?: number;
+      limit_up_count?: number | null;
+      limit_down_count?: number | null;
+    };
     core_indexes?: Array<{
       index_code: string;
       index_name: string;

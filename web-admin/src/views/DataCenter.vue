@@ -75,7 +75,7 @@
         <div><span>上涨 / 下跌 / 平盘</span><strong>{{ formatNumber(marketOverview?.items.up_count) }} / {{ formatNumber(marketOverview?.items.down_count) }} / {{ formatNumber(marketOverview?.items.flat_count) }}</strong></div>
         <div><span>平均 / 中位涨跌</span><strong>{{ formatPercent(marketOverview?.items.average_change_pct) }} / {{ formatPercent(marketOverview?.items.median_change_pct) }}</strong></div>
         <div><span>累计成交额</span><strong>{{ formatAmount(marketOverview?.items.total_amount_yuan) }}</strong></div>
-        <div><span>涨停 / 跌停</span><strong>{{ marketOverview?.items.limit_events?.available ? `${formatNumber(marketOverview.items.limit_events.limit_up_count)} / ${formatNumber(marketOverview.items.limit_events.limit_down_count)}` : '数据源未验证' }}</strong></div>
+        <div><span>涨停 / 跌停</span><strong>{{ marketOverview?.items.limit_events?.available ? `${formatNumber(marketOverview.items.limit_events.limit_up_count)} / ${formatNumber(marketOverview.items.limit_events.limit_down_count)}` : '数据未就绪' }}</strong></div>
         <div><span>≥5% / ≤-5%</span><strong>{{ formatNumber(marketOverview?.items.change_distribution?.up_5_pct) }} / {{ formatNumber(marketOverview?.items.change_distribution?.down_5_pct) }}</strong></div>
       </div>
       <div v-if="marketOverview?.items.core_indexes?.length" class="core-index-grid">

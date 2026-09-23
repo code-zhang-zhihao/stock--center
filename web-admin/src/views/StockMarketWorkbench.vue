@@ -622,7 +622,7 @@ function minuteChartOption(items: StockMinuteBar[], referencePrice: number | nul
 function startAutoRefresh() {
   stopAutoRefresh();
   if (!autoRefresh.value || activeChart.value !== 'realtime') return;
-  const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api/v1').replace(/\/$/, '');
+  const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/$/, '');
   const topic = `stock:${currentStockCode.value}`;
   realtimeEventSource = new EventSource(`${apiBaseUrl}/realtime/stream?topics=${encodeURIComponent(topic)}`);
   realtimeEventSource.addEventListener(topic, (event) => {

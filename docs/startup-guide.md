@@ -40,8 +40,11 @@ cd /Volumes/TiPro9000/projects/archived/stock-center
 - Health：`http://127.0.0.1:8000/api/v1/health`
 - DB Health：`http://127.0.0.1:8000/api/v1/health/db`
 - 前端：`http://127.0.0.1:8080`
+- 局域网前端：`http://<启动机器的局域网 IP>:8080`
 
 脚本默认同时启动后端和 `web-admin` 前端。后端日志写入 `logs/backend-*.log`，前端日志写入 `logs/frontend-*.log`。
+
+前端开发服务器默认监听 `0.0.0.0:8080`，并将同源 `/api/*` 请求代理到本机 `127.0.0.1:8000`。因此局域网客户端只需访问前端端口，不会把 API 请求错误地发到客户端自己的 `127.0.0.1`；后端默认仍只监听本机回环地址。请仅在可信局域网中开放该端口，并按操作系统防火墙提示允许 Node.js 接收入站连接。
 
 `/api/v1/health` 只表示后端进程已启动；数据库连接请查看 `/api/v1/health/db`。当 `SCHEDULER_ENABLED=true` 但数据库暂时不可连时，后端仍会启动，调度器状态会在 `/api/v1/scheduler/status` 中显示错误。
 
@@ -135,8 +138,10 @@ cd /Volumes/TiPro9000/projects/archived/stock-center
 前端 API 地址由 `web-admin/.env` 控制：
 
 ```env
-VITE_API_BASE_URL=http://127.0.0.1:8000/api/v1
+VITE_API_BASE_URL=/api/v1
 ```
+
+本地开发默认使用 Vite 同源代理。若改为独立部署静态资源，需要由反向代理将 `/api/*` 转发到后端，或者将 `VITE_API_BASE_URL` 设置为局域网客户端可访问的后端地址并同步配置后端 CORS。
 
 前端静态验证：
 

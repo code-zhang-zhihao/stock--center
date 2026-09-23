@@ -59,7 +59,7 @@
           <span>涨停 / 跌停</span>
           <strong v-if="limitEvents?.available"><i class="up">{{ formatInteger(limitEvents.limit_up_count) }}</i> / <i class="down">{{ formatInteger(limitEvents.limit_down_count) }}</i></strong>
           <strong v-else>未验证</strong>
-          <small>{{ limitEvents?.available ? '以数据源返回的涨跌停价校验' : '当前 Quote 未提供可验证涨跌停价' }}</small>
+          <small>{{ limitEvents?.available ? limitEventLabel : '缺少证券规则或前收，暂不统计' }}</small>
         </div>
         <div class="summary-card">
           <span>触及日内高 / 低</span>
@@ -287,6 +287,15 @@ let fallbackTimer: number | null = null;
 const selectedSector = computed(() => [...conceptItems.value, ...industryItems.value].find((item) => item.sector_code === selectedSectorCode.value) || null);
 const breadth = computed(() => overview.value?.items.market_breadth);
 const limitEvents = computed(() => overview.value?.items.limit_events);
+const limitEventLabel = computed(() => {
+  if (limitEvents.value?.source === 'derived_a_share_rule') {
+    return `按 A 股交易规则推导 ${formatInteger(limitEvents.value.verified_quote_count)} 只`;
+  }
+  if (limitEvents.value?.source === 'mixed') {
+    return `数据源与规则推导混合校验 ${formatInteger(limitEvents.value.verified_quote_count)} 只`;
+  }
+  return `以数据源返回涨跌停价校验 ${formatInteger(limitEvents.value?.verified_quote_count)} 只`;
+});
 const factorTrend = computed(() => overview.value?.items.daily_factor_trend);
 const intradayStructure = computed(() => overview.value?.items.intraday_structure);
 const recentEvents = computed(() => [...events.value.items].reverse().slice(0, 8));
@@ -414,7 +423,7 @@ function applySectors(payload: { items?: RealtimeSectorStrength[] }) {
 
 function startStream() {
   stopStream();
-  const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api/v1').replace(/\/$/, '');
+  const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/$/, '');
   const topics = 'market_overview,sectors,pools,market_timeline,market_events';
   eventSource = new EventSource(`${apiBaseUrl}/realtime/stream?topics=${encodeURIComponent(topics)}`);
   eventSource.addEventListener('market_overview', (event) => { overview.value = parseEvent<RealtimeMarketOverview>(event) || overview.value; });

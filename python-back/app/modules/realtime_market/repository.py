@@ -23,9 +23,9 @@ class RealtimeMarketRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def active_stock_reference(self) -> tuple[list[str], dict[str, str]]:
+    async def active_stock_reference(self) -> tuple[list[str], dict[str, str], dict[str, dict]]:
         rows = await self.session.execute(
-            select(Stock.stock_code, Stock.stock_name)
+            select(Stock.stock_code, Stock.stock_name, Stock.exchange, Stock.list_date)
             .where(
                 Stock.status == "active",
                 Stock.is_st.is_(False),
@@ -34,7 +34,27 @@ class RealtimeMarketRepository:
             .order_by(Stock.stock_code)
         )
         pairs = rows.all()
-        return [row.stock_code for row in pairs], {row.stock_code: row.stock_name for row in pairs}
+        return (
+            [row.stock_code for row in pairs],
+            {row.stock_code: row.stock_name for row in pairs},
+            {
+                row.stock_code: {"exchange": row.exchange, "list_date": row.list_date}
+                for row in pairs
+            },
+        )
+
+    async def recent_open_trade_dates(self, *, up_to: date, limit: int) -> list[date]:
+        rows = await self.session.execute(
+            select(TradeCalendar.trade_date)
+            .where(
+                TradeCalendar.market == "CN",
+                TradeCalendar.is_open.is_(True),
+                TradeCalendar.trade_date <= up_to,
+            )
+            .order_by(TradeCalendar.trade_date.desc())
+            .limit(limit)
+        )
+        return list(rows.scalars().all())
 
     async def latest_daily_factor_reference(self) -> tuple[date | None, dict[str, dict]]:
         """Return the latest completed daily MA reference for the active universe.

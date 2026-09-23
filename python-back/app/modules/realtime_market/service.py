@@ -12,6 +12,7 @@ from app.core.redis_client import redis_client
 from app.db.session import get_sessionmaker
 from app.modules.config_center.repository import ConfigCenterRepository
 from app.modules.market_data.providers import MootdxProvider, normalize_symbol
+from app.modules.realtime_market.a_share_limit import AShareLimitPriceService
 from app.modules.realtime_market.repository import RealtimeMarketRepository
 from app.modules.realtime_market.rate_limit import RealtimeRateBudget
 from app.modules.realtime_market.schemas import RealtimeBlockMeta, RealtimeMinuteMeta, RealtimeRoundMeta, RealtimeSettings, RealtimeStatus
@@ -54,6 +55,9 @@ class RealtimeMarketService:
         self._reference_loaded_clock = 0.0
         self._active_codes: list[str] = []
         self._stock_names: dict[str, str] = {}
+        self._security_reference: dict[str, dict] = {}
+        self._recent_open_trade_dates: list[date] = []
+        self._a_share_limit_prices = AShareLimitPriceService()
         self._daily_factor_trade_date: date | None = None
         self._daily_factor_reference: dict[str, dict] = {}
         self._post_close_structure: dict = {"available": False, "reason": "post_close_structure_not_loaded"}
@@ -647,13 +651,18 @@ class RealtimeMarketService:
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
             repository = RealtimeMarketRepository(session)
-            active_codes, stock_names = await repository.active_stock_reference()
+            active_codes, stock_names, security_reference = await repository.active_stock_reference()
+            recent_open_trade_dates = await repository.recent_open_trade_dates(
+                up_to=datetime.now(tz=SHANGHAI).date(), limit=5
+            )
             factor_trade_date, daily_factor_reference = await repository.latest_daily_factor_reference()
             sector_info, sector_members, stock_sectors = await repository.sector_reference()
             industry_info, industry_members, stock_industries = await repository.industry_universe_reference()
             pools = await repository.pool_reference(active_codes)
         self._active_codes = active_codes
         self._stock_names = stock_names
+        self._security_reference = security_reference
+        self._recent_open_trade_dates = recent_open_trade_dates
         self._daily_factor_trade_date = factor_trade_date
         self._daily_factor_reference = daily_factor_reference
         self._sector_info = {**sector_info, **industry_info}
@@ -716,7 +725,11 @@ class RealtimeMarketService:
             request_count = 1
             result, _ = await self._quote_providers[0].universe_quotes("CN_Equity_A")
             active_set = set(self._active_codes)
-            rows = [self._normalize_quote(item) for item in result if normalize_symbol(str(item.get("stock_code") or "")) in active_set]
+            rows = [
+                self._normalize_quote(item)
+                for item in result
+                if normalize_symbol(str(item.get("stock_code") or "")) in active_set
+            ]
             if not rows:
                 errors.append("quote_universe: no eligible A-share quote data")
         except Exception as exc:
@@ -1299,17 +1312,15 @@ class RealtimeMarketService:
         up_ratio = round(up / max(1, quoted_count) * 100, 2)
         down_ratio = round(down / max(1, quoted_count) * 100, 2)
         breadth_state = "broadly_up" if up_ratio >= 65 else "broadly_down" if down_ratio >= 65 else "mixed"
-        verified_limit_quotes = [
-            item
-            for item in values
-            if isinstance(item.get("metadata"), dict)
-            and isinstance(item["metadata"].get("ext"), dict)
-            and item["metadata"]["ext"].get("limit_up") is not None
-            and item["metadata"]["ext"].get("limit_down") is not None
-        ]
+        verified_limit_quotes = [item for item in values if self._has_verified_limit_prices(item)]
+        limit_sources = {self._limit_price_source(item) for item in verified_limit_quotes}
+        limit_source = next(iter(limit_sources)) if len(limit_sources) == 1 else "mixed" if limit_sources else None
         limit_events = {
             "available": bool(verified_limit_quotes),
-            "reason": None if verified_limit_quotes else "tickflow_quote_limit_prices_unavailable",
+            "reason": None if verified_limit_quotes else "a_share_limit_prices_unavailable",
+            "source": limit_source,
+            "verified_quote_count": len(verified_limit_quotes),
+            "unavailable_quote_count": len(values) - len(verified_limit_quotes),
             "limit_up_count": sum(1 for item in verified_limit_quotes if self._is_limit_event(item, "up")) if verified_limit_quotes else None,
             "limit_down_count": sum(1 for item in verified_limit_quotes if self._is_limit_event(item, "down")) if verified_limit_quotes else None,
         }
@@ -2035,7 +2046,7 @@ class RealtimeMarketService:
 
     def _normalize_quote(self, row: dict) -> dict:
         stock_code = normalize_symbol(str(row.get("stock_code") or ""))
-        return {
+        quote = {
             "stock_code": stock_code,
             "stock_name": row.get("stock_name") or self._stock_names.get(stock_code),
             "quote_time": row.get("quote_time").isoformat() if isinstance(row.get("quote_time"), datetime) else str(row.get("quote_time") or ""),
@@ -2054,6 +2065,7 @@ class RealtimeMarketService:
             "amount_yuan": row.get("amount_yuan"),
             "metadata": row.get("metadata_json") if isinstance(row.get("metadata_json"), dict) else None,
         }
+        return self._enrich_quote_with_a_share_limit_prices(quote)
 
     @staticmethod
     def _normalize_minute(row: dict) -> dict:
@@ -2136,20 +2148,67 @@ class RealtimeMarketService:
 
     @staticmethod
     def _is_limit_event(quote: dict, direction: str) -> bool:
-        metadata = quote.get("metadata") if isinstance(quote.get("metadata"), dict) else {}
-        ext = metadata.get("ext") if isinstance(metadata.get("ext"), dict) else {}
-        target = ext.get("limit_up") if direction == "up" else ext.get("limit_down")
-        price = quote.get("last_price")
-        try:
-            return target is not None and price is not None and abs(float(target) - float(price)) <= max(0.001, abs(float(target)) * 0.0002)
-        except (TypeError, ValueError):
-            return False
+        details = RealtimeMarketService._limit_price_details(quote)
+        return bool(details.get("is_limit_up" if direction == "up" else "is_limit_down"))
 
     @staticmethod
     def _has_verified_limit_prices(quote: dict) -> bool:
         metadata = quote.get("metadata") if isinstance(quote.get("metadata"), dict) else {}
         ext = metadata.get("ext") if isinstance(metadata.get("ext"), dict) else {}
-        return ext.get("limit_up") is not None and ext.get("limit_down") is not None
+        if ext.get("limit_up") is not None and ext.get("limit_down") is not None:
+            return True
+        details = metadata.get("limit_price")
+        return bool(details.get("available")) if isinstance(details, dict) else False
+
+    @staticmethod
+    def _limit_price_details(quote: dict) -> dict:
+        metadata = quote.get("metadata") if isinstance(quote.get("metadata"), dict) else {}
+        ext = metadata.get("ext") if isinstance(metadata.get("ext"), dict) else {}
+        if ext.get("limit_up") is not None and ext.get("limit_down") is not None:
+            price = quote.get("last_price")
+            try:
+                return {
+                    "available": True,
+                    "limit_up": ext.get("limit_up"),
+                    "limit_down": ext.get("limit_down"),
+                    "is_limit_up": price is not None and abs(float(ext["limit_up"]) - float(price)) < 0.000001,
+                    "is_limit_down": price is not None and abs(float(ext["limit_down"]) - float(price)) < 0.000001,
+                    "source": "provider",
+                }
+            except (TypeError, ValueError):
+                return {"available": False, "source": "provider"}
+        details = metadata.get("limit_price")
+        return details if isinstance(details, dict) else {"available": False}
+
+    @staticmethod
+    def _limit_price_source(quote: dict) -> str:
+        return str(RealtimeMarketService._limit_price_details(quote).get("source") or "unknown")
+
+    def _enrich_quote_with_a_share_limit_prices(self, quote: dict) -> dict:
+        stock_code = str(quote.get("stock_code") or "")
+        reference = self._security_reference.get(stock_code, {})
+        list_date = reference.get("list_date")
+        if not isinstance(list_date, date) or len(self._recent_open_trade_dates) < 5:
+            listing_state: bool | None = None
+        else:
+            # The five most recent exchange-open dates include the current
+            # trade date. A listing date within this window remains in the
+            # IPO's first five open trading days and has no daily price limit.
+            listing_state = list_date >= min(self._recent_open_trade_dates)
+        limit_price = self._a_share_limit_prices.calculate(
+            stock_code=stock_code,
+            exchange=reference.get("exchange"),
+            pre_close_price=quote.get("pre_close_price"),
+            last_price=quote.get("last_price"),
+            is_new_listing_first_five_open_days=listing_state,
+        )
+        metadata = quote.get("metadata") if isinstance(quote.get("metadata"), dict) else {}
+        quote["metadata"] = {**metadata, "limit_price": limit_price}
+        if limit_price.get("change_amount") is not None:
+            quote["change_amount"] = limit_price["change_amount"]
+        if limit_price.get("change_pct") is not None:
+            quote["change_pct"] = limit_price["change_pct"]
+        return quote
 
     @staticmethod
     def _heat_breakdown(changes: list[float], limit_up: int, limit_down: int, member_count: int, amount: float) -> dict[str, float]:

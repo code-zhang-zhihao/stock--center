@@ -8,7 +8,7 @@ WEB_DIR="$ROOT_DIR/web-admin"
 LOG_DIR="$ROOT_DIR/logs"
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
-FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-8080}"
 INSTALL_DEPS="false"
 WITH_FRONTEND="true"
@@ -33,12 +33,14 @@ Backend:
   Health  : http://${BACKEND_HOST}:${BACKEND_PORT}/api/v1/health
 
 Frontend:
-  Web Admin: http://${FRONTEND_HOST}:${FRONTEND_PORT}
+  Local Web Admin: http://127.0.0.1:${FRONTEND_PORT}
+  LAN Web Admin  : http://<this-machine-lan-ip>:${FRONTEND_PORT}
 
 Notes:
   - This script does not initialize database tables.
   - Run docs/sql/01-schema.sql and docs/sql/02-stock-analysis-migration-mapping.sql manually.
   - Backend .env must point DATABASE_URL to the existing stock-analysis database.
+  - Web Admin proxies /api requests to the local backend, so LAN clients only need port ${FRONTEND_PORT}.
 EOF
 }
 
@@ -53,6 +55,20 @@ die() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+detect_lan_ip() {
+  if command_exists ifconfig; then
+    ifconfig 2>/dev/null | awk '
+      $1 == "inet" && ($2 ~ /^10\./ || $2 ~ /^192\.168\./ || $2 ~ /^172\.(1[6-9]|2[0-9]|3[01])\./) {
+        print $2
+        exit
+      }
+    '
+    return
+  fi
+
+  return 1
 }
 
 port_in_use() {
@@ -211,7 +227,9 @@ main() {
   mkdir -p "$LOG_DIR"
 
   local timestamp
+  local lan_ip
   timestamp="$(date '+%Y%m%d-%H%M%S')"
+  lan_ip="$(detect_lan_ip || true)"
   local backend_log="$LOG_DIR/backend-$timestamp.log"
   local frontend_log="$LOG_DIR/frontend-$timestamp.log"
 
@@ -228,7 +246,7 @@ main() {
   fi
 
   if [ "$WITH_FRONTEND" = "true" ]; then
-    if ! wait_for_url "Web Admin" "http://$FRONTEND_HOST:$FRONTEND_PORT" 60 1; then
+    if ! wait_for_url "Web Admin" "http://127.0.0.1:$FRONTEND_PORT" 60 1; then
       die "Web Admin did not become ready. Check $frontend_log"
     fi
   fi
@@ -247,9 +265,14 @@ EOF
 
   if [ "$WITH_FRONTEND" = "true" ]; then
     cat <<EOF
-Web Admin  : http://$FRONTEND_HOST:$FRONTEND_PORT
+Web Admin  : http://127.0.0.1:$FRONTEND_PORT
 Frontend log: $frontend_log
 EOF
+    if [ -n "$lan_ip" ]; then
+      log "LAN access: http://$lan_ip:$FRONTEND_PORT"
+    else
+      log "LAN access: http://<this-machine-lan-ip>:$FRONTEND_PORT"
+    fi
     wait "$BACKEND_PID" "$FRONTEND_PID"
   else
     wait "$BACKEND_PID"

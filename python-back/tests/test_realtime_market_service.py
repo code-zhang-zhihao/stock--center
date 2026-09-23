@@ -148,6 +148,36 @@ def test_market_overview_uses_only_the_current_full_market_round():
     assert overview["items"]["limit_events"]["available"] is False
 
 
+def test_market_overview_counts_a_share_rule_derived_limit_prices():
+    service = RealtimeMarketService()
+    service._active_codes = ["000017", "688170"]
+    service._security_reference = {
+        "000017": {"exchange": "SZ", "list_date": date(2020, 1, 1)},
+        "688170": {"exchange": "SH", "list_date": date(2020, 1, 1)},
+    }
+    service._recent_open_trade_dates = [date(2026, 7, 24), date(2026, 7, 23), date(2026, 7, 22), date(2026, 7, 21), date(2026, 7, 20)]
+    current_round = {
+        "000017": service._enrich_quote_with_a_share_limit_prices(
+            {"stock_code": "000017", "last_price": 9.52, "pre_close_price": 10.58, "change_pct": -10.0, "amount_yuan": 10.0}
+        ),
+        "688170": service._enrich_quote_with_a_share_limit_prices(
+            {"stock_code": "688170", "last_price": 61.9, "pre_close_price": 52.68, "change_pct": 17.5, "amount_yuan": 20.0}
+        ),
+    }
+
+    overview = service._build_market_overview("round-current", current_round)
+
+    assert overview["items"]["limit_events"] == {
+        "available": True,
+        "reason": None,
+        "source": "derived_a_share_rule",
+        "verified_quote_count": 2,
+        "unavailable_quote_count": 0,
+        "limit_up_count": 0,
+        "limit_down_count": 1,
+    }
+
+
 def test_market_overview_combines_live_structure_with_completed_daily_ma_reference():
     service = RealtimeMarketService()
     service._active_codes = ["600001", "600002"]
